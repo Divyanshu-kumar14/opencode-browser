@@ -1,0 +1,31 @@
+{
+  "name": "opencode-browser",
+  "version": "0.1.0",
+  "description": "Browser automation plugin for OpenCode: TypeScript shim + Rust CDP daemon (Linux x64)",
+  "type": "module",
+  "exports": {
+    ".": "./plugin/src/index.ts"
+  },
+  "files": [
+    "plugin",
+    "prebuilds",
+    "README.md"
+  ],
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "bench": "node scripts/bench.mjs",
+    "bench:mock": "node scripts/bench.mjs --mock",
+    "test": "cargo test --manifest-path daemon/Cargo.toml && cd plugin && bun test",
+    "typecheck": "cd plugin && ./node_modules/.bin/tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22",
+    "bun": ">=1"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ]
+}

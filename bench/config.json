@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "M3 benchmark workload definition (IMPLEMENTATION-PLAN.md Phase 5)",
+  "description": "Canonical workload for Baseline A (JS driver) vs Baseline B (Rust daemon). Both sides report the same results.json schema; scripts/bench.mjs --compare evaluates the kill rule.",
+  "workload": {
+    "sessionCounts": [1, 4, 8],
+    "callsPerSession": 20,
+    "opCycle": ["navigate", "snapshot", "click", "fill", "screenshot"],
+    "runs": 3,
+    "discardFirstRunAsCold": true,
+    "fixture": "embedded data: URL (sign-in form); overridable via --fixture"
+  },
+  "metrics": [
+    "cold first call (driver launch + first navigate, wall clock)",
+    "warm per-method p50/p95 (navigate, snapshot, click, fill, screenshot)",
+    "bench-process idle RSS via /proc/<pid>/status VmRSS",
+    "marginal RSS per session (slope of peak tree RSS across session counts)",
+    "total tree RSS (daemon process + descendants) sampled at 1 Hz",
+    "cross-session collisions (TAB_FORBIDDEN counter)",
+    "30-minute RSS drift via --soak-minutes 30 (skipped by default)"
+  ],
+  "resultsSchema": {
+    "driverKind": "mock | js | rust",
+    "warm": "{ byMethod: { <method>: { n, p50, p95, max } }, all: { n, p50, p95, max } }",
+    "rss": "{ selfIdleMb, peakTreeMbBySessions, marginalPerSessionMb }",
+    "collisions": "cross-session tab-access counter",
+    "failures": "all other per-op errors"
+  },
+  "killRule": "If Rust shows <20% improvement in marginal memory per session AND <20% in warm-call p95 versus baseline A, do NOT ship the daemon as the default. Ship the JS driver instead.",
+  "notes": [
+    "results.json is gitignored (bench/results/*.json): it is an artifact, not a claim.",
+    "bench/results/report.md is the checked-in decision memo generated from the latest run.",
+    "No 'faster/lighter' wording in any README before bench/results/report.md exists with both baselines."
+  ]
+}

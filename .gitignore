@@ -1,0 +1,9 @@
+target/
+node_modules/
+dist/
+bun.lock
+bun.lockb
+prebuilds/linux-x64/browserd
+bench/results/*.json
+*.log
+.DS_Store

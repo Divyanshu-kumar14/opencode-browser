@@ -1,4 +1,6 @@
 import { Plugin } from "@opencode/plugin";
+import { getClient } from "./supervisor.ts";
+import { NAMESPACE as BROWSER_NAMESPACE, registerBrowserTools } from "./tools.ts";
 
 /**
  * Display namespace. NOTE: on the installed runtime (v2.2.7) this only describes the
@@ -38,11 +40,15 @@ export default Plugin.define({
           required: ["value"],
           additionalProperties: false,
         },
-        options: { namespace: NAMESPACE.name },
+        options: { namespace: NAMESPACE.name, codemode: true },
         execute: async (input, context) => {
           // The JSON Schema above is the runtime contract; the framework hands the
-          // executor `unknown`, so narrow at this single boundary.
-          const { value } = input as { value: string };
+          // executor `unknown`, so narrow at this single boundary. A non-string
+          // must not stringify into "pong:undefined" — reject it instead.
+          const { value } = input as { value: unknown };
+          if (typeof value !== "string") {
+            throw new Error("browser_ping: `value` must be a string");
+          }
 
           // Reading `context.signal` opts this tool into a cooperative stop.
           console.error(
@@ -80,12 +86,19 @@ export default Plugin.define({
           }
         },
       });
+
+      registerBrowserTools(editor, {
+        permission: ctx.permission,
+        getClient,
+      });
     });
 
     // Evidence for docs/api-notes.md: the names the runtime actually registered.
+    // Match on the effective id prefix (`browser_navigate`, …), not the declared
+    // name, so this line survives every future tool addition.
     const registered = await ctx.tool.list();
-    const ours = registered.filter(
-      (tool) => tool.name === "ping" || tool.name === "permission_probe",
+    const ours = registered.filter((tool) =>
+      tool.id.startsWith(BROWSER_NAMESPACE + "_"),
     );
     console.error(
       `[browser] registered: ${ours

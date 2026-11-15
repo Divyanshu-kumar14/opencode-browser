@@ -20,6 +20,7 @@ import {
   formatScroll,
   formatSelect,
   formatUpload,
+  MAX_CLICK_COORD,
   MAX_LOG_ENTRIES,
   toToolError,
   UPLOAD_PERMISSION,
@@ -953,5 +954,232 @@ describe("wait executors", () => {
     );
     expect(missingText).toBeInstanceOf(ToolError);
     expect(calls).toEqual([]);
+  });
+});
+
+describe("click_at executor (D lane, C executor)", () => {
+  test("forwards x/y and tab id, reports the coordinates", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: { click_at: { result: { ok: true, x: 320, y: 240 } } },
+    });
+    const out = await createExecutors(deps)["click_at"]?.(
+      { x: 320, y: 240, tab_id: "t2" },
+      fakeContext(),
+    );
+    expect(calls[0]).toEqual({
+      method: "click_at",
+      params: { x: 320, y: 240, tab_id: "t2" },
+    });
+    expect(out?.content).toBe("clicked 320,240");
+    expect(out?.metadata).toMatchObject({
+      result: expect.objectContaining({ ok: true, x: 320, y: 240 }),
+    });
+  });
+
+  test("omits tab_id when not given", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: { click_at: { result: { ok: true, x: 1, y: 2 } } },
+    });
+    await createExecutors(deps)["click_at"]?.({ x: 1, y: 2 }, fakeContext());
+    expect(calls[0]?.params).toEqual({ x: 1, y: 2 });
+  });
+
+  test("boundary coords pass through untouched", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: { click_at: { result: { ok: true } } },
+    });
+    const executors = createExecutors(deps);
+    await executors["click_at"]?.({ x: 0, y: 0 }, fakeContext());
+    await executors["click_at"]?.(
+      { x: MAX_CLICK_COORD, y: MAX_CLICK_COORD },
+      fakeContext(),
+    );
+    expect(calls).toHaveLength(2);
+    expect(MAX_CLICK_COORD).toBe(16384);
+  });
+
+  test("rejects missing/non-finite/out-of-range coords before any RPC", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({ calls });
+    const executors = createExecutors(deps);
+    const bad: unknown[] = [
+      {},
+      { x: 10 },
+      { y: 10 },
+      { x: Number.NaN, y: 10 },
+      { x: 10, y: Number.POSITIVE_INFINITY },
+      { x: Number.NEGATIVE_INFINITY, y: 10 },
+      { x: -1, y: 10 },
+      { x: 10, y: -0.5 },
+      { x: MAX_CLICK_COORD + 1, y: 10 },
+      { x: 10, y: 1_000_000 },
+      { x: "left", y: 10 },
+      { x: 10, y: null },
+    ];
+    for (const input of bad) {
+      const error = await executors["click_at"]?.(input, fakeContext()).catch(
+        (e) => e,
+      );
+      expect(error).toBeInstanceOf(ToolError);
+      expect((error as ToolError).metadata).toMatchObject({
+        code: "INTERNAL",
+      });
+    }
+    expect(calls).toEqual([]);
+  });
+
+  test("ownership failure surfaces TAB_FORBIDDEN with its hint", async () => {
+    const deps = fakeDeps({
+      scripts: {
+        click_at: {
+          error: {
+            code: "TAB_FORBIDDEN",
+            message: "tab t9 belongs to session ses_other",
+            hint: "this tab belongs to another session",
+          },
+        },
+      },
+    });
+    const error = await createExecutors(deps)["click_at"]?.(
+      { x: 5, y: 5 },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).metadata).toMatchObject({
+      code: "TAB_FORBIDDEN",
+      hint: "this tab belongs to another session",
+    });
+  });
+});
+
+describe("look executor (D lane, C executor)", () => {
+  const snapResult = {
+    tab_id: "t1",
+    url: "https://a.example",
+    text: '[g7-1] button "Sign in"',
+    nodes: [{ uid: "g7-1", role: "button", name: "Sign in" }],
+    truncated: false,
+  };
+  const shotResult = { path: "/tmp/look-s1.png", width: 1280, height: 800 };
+  const hint = "open file:///tmp/look-s1.png to view";
+
+  function lookDeps(
+    calls: { method: string; params: Record<string, unknown> }[],
+    scripts: Record<string, Script>,
+  ): BrowserDeps {
+    return fakeDeps({ calls, scripts });
+  }
+
+  test("composes snapshot text with the screenshot file in one call", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = lookDeps(calls, {
+      snapshot: { result: snapResult },
+      screenshot: { result: shotResult },
+    });
+    const out = await createExecutors(deps)["look"]?.({}, fakeContext());
+    expect(calls.map((c) => c.method)).toEqual(["snapshot", "screenshot"]);
+    expect(out?.content).toEqual([
+      { type: "text", text: `${snapResult.text}\n\n${hint}` },
+      { type: "file", uri: "/tmp/look-s1.png", mime: "image/png" },
+    ]);
+    expect(out?.metadata).toMatchObject({
+      path: "/tmp/look-s1.png",
+      width: 1280,
+      height: 800,
+      hint,
+    });
+  });
+
+  test("forwards tab id and per-half options to the right RPC", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = lookDeps(calls, {
+      snapshot: { result: snapResult },
+      screenshot: { result: shotResult },
+    });
+    await createExecutors(deps)["look"]?.(
+      { tab_id: "t2", max_nodes: 50, include_ax: true, full_page: true },
+      fakeContext(),
+    );
+    expect(calls[0]).toEqual({
+      method: "snapshot",
+      params: { tab_id: "t2", max_nodes: 50, include_ax: true },
+    });
+    expect(calls[1]).toEqual({
+      method: "screenshot",
+      params: { tab_id: "t2", full_page: true },
+    });
+  });
+
+  test("a failed screenshot fails the call with look_phase, never an unpaired snapshot", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = lookDeps(calls, {
+      snapshot: { result: snapResult },
+      screenshot: {
+        error: {
+          code: "INTERNAL",
+          message: "screenshot did not return PNG data",
+          hint: "retry the screenshot",
+        },
+      },
+    });
+    const error = await createExecutors(deps)["look"]?.(
+      {},
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).message).toContain(
+      "look failed after a good snapshot",
+    );
+    expect((error as ToolError).metadata).toMatchObject({
+      code: "INTERNAL",
+      look_phase: "screenshot",
+    });
+    expect(calls.map((c) => c.method)).toEqual(["snapshot", "screenshot"]);
+  });
+
+  test("a failed snapshot attempts no screenshot", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = lookDeps(calls, {
+      snapshot: {
+        error: {
+          code: "TAB_FORBIDDEN",
+          message: "tab t1 belongs to session ses_other",
+          hint: "this tab belongs to another session",
+        },
+      },
+    });
+    const error = await createExecutors(deps)["look"]?.(
+      {},
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).metadata).toMatchObject({
+      code: "TAB_FORBIDDEN",
+    });
+    expect(calls.map((c) => c.method)).toEqual(["snapshot"]);
+  });
+});
+
+describe("screenshot view hint (C lane)", () => {
+  test("screenshot metadata carries a file:// view hint", async () => {
+    const deps = fakeDeps({
+      scripts: {
+        screenshot: { result: { path: "/tmp/shot.png", width: 100, height: 50 } },
+      },
+    });
+    const out = await createExecutors(deps)["screenshot"]?.(
+      {},
+      fakeContext(),
+    );
+    expect(out?.metadata).toMatchObject({
+      path: "/tmp/shot.png",
+      hint: "open file:///tmp/shot.png to view",
+    });
   });
 });

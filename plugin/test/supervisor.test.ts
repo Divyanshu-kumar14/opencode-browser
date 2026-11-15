@@ -6,12 +6,19 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { DaemonError } from "../src/errors.ts";
 import { RpcClient } from "../src/rpc.ts";
 import {
   __resetSupervisorForTests,
+  ATTACH_ENV,
+  ATTACH_URL_ENV,
   BIN_ENV,
   getClient,
+  probeAttachTarget,
+  resolveAttachEnv,
+  resolveAttachProbeUrl,
   resolveBinary,
   SOCKET_ENV,
 } from "../src/supervisor.ts";
@@ -19,16 +26,56 @@ import { startMockDaemon, type MockDaemon } from "./mock-daemon.ts";
 
 const savedSocket = process.env[SOCKET_ENV];
 const savedBin = process.env[BIN_ENV];
+const savedAttach = process.env[ATTACH_ENV];
+const savedAttachUrl = process.env[ATTACH_URL_ENV];
 let mocks: MockDaemon[] = [];
+const stubServers: Server[] = [];
+
+async function closeStubs(): Promise<void> {
+  while (stubServers.length > 0) {
+    const server = stubServers.pop();
+    if (server !== undefined) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+}
+
+/** Fake `:9222` origin: answers `/json/version` with the given handler. */
+async function startVersionStub(
+  handler: (reqBody: string) => { status: number; body: string },
+): Promise<string> {
+  const server = createServer((req, res) => {
+    let incoming = "";
+    req.on("data", (chunk: string) => {
+      incoming += chunk;
+    });
+    req.on("end", () => {
+      const { status, body } = handler(incoming);
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(body);
+    });
+  });
+  await new Promise<void>((resolve) =>
+    server.listen(0, "127.0.0.1", resolve),
+  );
+  stubServers.push(server);
+  const { port } = server.address() as AddressInfo;
+  return `http://127.0.0.1:${port}/json/version`;
+}
 
 afterEach(async () => {
   for (const mock of mocks) await mock.close();
   mocks = [];
+  await closeStubs();
   __resetSupervisorForTests();
   if (savedSocket === undefined) delete process.env[SOCKET_ENV];
   else process.env[SOCKET_ENV] = savedSocket;
   if (savedBin === undefined) delete process.env[BIN_ENV];
   else process.env[BIN_ENV] = savedBin;
+  if (savedAttach === undefined) delete process.env[ATTACH_ENV];
+  else process.env[ATTACH_ENV] = savedAttach;
+  if (savedAttachUrl === undefined) delete process.env[ATTACH_URL_ENV];
+  else process.env[ATTACH_URL_ENV] = savedAttachUrl;
 });
 
 describe("supervisor", () => {
@@ -93,5 +140,110 @@ describe("supervisor", () => {
     expect(
       await after.request("navigate", { url: "https://b.example" }),
     ).toEqual({ tab_id: "t2", url: "https://b.example" });
+  });
+});
+
+describe("attach auto-detect (D lane, C supervisor)", () => {
+  const WS_URL = "ws://127.0.0.1:9222/devtools/browser/abc123";
+
+  test("probe returns the debugger URL when a debuggable target answers", async () => {
+    const probeUrl = await startVersionStub(() => ({
+      status: 200,
+      body: JSON.stringify({
+        Browser: "Chrome/144.0",
+        "webSocketDebuggerUrl": WS_URL,
+      }),
+    }));
+    expect(await probeAttachTarget(probeUrl)).toBe(WS_URL);
+  });
+
+  test("probe returns null when nothing listens (refused)", async () => {
+    // Grab a loopback port, then close it: connecting must fail fast.
+    const probeUrl = await startVersionStub(() => ({
+      status: 200,
+      body: "{}",
+    }));
+    await closeStubs();
+    expect(await probeAttachTarget(probeUrl, 1_000)).toBeNull();
+  });
+
+  test("probe returns null on garbage: non-2xx, non-JSON, or no debugger URL", async () => {
+    const missing = await startVersionStub(() => ({
+      status: 404,
+      body: "no such target",
+    }));
+    expect(await probeAttachTarget(missing)).toBeNull();
+
+    const notJson = await startVersionStub(() => ({
+      status: 200,
+      body: "this is not json{{{",
+    }));
+    expect(await probeAttachTarget(notJson)).toBeNull();
+
+    const noWsUrl = await startVersionStub(() => ({
+      status: 200,
+      body: JSON.stringify({ Browser: "Chrome/144.0" }),
+    }));
+    expect(await probeAttachTarget(noWsUrl)).toBeNull();
+  });
+
+  test("probe throws fail-closed on a non-loopback debugger URL", async () => {
+    const probeUrl = await startVersionStub(() => ({
+      status: 200,
+      body: JSON.stringify({
+        webSocketDebuggerUrl: "ws://203.0.3.9:9222/devtools/browser/evil",
+      }),
+    }));
+    const error = await probeAttachTarget(probeUrl).catch((e) => e);
+    expect(error).toBeInstanceOf(DaemonError);
+    expect((error as DaemonError).code).toBe("PERMISSION_DENIED");
+  });
+
+  test("resolveAttachProbeUrl: no opt-in means no probe", () => {
+    delete process.env[ATTACH_ENV];
+    delete process.env[ATTACH_URL_ENV];
+    expect(resolveAttachProbeUrl()).toBeNull();
+  });
+
+  test("resolveAttachProbeUrl: opt-in defaults to loopback :9222, explicit loopback override wins", () => {
+    process.env[ATTACH_ENV] = "1";
+    delete process.env[ATTACH_URL_ENV];
+    expect(resolveAttachProbeUrl()).toBe(
+      "http://127.0.0.1:9222/json/version",
+    );
+    process.env[ATTACH_URL_ENV] = "http://127.0.0.1:9333";
+    expect(resolveAttachProbeUrl()).toBe("http://127.0.0.1:9333/json/version");
+  });
+
+  test("resolveAttachProbeUrl refuses non-loopback overrides, never fetched", () => {
+    for (const override of [
+      "http://example.com:9222",
+      "http://192.168.1.10:9222",
+      "file:///etc/passwd",
+      "http://127.999.1.1:9222",
+      "not a url",
+    ]) {
+      process.env[ATTACH_ENV] = "1";
+      process.env[ATTACH_URL_ENV] = override;
+      expect(() => resolveAttachProbeUrl()).toThrow(DaemonError);
+    }
+  });
+
+  test("resolveAttachEnv: without opt-in there is no probe and no extra env", async () => {
+    delete process.env[ATTACH_ENV];
+    delete process.env[ATTACH_URL_ENV];
+    expect(await resolveAttachEnv()).toEqual({});
+  });
+
+  test("resolveAttachEnv: opt-in with no Chrome falls back to launch env", async () => {
+    process.env[ATTACH_ENV] = "1";
+    // Point at a closed loopback port: probe fails fast, fallback is `{}`.
+    const probeUrl = await startVersionStub(() => ({
+      status: 200,
+      body: "{}",
+    }));
+    await closeStubs();
+    process.env[ATTACH_URL_ENV] = probeUrl.replace("/json/version", "");
+    expect(await resolveAttachEnv()).toEqual({});
   });
 });

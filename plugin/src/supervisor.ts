@@ -23,6 +23,18 @@ import { PROTOCOL, RpcClient } from "./rpc.ts";
 
 export const SOCKET_ENV = "OPENCODE_BROWSER_SOCKET";
 export const BIN_ENV = "OPENCODE_BROWSERD_BIN";
+/** Explicit opt-in for attach auto-detect. Never probed unless `"1"`. */
+export const ATTACH_ENV = "OPENCODE_BROWSER_ATTACH";
+/**
+ * Explicit attach endpoint (`http://127.0.0.1:9222`); unset means probe the
+ * default below. Also passed to the daemon child when a debuggable target
+ * answers, so a capable daemon can attach instead of launching.
+ */
+export const ATTACH_URL_ENV = "OPENCODE_BROWSER_ATTACH_URL";
+/** Localhost-only default probe. A literal IP, never a resolvable hostname. */
+export const ATTACH_PROBE_URL = "http://127.0.0.1:9222/json/version";
+/** Probe budget: a local Chrome answers in ms; bounds opt-in startup cost. */
+export const ATTACH_PROBE_TIMEOUT_MS = 2_000;
 /** Per-attempt pause after spawning, in ms. Capped at 2 s per the plan. */
 const RETRY_DELAYS_MS = [50, 100, 250, 500, 1000, 1500, 2000];
 const HELLO_TIMEOUT_MS = 5_000;
@@ -84,6 +96,152 @@ export function resolveBinary(): string | null {
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Attach auto-detect (explicit opt-in only).
+//
+// When `OPENCODE_BROWSER_ATTACH=1` and no `OPENCODE_BROWSER_ATTACH_URL` is
+// set, the supervisor probes the loopback debug endpoint before spawning:
+// a debuggable local Chrome yields its endpoint to the daemon child,
+// anything else falls back to a fresh launch with a clear log line. No
+// probe, no attach, and no log line unless the operator opted in.
+// ---------------------------------------------------------------------------
+
+/** True only on the explicit `"1"`: attach is never silent or default. */
+export function attachOptIn(): boolean {
+  return process.env[ATTACH_ENV] === "1";
+}
+
+/** Hosts that are unambiguously this machine. Anything else is refused. */
+function isLoopbackHost(host: string): boolean {
+  const lower = host.toLowerCase();
+  if (lower === "localhost" || lower === "127.0.0.1" || lower === "::1") {
+    return true;
+  }
+  // 127/8 literals need no DNS; validate each octet so `127.999.1.1`
+  // (which never routes to loopback) cannot slip through.
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(lower)) {
+    return lower
+      .split(".")
+      .slice(1)
+      .every((octet) => Number(octet) <= 255);
+  }
+  return false;
+}
+
+function attachRefused(url: string, why: string): DaemonError {
+  return new DaemonError(
+    "PERMISSION_DENIED",
+    `refusing Chrome attach target ${url}: ${why}`,
+    `attach is localhost-only and explicit: set ${ATTACH_URL_ENV} to a ` +
+      `127.0.0.1 http(s) URL from a debug-enabled Chrome ` +
+      `(--remote-debugging-port=9222), or unset ${ATTACH_ENV} to launch a fresh browser`,
+  );
+}
+
+/**
+ * Endpoint to probe, or null when attach was not opted in. An explicit
+ * `OPENCODE_BROWSER_ATTACH_URL` wins; otherwise the loopback default.
+ * Throws (fail closed) on an unparseable, non-http(s), or non-loopback
+ * override — such a URL is never fetched.
+ */
+export function resolveAttachProbeUrl(): string | null {
+  if (!attachOptIn()) return null;
+  const override = process.env[ATTACH_URL_ENV];
+  if (override === undefined || override.length === 0) return ATTACH_PROBE_URL;
+  let parsed: URL;
+  try {
+    parsed = new URL(override);
+  } catch {
+    throw attachRefused(override, "not a parseable URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw attachRefused(override, `scheme ${parsed.protocol} is not http(s)`);
+  }
+  if (!isLoopbackHost(parsed.hostname)) {
+    throw attachRefused(override, `host ${parsed.hostname} is not loopback`);
+  }
+  return `${parsed.origin}/json/version`;
+}
+
+/**
+ * Probe a local Chrome's `/json/version`. Returns the debugger WebSocket URL
+ * when a debuggable loopback target answers, null when nothing usable is
+ * there (refused, timeout, non-2xx, or no debugger URL). Throws only for a
+ * non-loopback debugger URL — fail closed, never hand a remote browser on.
+ */
+export async function probeAttachTarget(
+  probeUrl: string,
+  timeoutMs: number = ATTACH_PROBE_TIMEOUT_MS,
+): Promise<string | null> {
+  let parsed: URL;
+  try {
+    parsed = new URL(probeUrl);
+  } catch {
+    return null;
+  }
+  // Belt and braces: even the default constant passes through the gate, so
+  // no packet ever leaves this machine for a non-loopback host.
+  if (!isLoopbackHost(parsed.hostname)) {
+    throw attachRefused(probeUrl, `host ${parsed.hostname} is not loopback`);
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${parsed.origin}/json/version`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    // Unreachable or timed out: not an error, just no debuggable Chrome.
+    return null;
+  }
+  if (!response.ok) return null;
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return null;
+  }
+  const wsUrl =
+    typeof body === "object" && body !== null
+      ? (body as Record<string, unknown>)["webSocketDebuggerUrl"]
+      : undefined;
+  if (typeof wsUrl !== "string" || wsUrl.length === 0) return null;
+  let ws: URL;
+  try {
+    ws = new URL(wsUrl);
+  } catch {
+    return null;
+  }
+  if (ws.protocol !== "ws:" && ws.protocol !== "wss:") return null;
+  if (!isLoopbackHost(ws.hostname)) {
+    throw attachRefused(probeUrl, `debugger URL points at ${ws.hostname}`);
+  }
+  return wsUrl;
+}
+
+/**
+ * Extra env for the daemon child. `{}` unless explicitly opted in. On
+ * opt-in the local probe runs (bounded by `ATTACH_PROBE_TIMEOUT_MS`): a
+ * debuggable Chrome yields its endpoint, otherwise we log the fallback and
+ * launch fresh. Only a non-loopback target throws (fail closed).
+ */
+export async function resolveAttachEnv(): Promise<Record<string, string>> {
+  const probeUrl = resolveAttachProbeUrl();
+  if (probeUrl === null) return {};
+  const wsUrl = await probeAttachTarget(probeUrl);
+  if (wsUrl === null) {
+    console.error(
+      `[browse] attach probe ${probeUrl} found no debuggable Chrome — ` +
+        `launching a fresh browser (opt out: unset ${ATTACH_ENV})`,
+    );
+    return {};
+  }
+  console.error(
+    `[browse] attaching to the debuggable Chrome at ${probeUrl} ` +
+      `(explicit opt-in ${ATTACH_ENV}=1)`,
+  );
+  return { [ATTACH_URL_ENV]: wsUrl };
 }
 
 let cachedVersion: string | null = null;
@@ -148,10 +306,16 @@ async function tryHello(sock: string): Promise<RpcClient | null> {
 }
 
 /** Spawn detached, fully dissociated; never reaped or killed by us. */
-function spawnDetached(binary: string): void {
+function spawnDetached(
+  binary: string,
+  extraEnv: Record<string, string> = {},
+): void {
   const child = spawn(binary, [], {
     detached: true,
     stdio: "ignore",
+    // Explicit spread of process.env: identical to the inherited default,
+    // plus the attach endpoint when auto-detect found a debuggable Chrome.
+    env: { ...process.env, ...extraEnv },
   });
   // An async ENOENT (override removed between preflight and spawn) must not
   // crash the server as an unhandled 'error' event.
@@ -171,7 +335,8 @@ async function connectOrSpawn(): Promise<RpcClient> {
       `nothing listening and no browserd binary found (looked at: ${binaryCandidates().join(", ")})`,
     );
   }
-  spawnDetached(binary);
+  // Attach auto-detect (explicit opt-in only; {} and a plain launch otherwise).
+  spawnDetached(binary, await resolveAttachEnv());
 
   let lastError: unknown = null;
   for (const delay of RETRY_DELAYS_MS) {

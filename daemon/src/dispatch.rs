@@ -14,9 +14,10 @@ use crate::error::{ErrorCode, RpcError};
 use crate::paths;
 use crate::policy::{check_navigate_url, redact_url};
 use crate::rpc::{
-    self, BenchParams, ClickParams, CloseTabParams, ConsoleParams, EvalParams, FillParams,
-    HelloParams, NavigateParams, NetworkParams, PressKeyParams, Request, Response,
-    ScreenshotParams, ShutdownParams, SnapshotParams,
+    self, BenchParams, ClickParams, CloseTabParams, ConsoleParams, DialogParams, EvalParams,
+    FillParams, HelloParams, HoverParams, NavigateParams, NetworkBodyParams, NetworkParams,
+    PressKeyParams, Request, Response, ScreenshotParams, ScrollParams, SelectParams,
+    ShutdownParams, SnapshotParams, UploadParams,
 };
 use crate::snapshot::{self, DEFAULT_MAX_NODES};
 use crate::tabs::{now_ms, Tab, TabRegistry};
@@ -28,11 +29,17 @@ pub const METHODS: &[&str] = &[
     "snapshot",
     "click",
     "fill",
+    "hover",
+    "select",
+    "upload",
+    "dialog",
+    "scroll",
     "press_key",
     "eval",
     "screenshot",
     "console",
     "network",
+    "network_body",
     "list_tabs",
     "close_tab",
     "status",
@@ -41,18 +48,22 @@ pub const METHODS: &[&str] = &[
     "cancel",
 ];
 
-/// Outer per-request timeout: 30 s everywhere except `navigate`, which gets
-/// its own deadline plus headroom (capped so one call cannot wedge a worker).
+/// Outer per-request timeout: 30 s by default. `navigate` and `eval` carry
+/// their own deadline, so the outer bound is that deadline plus headroom
+/// (capped so one call cannot wedge a worker).
 pub fn request_timeout_ms(method: &str, params: &Value) -> u64 {
-    if method == "navigate" {
-        let inner = params
+    let inner = |fallback: u64, min: u64| {
+        params
             .get("timeout_ms")
             .and_then(Value::as_u64)
-            .unwrap_or(15_000)
-            .clamp(1_000, 120_000);
-        return (inner + 10_000).min(130_000);
+            .unwrap_or(fallback)
+            .clamp(min, 120_000)
+    };
+    match method {
+        "navigate" => (inner(15_000, 1_000) + 10_000).min(130_000),
+        "eval" => (inner(30_000, 100) + 5_000).min(125_000),
+        _ => 30_000,
     }
-    30_000
 }
 
 pub struct App {
@@ -109,11 +120,17 @@ pub async fn dispatch(app: &App, req: Request, session: String) -> Response {
         "snapshot" => handle_snapshot(app, req.params, &session).await,
         "click" => handle_click(app, req.params, &session).await,
         "fill" => handle_fill(app, req.params, &session).await,
+        "hover" => handle_hover(app, req.params, &session).await,
+        "select" => handle_select(app, req.params, &session).await,
+        "upload" => handle_upload(app, req.params, &session).await,
+        "dialog" => handle_dialog(app, req.params, &session).await,
+        "scroll" => handle_scroll(app, req.params, &session).await,
         "press_key" => handle_press_key(app, req.params, &session).await,
         "eval" => handle_eval(app, req.params, &session).await,
         "screenshot" => handle_screenshot(app, req.params, &session).await,
         "console" => handle_console(app, req.params, &session).await,
         "network" => handle_network(app, req.params, &session).await,
+        "network_body" => handle_network_body(app, req.params, &session).await,
         "list_tabs" => handle_list_tabs(app).await,
         "close_tab" => handle_close_tab(app, req.params, &session).await,
         "status" => handle_status(app).await,
@@ -218,6 +235,18 @@ async fn handle_navigate(app: &App, params: Value, session: &str) -> Result<Valu
     }
 
     let tab = app.tabs.resolve_or_create(session, &app.chrome).await?;
+    let dialog_manual = match parsed.dialog_policy.as_deref().unwrap_or("auto") {
+        "auto" => false,
+        "manual" => true,
+        other => {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                format!("invalid dialog_policy {other:?}: expected auto or manual"),
+                "omit dialog_policy to auto-dismiss, or use \"manual\" to drive dialogs with browser_dialog",
+            ));
+        }
+    };
+    tab.set_dialog_policy(dialog_manual);
     tab.ensure_listeners().await;
     let _guard = tab.op_lock.lock().await;
 
@@ -498,6 +527,311 @@ async fn handle_fill(app: &App, params: Value, session: &str) -> Result<Value, R
     Ok(json!({"ok": true}))
 }
 
+async fn handle_hover(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchMouseEventParams, DispatchMouseEventType,
+    };
+    let parsed: HoverParams = rpc::parse_params("hover", &params)?;
+    if parsed.uid.trim().is_empty() {
+        return Err(RpcError::uid_not_found("(empty uid)"));
+    }
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    let _guard = tab.op_lock.lock().await;
+    tab.check_uid(&parsed.uid)?;
+    let (x, y) = probe_click_point(&tab, &parsed.uid).await?;
+    let moved = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MouseMoved)
+        .x(x)
+        .y(y)
+        .build()
+        .map_err(RpcError::internal)?;
+    tab.exec(moved).await?;
+    Ok(json!({"ok": true, "x": x, "y": y}))
+}
+
+/// Change a `<select>` by option value, visible label or index. Exactly one of
+/// the three selectors is required, so a typo can never silently pick option 0.
+async fn handle_select(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    let parsed: SelectParams = rpc::parse_params("select", &params)?;
+    if parsed.uid.trim().is_empty() {
+        return Err(RpcError::uid_not_found("(empty uid)"));
+    }
+    let given = usize::from(parsed.value.is_some())
+        + usize::from(parsed.label.is_some())
+        + usize::from(parsed.index.is_some());
+    if given != 1 {
+        return Err(RpcError::new(
+            ErrorCode::Internal,
+            format!("select needs exactly one of value, label or index (got {given})"),
+            "pass value for option.value, label for the visible text, or index for the position",
+        ));
+    }
+    let (mode, target) = if let Some(value) = parsed.value.clone() {
+        ("value", json!(value))
+    } else if let Some(label) = parsed.label.clone() {
+        ("label", json!(label))
+    } else {
+        ("index", json!(parsed.index.unwrap_or(0)))
+    };
+
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    let _guard = tab.op_lock.lock().await;
+    tab.check_uid(&parsed.uid)?;
+
+    let want = serde_json::to_string(&parsed.uid).map_err(|e| RpcError::internal(e.to_string()))?;
+    let spec = json!({"mode": mode, "target": target});
+    let js = format!(
+        r#"(() => {{
+  const want = {want};
+  const spec = {spec};
+  const el = document.querySelector('[data-oc-uid="' + want + '"]');
+  if (!el) return {{ ok: false, reason: 'missing' }};
+  if (el.tagName.toLowerCase() !== 'select') return {{ ok: false, reason: 'not-select', tag: el.tagName.toLowerCase() }};
+  const options = Array.from(el.options);
+  let index = -1;
+  if (spec.mode === 'value') index = options.findIndex((o) => o.value === spec.target);
+  else if (spec.mode === 'label') index = options.findIndex((o) => ((o.label || o.text || '').trim() === spec.target));
+  else index = spec.target;
+  if (!Number.isInteger(index) || index < 0 || index >= options.length) {{
+    return {{ ok: false, reason: 'no-match', count: options.length }};
+  }}
+  el.focus();
+  el.selectedIndex = index;
+  el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  const chosen = options[index];
+  return {{ ok: true, index, value: chosen.value, label: (chosen.label || chosen.text || '') }};
+}})()"#
+    );
+    let value = tab
+        .eval_json(&js)
+        .await
+        .map_err(|err| RpcError::internal(format!("select failed: {err}")))?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        let reason = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return Err(match reason {
+            "missing" => RpcError::uid_not_found(&parsed.uid),
+            "not-select" => RpcError::new(
+                ErrorCode::Internal,
+                format!(
+                    "uid {} is a <{}>, not a <select>",
+                    parsed.uid,
+                    value
+                        .get("tag")
+                        .and_then(Value::as_str)
+                        .unwrap_or("element")
+                ),
+                "use browser_click or browser_fill for non-select elements",
+            ),
+            _ => RpcError::new(
+                ErrorCode::Internal,
+                format!(
+                    "no option matched {mode}={:?} (the select has {} options)",
+                    target,
+                    value.get("count").and_then(Value::as_u64).unwrap_or(0)
+                ),
+                "call browser_snapshot to read the option values and labels",
+            ),
+        });
+    }
+    Ok(value)
+}
+
+/// Attach local files to an `<input type="file">`. Permission-gated in the shim
+/// because this is a file-exfiltration primitive; the daemon re-validates every
+/// path so a hostile client cannot bypass the shim.
+async fn handle_upload(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    use chromiumoxide::cdp::browser_protocol::dom::{
+        DescribeNodeParams, GetDocumentParams, QuerySelectorParams, SetFileInputFilesParams,
+    };
+
+    let parsed: UploadParams = rpc::parse_params("upload", &params)?;
+    if parsed.uid.trim().is_empty() {
+        return Err(RpcError::uid_not_found("(empty uid)"));
+    }
+    crate::policy::check_upload_paths(&parsed.paths)?;
+
+    let mut total = 0u64;
+    for path in &parsed.paths {
+        let label = crate::policy::file_label(path);
+        let meta = tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(|err| RpcError::upload_denied(format!("cannot read {label}: {err}")))?;
+        if meta.file_type().is_symlink() {
+            return Err(RpcError::upload_denied(format!("{label} is a symlink")));
+        }
+        if !meta.is_file() {
+            return Err(RpcError::upload_denied(format!(
+                "{label} is not a regular file"
+            )));
+        }
+        total = total.saturating_add(meta.len());
+    }
+    if total > crate::policy::MAX_UPLOAD_BYTES {
+        return Err(RpcError::upload_denied(format!(
+            "{} bytes total, over the {} MiB limit",
+            total,
+            crate::policy::MAX_UPLOAD_BYTES / (1024 * 1024)
+        )));
+    }
+
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    let _guard = tab.op_lock.lock().await;
+    tab.check_uid(&parsed.uid)?;
+
+    let doc = tab
+        .exec(GetDocumentParams {
+            depth: Some(0),
+            pierce: None,
+        })
+        .await?;
+    let selector = format!("[data-oc-uid=\"{}\"]", parsed.uid);
+    let found = tab
+        .exec(QuerySelectorParams::new(doc.root.node_id, selector))
+        .await?;
+    if found.node_id.0 == 0 {
+        return Err(RpcError::uid_not_found(&parsed.uid));
+    }
+    let described = tab
+        .exec(DescribeNodeParams {
+            node_id: Some(found.node_id),
+            ..Default::default()
+        })
+        .await?;
+    let node = described.node;
+    if !node.node_name.eq_ignore_ascii_case("input") {
+        return Err(RpcError::new(
+            ErrorCode::UploadDenied,
+            format!(
+                "uid {} is a <{}>, not a file input",
+                parsed.uid,
+                node.node_name.to_lowercase()
+            ),
+            "point upload at an <input type=\"file\"> uid from browser_snapshot",
+        ));
+    }
+    let attrs = node.attributes.unwrap_or_default();
+    let mut kind = String::new();
+    for pair in attrs.chunks(2) {
+        if pair.len() == 2 && pair[0].eq_ignore_ascii_case("type") {
+            kind = pair[1].to_ascii_lowercase();
+        }
+    }
+    if kind != "file" {
+        return Err(RpcError::new(
+            ErrorCode::UploadDenied,
+            format!(
+                "uid {} is an <input type=\"{kind}\">, not a file input",
+                parsed.uid
+            ),
+            "point upload at an <input type=\"file\"> uid from browser_snapshot",
+        ));
+    }
+
+    tab.exec(SetFileInputFilesParams {
+        files: parsed.paths.clone(),
+        node_id: Some(found.node_id),
+        backend_node_id: None,
+        object_id: None,
+    })
+    .await?;
+
+    let files: Vec<String> = parsed
+        .paths
+        .iter()
+        .map(|path| crate::policy::file_label(path))
+        .collect();
+    Ok(json!({"ok": true, "files": files}))
+}
+
+/// Accept or dismiss the dialog the page opened. Only meaningful after a
+/// navigation with `dialog_policy: "manual"`; the default policy auto-handles.
+async fn handle_dialog(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    use chromiumoxide::cdp::browser_protocol::page::HandleJavaScriptDialogParams;
+
+    let parsed: DialogParams = rpc::parse_params("dialog", &params)?;
+    let action = parsed.action.to_ascii_lowercase();
+    if !matches!(action.as_str(), "accept" | "dismiss") {
+        return Err(RpcError::new(
+            ErrorCode::Internal,
+            format!("invalid dialog action {action:?}: expected accept or dismiss"),
+            "use accept to confirm, dismiss to cancel",
+        ));
+    }
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    let pending = tab.dialog().ok_or_else(RpcError::dialog_not_open)?;
+    tab.exec(HandleJavaScriptDialogParams {
+        accept: action == "accept",
+        prompt_text: parsed.prompt_text.clone(),
+    })
+    .await?;
+    tab.set_dialog(None);
+    Ok(json!({"ok": true, "action": action, "dialog": pending}))
+}
+
+/// Scroll the document. Fires real scroll events, so infinite feeds load.
+async fn handle_scroll(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    let parsed: ScrollParams = rpc::parse_params("scroll", &params)?;
+    let direction = parsed.direction.to_ascii_lowercase();
+    if !matches!(
+        direction.as_str(),
+        "up" | "down" | "left" | "right" | "top" | "bottom"
+    ) {
+        return Err(RpcError::new(
+            ErrorCode::Internal,
+            format!("invalid scroll direction {direction:?}"),
+            "use up, down, left, right, top or bottom",
+        ));
+    }
+    if let Some(amount) = parsed.amount {
+        if !amount.is_finite() || amount <= 0.0 || amount > 100_000.0 {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                "amount must be a positive number of pixels (max 100000)",
+                "omit amount to scroll by 80% of the viewport",
+            ));
+        }
+    }
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    let _guard = tab.op_lock.lock().await;
+
+    let spec = json!({"direction": direction, "amount": parsed.amount});
+    let js = format!(
+        r#"(() => {{
+  const spec = {spec};
+  const vh = window.innerHeight || 800;
+  const vw = window.innerWidth || 1200;
+  const horizontal = spec.direction === 'left' || spec.direction === 'right';
+  const step = (typeof spec.amount === 'number' && spec.amount > 0) ? spec.amount : (horizontal ? vw : vh) * 0.8;
+  const before = {{ x: window.scrollX, y: window.scrollY }};
+  if (spec.direction === 'top') window.scrollTo({{ top: 0, left: window.scrollX }});
+  else if (spec.direction === 'bottom') window.scrollTo({{ top: document.documentElement.scrollHeight, left: window.scrollX }});
+  else if (spec.direction === 'up') window.scrollBy({{ top: -step, left: 0 }});
+  else if (spec.direction === 'down') window.scrollBy({{ top: step, left: 0 }});
+  else if (spec.direction === 'left') window.scrollBy({{ top: 0, left: -step }});
+  else window.scrollBy({{ top: 0, left: step }});
+  const max = Math.max(0, document.documentElement.scrollHeight - vh);
+  return {{
+    scrollX: window.scrollX,
+    scrollY: window.scrollY,
+    at_bottom: window.scrollY >= max - 1,
+    moved: window.scrollX !== before.x || window.scrollY !== before.y,
+  }};
+}})()"#
+    );
+    let value = tab.eval_json(&js).await?;
+    Ok(json!({
+        "ok": true,
+        "scrollX": value.get("scrollX"),
+        "scrollY": value.get("scrollY"),
+        "at_bottom": value.get("at_bottom"),
+        "moved": value.get("moved"),
+    }))
+}
+
 async fn handle_press_key(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
     let parsed: PressKeyParams = rpc::parse_params("press_key", &params)?;
     if parsed.key.is_empty() {
@@ -532,13 +866,22 @@ async fn handle_eval(app: &App, params: Value, session: &str) -> Result<Value, R
     let tab = app.tabs.resolve_or_create(session, &app.chrome).await?;
     tab.ensure_listeners().await;
     let _guard = tab.op_lock.lock().await;
+    let timeout_ms = parsed.timeout_ms.unwrap_or(30_000).clamp(100, 120_000);
     let eval_params = chromiumoxide::cdp::js_protocol::runtime::EvaluateParams {
         expression: parsed.js.clone(),
         return_by_value: Some(true),
         await_promise: Some(parsed.await_promise.unwrap_or(true)),
         ..Default::default()
     };
-    let result = tab.exec(eval_params).await?;
+    // The deadline bounds the caller's wait; Chrome may keep running the
+    // script, which the error hint says explicitly.
+    let result = tab
+        .exec_timeout_with(
+            eval_params,
+            std::time::Duration::from_millis(timeout_ms),
+            || RpcError::eval_timeout(timeout_ms),
+        )
+        .await?;
     if let Some(details) = result.exception_details {
         let text = details
             .exception
@@ -616,16 +959,41 @@ async fn handle_console(app: &App, params: Value, session: &str) -> Result<Value
     let parsed: ConsoleParams = rpc::parse_params("console", &params)?;
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
     let limit = parsed.limit.unwrap_or(100).clamp(1, 500);
-    let (messages, truncated) = tab.drain_console(limit, parsed.level.as_deref());
-    Ok(json!({"messages": messages, "truncated": truncated}))
+    let (messages, truncated, next_since) =
+        tab.drain_console(limit, parsed.level.as_deref(), parsed.since);
+    Ok(json!({"messages": messages, "truncated": truncated, "next_since": next_since}))
 }
 
 async fn handle_network(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
     let parsed: NetworkParams = rpc::parse_params("network", &params)?;
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
     let limit = parsed.limit.unwrap_or(100).clamp(1, 500);
-    let (requests, truncated) = tab.drain_network(limit, parsed.filter.as_deref());
-    Ok(json!({"requests": requests, "truncated": truncated}))
+    let (mut requests, truncated, next_since) =
+        tab.drain_network(limit, parsed.filter.as_deref(), parsed.since);
+    // Headers are captured redacted, but they still double the payload size:
+    // only send them when the caller asked.
+    if !parsed.include_headers.unwrap_or(false) {
+        for entry in &mut requests {
+            entry.request_headers.clear();
+            entry.response_headers.clear();
+        }
+    }
+    Ok(json!({"requests": requests, "truncated": truncated, "next_since": next_since}))
+}
+
+async fn handle_network_body(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    let parsed: NetworkBodyParams = rpc::parse_params("network_body", &params)?;
+    if parsed.request_id.is_empty() {
+        return Err(RpcError::internal(
+            "network_body: `request_id` must not be empty",
+        ));
+    }
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    let max_bytes = parsed
+        .max_bytes
+        .unwrap_or(crate::tabs::DEFAULT_BODY_BYTES)
+        .clamp(1, crate::tabs::MAX_BODY_BYTES);
+    tab.response_body(&parsed.request_id, max_bytes).await
 }
 
 async fn handle_list_tabs(app: &App) -> Result<Value, RpcError> {
@@ -726,12 +1094,17 @@ mod tests {
     }
 
     #[test]
-    fn navigate_gets_a_longer_timeout_than_default() {
+    fn navigate_and_eval_get_their_own_deadline() {
         let params = json!({"url": "https://example.com/", "timeout_ms": 60_000});
         assert_eq!(request_timeout_ms("navigate", &params), 70_000);
         assert_eq!(request_timeout_ms("snapshot", &json!({})), 30_000);
         let huge = json!({"url": "https://example.com/", "timeout_ms": 999_999_999});
         assert_eq!(request_timeout_ms("navigate", &huge), 130_000);
+
+        // eval must never be cut off by the default 30 s outer bound.
+        let long_eval = json!({"js": "1", "timeout_ms": 90_000});
+        assert_eq!(request_timeout_ms("eval", &long_eval), 95_000);
+        assert_eq!(request_timeout_ms("eval", &json!({"js": "1"})), 35_000);
     }
 
     #[test]
@@ -757,11 +1130,17 @@ mod tests {
                         | "snapshot"
                         | "click"
                         | "fill"
+                        | "hover"
+                        | "select"
+                        | "upload"
+                        | "dialog"
+                        | "scroll"
                         | "press_key"
                         | "eval"
                         | "screenshot"
                         | "console"
                         | "network"
+                        | "network_body"
                         | "list_tabs"
                         | "close_tab"
                         | "status"

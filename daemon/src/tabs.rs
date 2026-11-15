@@ -10,9 +10,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use chromiumoxide::cdp::browser_protocol::log::EventEntryAdded;
 use chromiumoxide::cdp::browser_protocol::network::{
-    EventRequestWillBeSent, EventResponseReceived,
+    EventRequestWillBeSent, EventResponseReceived, GetResponseBodyParams, Headers,
+};
+use chromiumoxide::cdp::browser_protocol::page::{
+    EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
 };
 use chromiumoxide::cdp::browser_protocol::target::CloseTargetParams;
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
@@ -39,6 +44,8 @@ pub const BUFFER_CAP: usize = 500;
 /// One console/log entry kept per tab.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsoleEntry {
+    /// Monotonic per-tab sequence number, used as the `since` cursor.
+    pub seq: u64,
     pub level: String,
     pub text: String,
     pub url: String,
@@ -48,11 +55,107 @@ pub struct ConsoleEntry {
 /// One completed network response kept per tab.
 #[derive(Debug, Clone, Serialize)]
 pub struct NetworkEntry {
+    pub seq: u64,
+    pub request_id: String,
     pub method: String,
     pub url: String,
     pub status: i64,
     pub ms: f64,
+    /// CDP resource type (`document`, `xhr`, `fetch`, …).
     pub kind: String,
+    /// Served from the disk cache or a service worker.
+    pub from_cache: bool,
+    /// Wire bytes as reported by Chrome (`encodedDataLength`).
+    pub encoded_bytes: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub request_headers: Vec<Header>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub response_headers: Vec<Header>,
+    pub ts: u64,
+}
+
+/// One header kept on a network entry. Values of credential-bearing headers are
+/// replaced at capture time, so the ring buffer never stores the secret and no
+/// later serialization path can leak it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Header {
+    pub name: String,
+    pub value: String,
+}
+
+/// Bound header memory: 500 entries × 64 headers × 512 chars worst case would
+/// blow the ring budget, so both dimensions are capped.
+const MAX_HEADERS: usize = 32;
+const MAX_HEADER_VALUE: usize = 512;
+
+/// Header names whose values must never leave the process.
+const SECRET_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+];
+
+/// Default and hard cap for `network_body` (`docs/PLAN-tool-surface-gaps.md` C3).
+pub const DEFAULT_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_BODY_BYTES: usize = 256 * 1024;
+/// Base64 input bound (~350 KiB of encoded text covers the 256 KiB cap).
+const MAX_BODY_B64_CHARS: usize = 512 * 1024;
+
+fn header_value(value: &Value) -> String {
+    let raw = match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    };
+    if raw.chars().count() > MAX_HEADER_VALUE {
+        let mut short: String = raw.chars().take(MAX_HEADER_VALUE).collect();
+        short.push('…');
+        short
+    } else {
+        raw
+    }
+}
+
+/// Copy a CDP header map into bounded, redacted pairs.
+fn collect_headers(headers: &Headers) -> Vec<Header> {
+    let Some(map) = headers.inner().as_object() else {
+        return Vec::new();
+    };
+    map.iter()
+        .take(MAX_HEADERS)
+        .map(|(name, value)| {
+            let secret = SECRET_HEADERS
+                .iter()
+                .any(|secret| name.eq_ignore_ascii_case(secret));
+            Header {
+                name: name.clone(),
+                value: if secret {
+                    "[redacted]".to_string()
+                } else {
+                    header_value(value)
+                },
+            }
+        })
+        .collect()
+}
+
+/// A JavaScript dialog the page opened (`Page.javascriptDialogOpening`).
+#[derive(Debug, Clone, Serialize)]
+pub struct DialogInfo {
+    /// `alert`, `confirm`, `prompt` or `beforeunload`.
+    pub kind: String,
+    pub message: String,
+    pub default_prompt: Option<String>,
+    pub url: String,
     pub ts: u64,
 }
 
@@ -93,6 +196,12 @@ pub struct Tab {
     pub op_lock: AsyncMutex<()>,
     console: StdMutex<VecDeque<ConsoleEntry>>,
     network: StdMutex<VecDeque<NetworkEntry>>,
+    console_seq: AtomicU64,
+    network_seq: AtomicU64,
+    dialog: StdMutex<Option<DialogInfo>>,
+    /// `true` leaves dialogs open for `dialog`; `false` (default) auto-handles
+    /// them so a page can never wedge the tab.
+    dialog_manual: AtomicBool,
     listeners_started: AtomicBool,
     listeners_ready: AtomicBool,
 }
@@ -113,9 +222,27 @@ impl Tab {
             op_lock: AsyncMutex::new(()),
             console: StdMutex::new(VecDeque::new()),
             network: StdMutex::new(VecDeque::new()),
+            console_seq: AtomicU64::new(0),
+            network_seq: AtomicU64::new(0),
+            dialog: StdMutex::new(None),
+            dialog_manual: AtomicBool::new(false),
             listeners_started: AtomicBool::new(false),
             listeners_ready: AtomicBool::new(false),
         }
+    }
+
+    /// `true` leaves dialogs open for the `dialog` method; `false` auto-handles
+    /// them (dismiss `alert`/`confirm`/`prompt`, accept `beforeunload`).
+    pub fn set_dialog_policy(&self, manual: bool) {
+        self.dialog_manual.store(manual, Ordering::SeqCst);
+    }
+
+    pub fn dialog(&self) -> Option<DialogInfo> {
+        lock(&self.dialog).clone()
+    }
+
+    pub fn set_dialog(&self, info: Option<DialogInfo>) {
+        *lock(&self.dialog) = info;
     }
 
     pub fn owner(&self) -> Option<String> {
@@ -225,6 +352,23 @@ impl Tab {
         cmd: T,
         timeout: Duration,
     ) -> Result<T::Response, RpcError> {
+        self.exec_timeout_with(cmd, timeout, || {
+            RpcError::internal(format!(
+                "CDP call timed out after {}ms",
+                timeout.as_millis()
+            ))
+        })
+        .await
+    }
+
+    /// Like [`Tab::exec_timeout`], but a blown deadline is reported with a
+    /// caller-chosen error — `eval` must say EVAL_ERROR, not INTERNAL.
+    pub async fn exec_timeout_with<T: Command>(
+        &self,
+        cmd: T,
+        timeout: Duration,
+        on_timeout: impl FnOnce() -> RpcError,
+    ) -> Result<T::Response, RpcError> {
         if self.is_dead() || !self.chrome_alive.load(Ordering::SeqCst) {
             return Err(RpcError::chrome_dead(format!(
                 "tab {} has no live browser",
@@ -234,10 +378,7 @@ impl Tab {
         match tokio::time::timeout(timeout, self.page.execute(cmd)).await {
             Ok(Ok(response)) => Ok(response.result),
             Ok(Err(err)) => Err(self.map_error(err.to_string())),
-            Err(_) => Err(RpcError::internal(format!(
-                "CDP call timed out after {}ms",
-                timeout.as_millis()
-            ))),
+            Err(_) => Err(on_timeout()),
         }
     }
 
@@ -334,6 +475,7 @@ impl Tab {
         {
             use chromiumoxide::cdp::browser_protocol::log::EnableParams as LogEnable;
             use chromiumoxide::cdp::browser_protocol::network::EnableParams as NetEnable;
+            use chromiumoxide::cdp::browser_protocol::page::EnableParams as PageEnable;
             use chromiumoxide::cdp::js_protocol::runtime::EnableParams as RtEnable;
             // Cold tabs may still be settling: retry the enables briefly
             // instead of leaving permanently-dead listeners behind.
@@ -342,7 +484,10 @@ impl Tab {
                 let rt = self.exec(RtEnable {}).await.is_ok();
                 let log = self.exec(LogEnable {}).await.is_ok();
                 let net = self.exec(NetEnable::builder().build()).await.is_ok();
-                if rt && log && net {
+                // Page domain: required for `javascriptDialogOpening`. Without
+                // it a page can block the renderer on an unhandled dialog.
+                let page = self.exec(PageEnable::default()).await.is_ok();
+                if rt && log && net && page {
                     enabled = true;
                     break;
                 }
@@ -352,7 +497,7 @@ impl Tab {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             if !enabled {
-                warn!(tab = %self.id, "console/network enables never succeeded; listeners disabled for this tab");
+                warn!(tab = %self.id, "console/network/dialog enables never succeeded; listeners disabled for this tab");
                 self.listeners_started.store(false, Ordering::SeqCst);
                 return;
             }
@@ -364,7 +509,7 @@ impl Tab {
         };
         use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
 
-        // Subscribe BEFORE any pump task exists: all four subscriptions must
+        // Subscribe BEFORE any pump task exists: all five subscriptions must
         // predate the navigation this setup was awaited for.
         let Some(console_stream) = self.subscribe::<EventConsoleApiCalled>("console").await else {
             self.listeners_started.store(false, Ordering::SeqCst);
@@ -388,6 +533,13 @@ impl Tab {
             self.listeners_started.store(false, Ordering::SeqCst);
             return;
         };
+        let Some(dialogs) = self
+            .subscribe::<EventJavascriptDialogOpening>("dialog")
+            .await
+        else {
+            self.listeners_started.store(false, Ordering::SeqCst);
+            return;
+        };
 
         let tab = self.clone();
         tokio::spawn(async move { Self::pump_console(tab, console_stream).await });
@@ -395,6 +547,8 @@ impl Tab {
         tokio::spawn(async move { Self::pump_log(tab, log_stream).await });
         let tab = self.clone();
         tokio::spawn(async move { Self::pump_network(tab, will_be_sent, responded).await });
+        let tab = self.clone();
+        tokio::spawn(async move { Self::pump_dialog(tab, dialogs).await });
         self.listeners_ready.store(true, Ordering::SeqCst);
     }
 
@@ -422,6 +576,7 @@ impl Tab {
                 parts.push(remote_text(arg));
             }
             tab.push_console(ConsoleEntry {
+                seq: 0,
                 level: format!("{:?}", event.r#type).to_lowercase(),
                 text: truncate_chars(&parts.join(" "), 2000),
                 url: redact_url(&tab.url()),
@@ -433,6 +588,7 @@ impl Tab {
     async fn pump_log(tab: Arc<Self>, mut stream: EventStream<EventEntryAdded>) {
         while let Some(event) = stream.next().await {
             tab.push_console(ConsoleEntry {
+                seq: 0,
                 level: event.entry.level.as_ref().to_string(),
                 text: truncate_chars(&event.entry.text, 2000),
                 url: event
@@ -446,12 +602,52 @@ impl Tab {
         }
     }
 
+    /// A page dialog either gets handled here (default policy) or stays in the
+    /// slot for the `dialog` method. Handling never takes `op_lock`: the pump
+    /// must be able to unblock a tab whose in-flight op is waiting on JS.
+    async fn pump_dialog(tab: Arc<Self>, mut stream: EventStream<EventJavascriptDialogOpening>) {
+        while let Some(event) = stream.next().await {
+            let info = DialogInfo {
+                kind: event.r#type.as_ref().to_string(),
+                message: truncate_chars(&event.message, 2000),
+                default_prompt: event
+                    .default_prompt
+                    .as_deref()
+                    .map(|prompt| truncate_chars(prompt, 500)),
+                url: redact_url(&event.url),
+                ts: now_ms(),
+            };
+            let manual = tab.dialog_manual.load(Ordering::SeqCst);
+            tab.set_dialog(Some(info.clone()));
+            if manual {
+                continue;
+            }
+            // `beforeunload` must be accepted or navigation can never complete.
+            let accept = info.kind == "beforeunload";
+            let params = HandleJavaScriptDialogParams {
+                accept,
+                prompt_text: None,
+            };
+            if let Err(err) = tab.exec(params).await {
+                warn!(tab = %tab.id, error = %err.message, "auto-handling a JavaScript dialog failed");
+            }
+            tab.set_dialog(None);
+        }
+    }
+
     async fn pump_network(
         tab: Arc<Self>,
         mut will_be_sent: EventStream<EventRequestWillBeSent>,
         mut responded: EventStream<EventResponseReceived>,
     ) {
-        let mut pending: HashMap<String, (String, String, String, f64)> = HashMap::new();
+        struct Pending {
+            method: String,
+            url: String,
+            kind: String,
+            t0: f64,
+            headers: Vec<Header>,
+        }
+        let mut pending: HashMap<String, Pending> = HashMap::new();
         loop {
             tokio::select! {
                 biased;
@@ -467,26 +663,37 @@ impl Tab {
                         .unwrap_or_else(|| "other".to_string());
                     pending.insert(
                         event.request_id.0.clone(),
-                        (
-                            event.request.method.clone(),
-                            redact_url(&event.request.url),
+                        Pending {
+                            method: event.request.method.clone(),
+                            url: redact_url(&event.request.url),
                             kind,
-                            event.timestamp.0,
-                        ),
+                            t0: event.timestamp.0,
+                            headers: collect_headers(&event.request.headers),
+                        },
                     );
                 }
                 next = responded.next() => {
                     let Some(event) = next else { break };
-                    if let Some((method, url, kind, t0)) =
-                        pending.remove(&event.request_id.0)
-                    {
-                        let ms = (event.timestamp.0 - t0) * 1000.0;
+                    if let Some(request) = pending.remove(&event.request_id.0) {
+                        let ms = (event.timestamp.0 - request.t0) * 1000.0;
+                        let encoded = event.response.encoded_data_length;
                         tab.push_network(NetworkEntry {
-                            method,
-                            url,
+                            seq: 0,
+                            request_id: event.request_id.0.clone(),
+                            method: request.method,
+                            url: request.url,
                             status: event.response.status,
                             ms: if ms.is_finite() && ms >= 0.0 { ms } else { 0.0 },
-                            kind,
+                            kind: request.kind,
+                            from_cache: event.response.from_disk_cache.unwrap_or(false)
+                                || event.response.from_service_worker.unwrap_or(false),
+                            encoded_bytes: if encoded.is_finite() && encoded >= 0.0 {
+                                encoded as i64
+                            } else {
+                                0
+                            },
+                            request_headers: request.headers,
+                            response_headers: collect_headers(&event.response.headers),
                             ts: now_ms(),
                         });
                     }
@@ -495,7 +702,8 @@ impl Tab {
         }
     }
 
-    fn push_console(&self, entry: ConsoleEntry) {
+    fn push_console(&self, mut entry: ConsoleEntry) {
+        entry.seq = self.console_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut buf = lock(&self.console);
         while buf.len() >= BUFFER_CAP {
             buf.pop_front();
@@ -503,7 +711,8 @@ impl Tab {
         buf.push_back(entry);
     }
 
-    fn push_network(&self, entry: NetworkEntry) {
+    fn push_network(&self, mut entry: NetworkEntry) {
+        entry.seq = self.network_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut buf = lock(&self.network);
         while buf.len() >= BUFFER_CAP {
             buf.pop_front();
@@ -511,34 +720,168 @@ impl Tab {
         buf.push_back(entry);
     }
 
-    /// Oldest-first, capped at `limit`, with a truncation flag.
-    pub fn drain_console(&self, limit: usize, level: Option<&str>) -> (Vec<ConsoleEntry>, bool) {
+    /// Oldest-first, capped at `limit`, with a truncation flag and the cursor
+    /// to pass back as `since`. Without `since` the newest `limit` entries are
+    /// returned (tail); with `since` the oldest unread ones (head), so a caller
+    /// polling in a loop cannot silently skip entries.
+    pub fn drain_console(
+        &self,
+        limit: usize,
+        level: Option<&str>,
+        since: Option<u64>,
+    ) -> (Vec<ConsoleEntry>, bool, u64) {
         let buf = lock(&self.console);
-        let matching: Vec<ConsoleEntry> = buf
-            .iter()
-            .filter(|entry| level.is_none_or(|want| entry.level.eq_ignore_ascii_case(want)))
-            .cloned()
-            .collect();
-        let truncated = matching.len() > limit;
-        let start = matching.len().saturating_sub(limit);
-        (matching[start..].to_vec(), truncated)
+        drain_buffered(
+            &buf,
+            limit,
+            since,
+            self.console_seq.load(Ordering::SeqCst),
+            |entry| entry.seq,
+            |entry| level.is_none_or(|want| entry.level.eq_ignore_ascii_case(want)),
+        )
     }
 
-    pub fn drain_network(&self, limit: usize, filter: Option<&str>) -> (Vec<NetworkEntry>, bool) {
+    pub fn drain_network(
+        &self,
+        limit: usize,
+        filter: Option<&str>,
+        since: Option<u64>,
+    ) -> (Vec<NetworkEntry>, bool, u64) {
         let buf = lock(&self.network);
-        let matching: Vec<NetworkEntry> = buf
-            .iter()
-            .filter(|entry| {
+        drain_buffered(
+            &buf,
+            limit,
+            since,
+            self.network_seq.load(Ordering::SeqCst),
+            |entry| entry.seq,
+            |entry| {
                 filter.is_none_or(|want| {
                     entry.url.contains(want) || entry.method.eq_ignore_ascii_case(want)
                 })
-            })
-            .cloned()
-            .collect();
-        let truncated = matching.len() > limit;
-        let start = matching.len().saturating_sub(limit);
-        (matching[start..].to_vec(), truncated)
+            },
+        )
     }
+
+    /// Read one response body by request id. Chrome evicts bodies after a
+    /// navigation or when its cache fills; that surfaces as `BODY_UNAVAILABLE`,
+    /// never as a generic internal error.
+    pub async fn response_body(
+        &self,
+        request_id: &str,
+        max_bytes: usize,
+    ) -> Result<Value, RpcError> {
+        if self.is_dead() || !self.chrome_alive.load(Ordering::SeqCst) {
+            return Err(RpcError::chrome_dead(format!(
+                "tab {} has no live browser",
+                self.id
+            )));
+        }
+        let params = GetResponseBodyParams::new(request_id.to_string());
+        let payload =
+            match tokio::time::timeout(Duration::from_secs(10), self.page.execute(params)).await {
+                Ok(Ok(response)) => response.result,
+                Ok(Err(err)) => {
+                    return Err(RpcError::body_unavailable(request_id, &err.to_string()));
+                }
+                Err(_) => {
+                    return Err(RpcError::body_unavailable(
+                        request_id,
+                        "Chrome did not answer within 10s",
+                    ));
+                }
+            };
+        let (body, total, truncated) =
+            decode_body(&payload.body, payload.base64_encoded, max_bytes)
+                .map_err(|err| RpcError::body_unavailable(request_id, &err))?;
+        Ok(serde_json::json!({
+            "request_id": request_id,
+            "body": body,
+            "base64_encoded": payload.base64_encoded,
+            "bytes": total,
+            "returned_bytes": body.len(),
+            "truncated": truncated,
+        }))
+    }
+}
+
+/// Truncate at a UTF-8 boundary. Returns `(text, truncated, original_bytes)`.
+fn truncate_utf8(text: &str, max_bytes: usize) -> (String, bool, usize) {
+    let total = text.len();
+    if total <= max_bytes {
+        return (text.to_string(), false, total);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true, total)
+}
+
+/// Decode a CDP body payload. Returns `(text, original_bytes, truncated)`.
+fn decode_body(
+    payload: &str,
+    base64_encoded: bool,
+    max_bytes: usize,
+) -> Result<(String, usize, bool), String> {
+    if base64_encoded {
+        // Bound the decode: keep whole 4-char groups so the tail still parses.
+        let take = (MAX_BODY_B64_CHARS / 4) * 4;
+        let encoded: String = payload.chars().take(take).collect();
+        let decoded = BASE64
+            .decode(encoded.as_bytes())
+            .map_err(|err| format!("invalid base64 body: {err}"))?;
+        let total = decoded.len();
+        let cut = total.min(max_bytes);
+        Ok((
+            String::from_utf8_lossy(&decoded[..cut]).into_owned(),
+            total,
+            total > cut,
+        ))
+    } else {
+        let (text, truncated, total) = truncate_utf8(payload, max_bytes);
+        Ok((text, total, truncated))
+    }
+}
+
+/// Shared ring-buffer read logic for console/network entries.
+///
+/// Returns `(entries, truncated, next_since)`. The cursor advances only over
+/// entries actually returned, so a truncated response can be resumed.
+pub fn drain_buffered<T: Clone>(
+    buf: &VecDeque<T>,
+    limit: usize,
+    since: Option<u64>,
+    latest_seq: u64,
+    seq_of: impl Fn(&T) -> u64,
+    matches: impl Fn(&T) -> bool,
+) -> (Vec<T>, bool, u64) {
+    let matching: Vec<&T> = buf
+        .iter()
+        .filter(|entry| since.is_none_or(|cursor| seq_of(entry) > cursor))
+        .filter(|entry| matches(entry))
+        .collect();
+    let truncated = matching.len() > limit;
+    let selected: Vec<T> = match since {
+        // Incremental read: oldest unread first, so the cursor never skips.
+        Some(_) => matching
+            .iter()
+            .take(limit)
+            .map(|entry| (*entry).clone())
+            .collect(),
+        // Snapshot read: newest entries are the interesting ones.
+        None => {
+            let start = matching.len().saturating_sub(limit);
+            matching[start..]
+                .iter()
+                .map(|entry| (*entry).clone())
+                .collect()
+        }
+    };
+    let next_since = match selected.last() {
+        Some(entry) => seq_of(entry),
+        None => since.unwrap_or(latest_seq),
+    };
+    (selected, truncated, next_since)
 }
 
 /// Truncate to `max` chars on a char boundary (never splits UTF-8).
@@ -904,5 +1247,151 @@ mod tests {
     fn eviction_returns_none_when_every_tab_is_actively_owned() {
         let tabs = vec![("t1".to_string(), Some("other".to_string()), 99_999)];
         assert_eq!(pick_eviction(&tabs, "me", 10_000, 100_000), None);
+    }
+
+    #[derive(Clone, Debug)]
+    struct Row {
+        seq: u64,
+        keep: bool,
+    }
+
+    fn rows(count: u64) -> VecDeque<Row> {
+        (1..=count)
+            .map(|seq| Row {
+                seq,
+                keep: seq % 2 == 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drain_without_cursor_returns_the_newest_window() {
+        let buf = rows(10);
+        let (out, truncated, next) = drain_buffered(&buf, 3, None, 10, |r| r.seq, |_| true);
+        assert_eq!(
+            out.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+        assert!(truncated);
+        assert_eq!(next, 10);
+    }
+
+    #[test]
+    fn drain_with_cursor_returns_oldest_unread_and_advances() {
+        let buf = rows(10);
+        let (out, truncated, next) = drain_buffered(&buf, 3, Some(2), 10, |r| r.seq, |_| true);
+        assert_eq!(out.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+        assert!(truncated);
+        assert_eq!(next, 5, "cursor must not skip the unread tail");
+
+        let (out, truncated, next) = drain_buffered(&buf, 3, Some(5), 10, |r| r.seq, |_| true);
+        assert_eq!(out.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![6, 7, 8]);
+        assert!(truncated);
+        assert_eq!(next, 8);
+    }
+
+    #[test]
+    fn drain_with_cursor_and_no_new_entries_keeps_the_cursor() {
+        let buf = rows(4);
+        let (out, truncated, next) = drain_buffered(&buf, 10, Some(4), 4, |r| r.seq, |_| true);
+        assert!(out.is_empty());
+        assert!(!truncated);
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn drain_applies_the_filter_before_the_window() {
+        let buf = rows(10);
+        let (out, _, next) = drain_buffered(&buf, 2, None, 10, |r| r.seq, |r| r.keep);
+        assert_eq!(out.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![8, 10]);
+        assert_eq!(next, 10);
+    }
+
+    #[test]
+    fn collect_headers_redacts_secrets_case_insensitively() {
+        let headers = Headers::new(serde_json::json!({
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-live-secret",
+            "COOKIE": "session=abc",
+            "Set-Cookie": "a=b; HttpOnly",
+            "X-Api-Key": "k-123",
+            "X-Trace": "abc",
+        }));
+        let collected = collect_headers(&headers);
+        let get = |name: &str| {
+            collected
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case(name))
+                .map(|header| header.value.as_str())
+                .unwrap_or("")
+        };
+        assert_eq!(get("content-type"), "application/json");
+        assert_eq!(get("authorization"), "[redacted]");
+        assert_eq!(get("cookie"), "[redacted]");
+        assert_eq!(get("set-cookie"), "[redacted]");
+        assert_eq!(get("x-api-key"), "[redacted]");
+        assert_eq!(get("x-trace"), "abc");
+    }
+
+    #[test]
+    fn collect_headers_bounds_count_and_value_length() {
+        let mut map = serde_json::Map::new();
+        for i in 0..(MAX_HEADERS + 10) {
+            map.insert(format!("x-{i}"), Value::String("v".to_string()));
+        }
+        map.insert("a-long".to_string(), Value::String("y".repeat(2000)));
+        let collected = collect_headers(&Headers::new(Value::Object(map)));
+        assert_eq!(collected.len(), MAX_HEADERS);
+        let long = collected
+            .iter()
+            .find(|header| header.name == "a-long")
+            .expect("early-sorting header kept");
+        assert!(long.value.chars().count() <= MAX_HEADER_VALUE + 1);
+    }
+
+    #[test]
+    fn truncate_utf8_never_splits_a_char() {
+        let text = "aé€𝄞"; // 1 + 2 + 3 + 4 bytes
+        let (cut, truncated, total) = truncate_utf8(text, 3);
+        assert_eq!(total, text.len());
+        assert!(truncated);
+        assert_eq!(cut, "aé", "byte 3 is the start of €, so it is a valid cut");
+        let (cut, _, _) = truncate_utf8(text, 4);
+        assert_eq!(cut, "aé", "byte 4 is inside €, so back off to byte 3");
+        let (cut, truncated, _) = truncate_utf8(text, 100);
+        assert!(!truncated);
+        assert_eq!(cut, text);
+    }
+
+    #[test]
+    fn decode_body_passes_plain_text_and_truncates() {
+        let (body, total, truncated) = decode_body("hello world", false, 5).expect("decode");
+        assert_eq!(body, "hello");
+        assert_eq!(total, 11);
+        assert!(truncated);
+
+        let (body, total, truncated) = decode_body("hello", false, 5).expect("decode");
+        assert_eq!(body, "hello");
+        assert_eq!(total, 5);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn decode_body_decodes_base64_and_truncates() {
+        // "hello world" in base64.
+        let (body, total, truncated) = decode_body("aGVsbG8gd29ybGQ=", true, 5).expect("decode");
+        assert_eq!(body, "hello");
+        assert_eq!(total, 11);
+        assert!(truncated);
+
+        let (body, _, truncated) = decode_body("aGVsbG8gd29ybGQ=", true, 1024).expect("decode");
+        assert_eq!(body, "hello world");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn decode_body_reports_invalid_base64() {
+        let err = decode_body("!!!not-base64!!!", true, 1024).expect_err("must fail");
+        assert!(err.contains("invalid base64"), "{err}");
     }
 }

@@ -146,6 +146,17 @@ impl ChromeManager {
             .viewport(None)
             .window_size(1280, 800)
             .user_data_dir(&profile)
+            // E lane: chromey's per-target NetworkManager answers EVERY
+            // `Fetch.requestPaused` it sees (continue for allowed URLs) and
+            // always wins the race against a page-listener pump — a daemon
+            // `Fetch.enable` alone can never mock deterministically. With
+            // `request_intercept` the manager enables Fetch itself at target
+            // creation and then STEPS ASIDE (user+protocol flags), leaving
+            // the daemon pump as the sole answerer on every tab. Cost: every
+            // request takes one CDP round trip through `pump_fetch`
+            // (passthrough when no route matches), armed from tab birth in
+            // `setup_listeners` so no pause can predate the pump.
+            .enable_request_intercept()
             .args([
                 "--disable-gpu",
                 "--no-first-run",

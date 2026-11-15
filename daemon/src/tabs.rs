@@ -12,8 +12,10 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused;
-use chromiumoxide::cdp::browser_protocol::fetch::HeaderEntry;
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    AuthChallengeResponse, AuthChallengeResponseResponse, ContinueWithAuthParams,
+    EventAuthRequired, EventRequestPaused, HeaderEntry,
+};
 use chromiumoxide::cdp::browser_protocol::log::EventEntryAdded;
 use chromiumoxide::cdp::browser_protocol::network::{
     ErrorReason, EventRequestWillBeSent, EventResponseReceived, GetResponseBodyParams, Headers,
@@ -278,10 +280,9 @@ pub struct Tab {
     /// Cleared by [`Tab::mark_dead`], so `close_tab`, `remove_all` and
     /// `sweep` all drop every mock — a fresh tab always starts unmocked.
     routes: StdMutex<Vec<MockRoute>>,
-    /// Fetch-intercept arm state: `fetch_started` elects the single task that
-    /// runs `Fetch.enable` + spawns the intercept pump; `fetch_armed` gates
-    /// mock installation so a route is never stored unenforced.
-    fetch_started: AtomicBool,
+    /// Set once the intercept pump (`pump_fetch`) is subscribed. `route`
+    /// refuses to record a mock before this flips (fail closed: a stored
+    /// but unenforced mock would lie).
     fetch_armed: AtomicBool,
 }
 
@@ -438,7 +439,6 @@ impl Tab {
             listeners_started: AtomicBool::new(false),
             listeners_ready: AtomicBool::new(false),
             routes: StdMutex::new(Vec::new()),
-            fetch_started: AtomicBool::new(false),
             fetch_armed: AtomicBool::new(false),
         }
     }
@@ -777,8 +777,12 @@ impl Tab {
         };
         use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
 
-        // Subscribe BEFORE any pump task exists: all five subscriptions must
-        // predate the navigation this setup was awaited for.
+        // Subscribe BEFORE any pump task exists: all subscriptions must
+        // predate the navigation this setup was awaited for. The fetch pair
+        // is armed from tab birth (E lane): with `request_intercept` the
+        // manager enables Fetch at target creation and steps aside, so this
+        // pump is the sole answerer — a missing subscription here would
+        // wedge the tab, hence the same fail-setup-and-retry path.
         let Some(console_stream) = self.subscribe::<EventConsoleApiCalled>("console").await else {
             self.listeners_started.store(false, Ordering::SeqCst);
             return;
@@ -808,6 +812,14 @@ impl Tab {
             self.listeners_started.store(false, Ordering::SeqCst);
             return;
         };
+        let Some(paused) = self.subscribe::<EventRequestPaused>("fetch").await else {
+            self.listeners_started.store(false, Ordering::SeqCst);
+            return;
+        };
+        let Some(auth) = self.subscribe::<EventAuthRequired>("fetch-auth").await else {
+            self.listeners_started.store(false, Ordering::SeqCst);
+            return;
+        };
 
         let tab = self.clone();
         tokio::spawn(async move { Self::pump_console(tab, console_stream).await });
@@ -817,6 +829,9 @@ impl Tab {
         tokio::spawn(async move { Self::pump_network(tab, will_be_sent, responded).await });
         let tab = self.clone();
         tokio::spawn(async move { Self::pump_dialog(tab, dialogs).await });
+        let tab = self.clone();
+        tokio::spawn(async move { Self::pump_fetch(tab, paused, auth).await });
+        self.fetch_armed.store(true, Ordering::SeqCst);
         self.listeners_ready.store(true, Ordering::SeqCst);
     }
 
@@ -1171,90 +1186,93 @@ impl Tab {
         Self::push_route(&mut routes, route)
     }
 
-    /// Arm `Fetch.enable` (all URLs paused) and spawn the intercept pump, once
-    /// per tab. Idempotent: exactly one task enables + pumps; concurrent
-    /// callers wait briefly for `fetch_armed` instead of double-enabling.
+    /// Arm check for `route`: the intercept pump is armed from tab birth in
+    /// `setup_listeners` (Fetch itself is enabled at target creation by
+    /// chromey's stepping-aside manager). A route is never recorded
+    /// unenforced: if the pump is not armed, fail closed.
     pub async fn ensure_fetch_intercept(self: &Arc<Self>) -> Result<(), RpcError> {
         if self.fetch_armed.load(Ordering::SeqCst) {
             return Ok(());
         }
-        if self
-            .fetch_started
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            use chromiumoxide::cdp::browser_protocol::fetch::EnableParams;
-            let result = self
-                .exec_timeout(EnableParams::builder().build(), Duration::from_secs(10))
-                .await;
-            match result {
-                Ok(_) => {
-                    let tab = self.clone();
-                    tokio::spawn(async move { Self::pump_fetch(tab).await });
-                    self.fetch_armed.store(true, Ordering::SeqCst);
-                    Ok(())
-                }
-                Err(err) => {
-                    self.fetch_started.store(false, Ordering::SeqCst);
-                    Err(err)
-                }
+        self.ensure_listeners().await;
+        for _ in 0..50 {
+            if self.fetch_armed.load(Ordering::SeqCst) {
+                return Ok(());
             }
-        } else {
-            for _ in 0..50 {
-                if self.fetch_armed.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(RpcError::new(
-                ErrorCode::Internal,
-                "fetch intercept did not arm in time",
-                "retry the route call; report a daemon bug if it persists",
-            ))
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        Err(RpcError::new(
+            ErrorCode::Internal,
+            "fetch intercept did not arm in time",
+            "retry the route call; report a daemon bug if it persists",
+        ))
     }
 
     /// Intercept pump: every paused request gets exactly one answer —
     /// fulfill, fail, or continue — so the page can never wedge on an
-    /// unanswered pause. A dead tab has no routes (cleared in `mark_dead`),
-    /// so late pauses fall through to passthrough.
-    async fn pump_fetch(tab: Arc<Self>) {
+    /// unanswered pause. Auth challenges are answered `Default` (browser
+    /// default handling, same as without interception). A dead tab has no
+    /// routes (cleared in `mark_dead`), so late pauses fall through to
+    /// passthrough. Fulfilled mocks carry ONLY `content-type` (+ body):
+    /// request headers (and their secrets) are never reflected into a mock.
+    async fn pump_fetch(
+        tab: Arc<Self>,
+        mut paused: EventStream<EventRequestPaused>,
+        mut auth: EventStream<EventAuthRequired>,
+    ) {
         use chromiumoxide::cdp::browser_protocol::fetch::{
             ContinueRequestParams, FailRequestParams, FulfillRequestParams,
         };
-        let Some(mut stream) = tab.subscribe::<EventRequestPaused>("fetch").await else {
-            tab.fetch_started.store(false, Ordering::SeqCst);
-            warn!(tab = %tab.id, "fetch listener subscription failed; routes unenforced");
-            return;
-        };
-        while let Some(event) = stream.next().await {
-            let decision = tab.match_route(&event.request.url);
-            let request_id = event.request_id.clone();
-            let answered = match decision {
-                None => tab
-                    .exec(ContinueRequestParams::new(request_id))
-                    .await
-                    .map(|_| ()),
-                Some(route) if route.action == RouteAction::Abort => tab
-                    .exec(FailRequestParams::new(
-                        request_id,
-                        ErrorReason::BlockedByClient,
-                    ))
-                    .await
-                    .map(|_| ()),
-                Some(route) => {
-                    let body = BASE64.encode(route.body.as_bytes());
-                    let mut params = FulfillRequestParams::new(request_id, route.status);
-                    params.response_headers =
-                        Some(Self::fulfill_response_headers(&route.content_type));
-                    params.body = Some(Binary::from(body));
-                    tab.exec(params).await.map(|_| ())
+        loop {
+            tokio::select! {
+                biased;
+                next = paused.next() => {
+                    let Some(event) = next else { break };
+                    let decision = tab.match_route(&event.request.url);
+                    let request_id = event.request_id.clone();
+                    debug!(
+                        tab = %tab.id,
+                        url = %redact_url(&event.request.url),
+                        matched = decision.is_some(),
+                        "fetch pause answered"
+                    );
+                    let answered = match decision {
+                        None => tab.exec(ContinueRequestParams::new(request_id)).await.map(|_| ()),
+                        Some(route) if route.action == RouteAction::Abort => tab
+                            .exec(FailRequestParams::new(
+                                request_id,
+                                ErrorReason::BlockedByClient,
+                            ))
+                            .await
+                            .map(|_| ()),
+                        Some(route) => {
+                            let body = BASE64.encode(route.body.as_bytes());
+                            let mut params = FulfillRequestParams::new(request_id, route.status);
+                            params.response_headers =
+                                Some(Self::fulfill_response_headers(&route.content_type));
+                            params.body = Some(Binary::from(body));
+                            tab.exec(params).await.map(|_| ())
+                        }
+                    };
+                    if let Err(err) = answered {
+                        // The pause may have lapsed (navigation, double answer)
+                        // — log and keep pumping: one missed answer must not
+                        // kill mocks.
+                        debug!(tab = %tab.id, error = %err.message, "fetch answer failed");
+                    }
                 }
-            };
-            if let Err(err) = answered {
-                // The pause may have lapsed (navigation, double answer) — log
-                // and keep pumping: one missed answer must not kill mocks.
-                debug!(tab = %tab.id, error = %err.message, "fetch answer failed");
+                next = auth.next() => {
+                    let Some(event) = next else { break };
+                    // Defer to the net stack's default (cancel auth or show
+                    // the prompt): identical to no interception.
+                    let params = ContinueWithAuthParams::new(
+                        event.request_id.clone(),
+                        AuthChallengeResponse::new(AuthChallengeResponseResponse::Default),
+                    );
+                    if let Err(err) = tab.exec(params).await {
+                        debug!(tab = %tab.id, error = %err.message, "fetch auth answer failed");
+                    }
+                }
             }
         }
     }

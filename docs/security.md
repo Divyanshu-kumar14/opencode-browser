@@ -106,9 +106,11 @@ session tab.
   (`TAB_FORBIDDEN` otherwise), and `mark_dead` clears the table, so
   `close_tab`, `remove_all`, `sweep`, and eviction all drop every mock.
   Requests with no matching route pass through untouched.
-- Arming pauses every request on the tab (`Fetch.enable`, no patterns);
-  the daemon pump answers each pause with exactly one continue/fulfill/fail,
-  so a mock can never wedge the page.
+- Arming: Chrome launches with `request_intercept`, so chromey's manager
+  enables Fetch at target creation and steps aside; the daemon pump (armed
+  from tab birth) answers each pause with exactly one continue/fulfill/fail,
+  so a mock can never wedge the page. Auth challenges are answered
+  `Default` (browser default handling).
 
 ## Session and tab isolation
 

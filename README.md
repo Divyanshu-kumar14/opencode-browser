@@ -91,7 +91,65 @@ All options are optional; defaults shown.
 | `idle_timeout_s` | seconds | `1800` | daemon exits after 30 min with zero tabs |
 | `OPENCODE_BROWSER_ATTACH` (env) | `"1"` | unset | probe local `:9222` and attach to a debug-enabled Chrome instead of launching — explicit opt-in, localhost-only, fails closed |
 
-## 🧰 Tools
+## 🧠 Perception-action engine (stateful, Antigravity-grade)
+
+`plugin/src/index.ts` now registers a stateful perception-action loop on top of
+Playwright (system Chromium), replacing guess-the-selector automation with:
+
+1. **Set-of-Mark visual + semantic perception** (`src/injected/dom-annotator.ts`) —
+   traverses DOM + open shadow roots, filters occluded/invisible nodes via
+   `elementFromPoint`, assigns deterministic `[1..N]` ids in reading order
+   (cap 100, labels truncated to 60 chars), tags nodes with `data-opencode-id`,
+   and draws numbered badges into a temporary overlay for screenshots only.
+2. **Live human-visible HUD** (`src/injected/agent-hud.ts`) — isolated Shadow DOM
+   status pill, smooth SVG virtual cursor, click ripple; hidden during capture.
+3. **Deterministic settling** (`src/core/settle.ts`) — 50 ms kickoff + network
+   quiet (fetch/xhr/document, 250 ms window, 2.5 s max) + double-rAF with a
+   MutationObserver quiet window.
+4. **Passive DevTools telemetry** (`src/core/telemetry.ts`) — bounded ring buffer
+   (200) for console errors/warnings, uncaught exceptions, HTTP ≥ 400, and
+   failed requests; every tool drains only the delta since the last call.
+
+Every mutating tool runs the closed loop:
+`HUD update → execute → waitForSettled → re-index + annotated screenshot →
+drain telemetry → formatted payload`, and screenshots are saved under
+`.opencode/browser-screenshots/` (temp PNG + `{type:"file"}` attachment).
+
+| Tool | What it does | Returns |
+|---|---|---|
+| `browse_navigate` | goto / back / forward / reload, then settle + perceive | element map + screenshot + telemetry |
+| `browse_interact` | single action or batched `actions[]` (type/click/hover/scroll/press_key/select_option/wait) by `elementId`, selector, or coords; stale-ID recovery stops the batch cleanly | element map + screenshot + telemetry |
+| `browse_snapshot` | re-index + fresh screenshot (annotated by default) without mutating | element map + screenshot + telemetry |
+| `browse_inspect` | deep diagnostics: tag, attrs, bbox, visibility, computed styles | inspect block + telemetry |
+| `browse_viewport` | resize to preset (desktop 1440x900, laptop 1280x800, tablet 768x1024, mobile 390x844) or custom | element map + screenshot + telemetry |
+| `browse_eval` | sandboxed JS in page context (localStorage, globals, React state) | serialized value + telemetry |
+
+Agent workflow (embedded in each tool description): prefer `elementId` from the
+`[id]` map over CSS selectors · batch fill+submit in one `browser_interact`
+turn · check the Telemetry section after every action · use `browser_inspect`
+for CSS/layout debugging.
+
+Legacy shim (Rust daemon RPC: `plugin/src/{tools,supervisor,rpc,driver}.ts`)
+remains in-tree and typechecks; the plugin entry now wires the stateful engine.
+
+### Engine environment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OPENCODE_BROWSER_HEADLESS` | unset (headful) | set `1`/`true` for headless (CI, servers) |
+| `OPENCODE_BROWSER_CDP_URL` | unset (persistent launch) | e.g. `http://127.0.0.1:9222` — attach to a running Chrome instead of launching |
+| `OPENCODE_BROWSER_PROFILE_DIR` | `.opencode/browser-profile` | persistent profile (cookies/localStorage survive runs) |
+| `OPENCODE_BROWSER_EXECUTABLE_PATH` | auto-detected (`/usr/bin/chromium`, …) or `CHROME_PATH` | override when Playwright has no bundled browser |
+| `OPENCODE_BROWSER_SCREENSHOT_DIR` | `.opencode/browser-screenshots` | annotated PNG output |
+| `OPENCODE_BROWSER_MAX_ELEMENTS` | `100` | SoM index cap |
+| `OPENCODE_BROWSER_MAX_TELEMETRY` | `200` | ring-buffer bound |
+| `OPENCODE_BROWSER_SETTLE_MAX_TIMEOUT_MS` / `OPENCODE_BROWSER_SETTLE_QUIET_WINDOW_MS` | `2500` / `250` | settle budget |
+
+Attach to an existing Chrome:
+`chromium --remote-debugging-port=9222` (or Chrome with the same flag), then
+`OPENCODE_BROWSER_CDP_URL=http://127.0.0.1:9222`.
+
+## 🧰 Tools (legacy daemon shim)
 
 <div align="center">
 

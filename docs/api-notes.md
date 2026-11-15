@@ -209,12 +209,15 @@ tab_id?}` → `{pattern, kind, action, routes}` (active-route count).
 `content_type` (default `text/plain`, printable ASCII, 128 chars) apply to
 fulfill only — `abort` rejects them rather than silently dropping them.
 
-**Enforcement:** `Fetch.enable` with no patterns pauses *every* request on
-the tab; the daemon pump answers each pause with exactly one of
-continue/fulfill/fail (`BlockedByClient` for abort), so the page can never
-wedge on an unanswered pause. First matching route (insertion order) wins;
-no match passes through. `Fetch.enable` + pump spawn happen once per tab
-(`fetch_started`/`fetch_armed` election); the table holds 20 routes max.
+**Enforcement (pinned-fork truth, not web lore):** chromey's per-target `NetworkManager` answers *every* `Fetch.requestPaused` it sees
+(continue for allowed URLs) and always wins the race against a page-listener pump — a daemon-side `Fetch.enable` alone can therefore never mock
+deterministically (every answer lost with `Invalid state for continueInterceptedRequest`, verified live). So the daemon launches Chrome with
+`request_intercept`, under which the manager enables Fetch itself at target creation and then STEPS ASIDE (user+protocol flags), leaving the daemon
+pump as the sole answerer. The pump is subscribed from tab birth in `setup_listeners` (awaited before every load-triggering op, so no pause can
+predate it) and answers each pause with exactly one of continue/fulfill/fail (`BlockedByClient` for abort), so the page can never wedge on an
+unanswered pause. Auth challenges (the manager enables with `handle_auth_requests`) are answered `Default` — browser default handling, identical to
+no interception. First matching route (insertion order) wins; no match passes through. The table holds 20 routes max; `fetch_armed` gates `route`
+so a mock is never recorded unenforced.
 
 **Trust boundary:** substring/prefix/host are literal string operations
 (`*`/`?` match themselves) — no regex crate touches untrusted input, so no

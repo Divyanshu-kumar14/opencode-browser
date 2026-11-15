@@ -383,6 +383,72 @@ describe("executors", () => {
     });
   });
 
+  test("route forwards pattern, action and fulfill options", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: {
+        route: {
+          result: { pattern: "/api/ping", action: "fulfill", routes: 1 },
+        },
+      },
+    });
+    const out = await createExecutors(deps)["route"]?.(
+      {
+        pattern: "/api/ping",
+        action: "fulfill",
+        kind: "substring",
+        status: 200,
+        body: '{"pong":"mock"}',
+        content_type: "application/json",
+      },
+      fakeContext(),
+    );
+    expect(calls[0]?.method).toBe("route");
+    expect(calls[0]?.params).toMatchObject({
+      pattern: "/api/ping",
+      action: "fulfill",
+      kind: "substring",
+      status: 200,
+      body: '{"pong":"mock"}',
+      content_type: "application/json",
+    });
+    expect(out?.content).toBe("route fulfill /api/ping (1 active)");
+  });
+
+  test("route omits unset optionals and rejects empty params before any RPC", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: { route: { result: { pattern: "/ads/", action: "abort" } } },
+    });
+    const out = await createExecutors(deps)["route"]?.(
+      { pattern: "/ads/", action: "abort" },
+      fakeContext(),
+    );
+    expect(calls[0]?.params).toEqual({ pattern: "/ads/", action: "abort" });
+    expect(out?.content).toBe("route abort /ads/");
+
+    const denied = await createExecutors(deps)["route"]?.(
+      { pattern: "/ads/" },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(denied).toBeInstanceOf(ToolError);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("route rejects oversized patterns before any RPC", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({ calls });
+    const error = await createExecutors(deps)["route"]?.(
+      { pattern: "p".repeat(513), action: "fulfill" },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).message).toContain("512 char limit");
+    expect(calls).toEqual([]);
+  });
+
   test("missing required params fail before any RPC", async () => {
     const calls: { method: string; params: Record<string, unknown> }[] = [];
     const deps = fakeDeps({ calls });

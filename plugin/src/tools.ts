@@ -1,5 +1,5 @@
 /**
- * Browser tool surface (plan §Phase 2–3): 16 executors over the daemon RPC.
+ * Browser tool surface (plan §Phase 2–3): 19 executors over the daemon RPC.
  *
  * Effective names come from `options.namespace` (`browse_navigate`, … —
  * see docs/api-notes.md), declared names below are the short suffixes.
@@ -37,6 +37,8 @@ export const UPLOAD_PERMISSION = "browser_upload";
 export const MAX_LOG_ENTRIES = 500;
 /** Mirrors `daemon/src/policy.rs`; the daemon is the real boundary. */
 export const MAX_UPLOAD_FILES = 8;
+/** Mirrors `daemon/src/tabs.rs` (`MAX_ROUTE_PATTERN`); the daemon is the real boundary. */
+export const MAX_ROUTE_PATTERN = 512;
 
 export interface BrowserDeps {
   readonly permission: Pick<PermissionDomain, "assert">;
@@ -290,6 +292,14 @@ export function formatNetworkBody(result: unknown): string {
   return body.length === 0 ? `(empty body; ${summary})` : `${summary}\n${body}`;
 }
 
+export function formatRoute(result: unknown): string {
+  const action = textField(result, "action") ?? "(unknown action)";
+  const pattern = textField(result, "pattern") ?? "(unknown pattern)";
+  const routes = asRecord(result)["routes"];
+  const count = typeof routes === "number" ? ` (${routes} active)` : "";
+  return `route ${action} ${pattern}${count}`;
+}
+
 export function formatTabsList(result: unknown): string {
   const tabs = asRecord(result)["tabs"];
   if (!Array.isArray(tabs) || tabs.length === 0) {
@@ -353,6 +363,21 @@ export function formatScroll(result: unknown): string {
   const y = typeof record["scrollY"] === "number" ? record["scrollY"] : 0;
   const bottom = record["at_bottom"] === true ? " (at bottom)" : "";
   return `scrolled to ${x},${y}${bottom}`;
+}
+
+export function formatWaitForUid(result: unknown): string {
+  const record = asRecord(result);
+  if (record["found"] !== true) return "uid not found";
+  const uid = textField(result, "uid") ?? "(unknown uid)";
+  const ms = typeof record["elapsed_ms"] === "number" ? record["elapsed_ms"] : 0;
+  return `found uid ${uid} in ${ms}ms`;
+}
+
+export function formatExpectText(result: unknown): string {
+  const record = asRecord(result);
+  if (record["matched"] !== true) return "text not matched";
+  const ms = typeof record["elapsed_ms"] === "number" ? record["elapsed_ms"] : 0;
+  return `matched text in ${ms}ms`;
 }
 
 type Executor = (
@@ -435,7 +460,7 @@ function pathsParam(input: unknown, key: string): string[] {
   return paths;
 }
 
-/** The 16 browser executors, keyed by RPC method. Tested directly. */
+/** The 19 browser executors, keyed by RPC method. Tested directly. */
 export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
   // Last good snapshot nodes per session+tab, so a UID_STALE failure can be
   // re-resolved by role+name. Populated by the snapshot executor and by every
@@ -791,6 +816,63 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
     return { content: formatNetworkBody(result), metadata: rawMetadata(result) };
   };
 
+  const route: Executor = async (input, context) => {
+    const pattern = stringParam(input, "pattern", { required: true });
+    const action = stringParam(input, "action", { required: true });
+    // Fail fast on the mirrored bound; the daemon re-validates (it is the
+    // trust boundary) so a hostile client gains nothing by skipping this.
+    if (pattern !== undefined && pattern.length > MAX_ROUTE_PATTERN) {
+      throw new ToolError({
+        message: `route pattern is ${pattern.length} chars, over the ${MAX_ROUTE_PATTERN} char limit`,
+        metadata: {
+          code: "INTERNAL",
+          hint: "use a shorter, distinctive substring instead of a whole URL",
+        },
+      });
+    }
+    const record = asRecord(input);
+    const result = await daemonCall(deps, context, "route", {
+      pattern,
+      action,
+      ...optionalTabId(input),
+      ...(typeof record["kind"] === "string" ? { kind: record["kind"] } : {}),
+      ...(typeof record["status"] === "number"
+        ? { status: record["status"] }
+        : {}),
+      ...(typeof record["body"] === "string" ? { body: record["body"] } : {}),
+      ...(typeof record["content_type"] === "string"
+        ? { content_type: record["content_type"] }
+        : {}),
+    });
+    return { content: formatRoute(result), metadata: rawMetadata(result) };
+  };
+
+  const waitForUid: Executor = async (input, context) => {
+    const uid = stringParam(input, "uid", { required: true });
+    const record = asRecord(input);
+    const result = await daemonCall(deps, context, "wait_for_uid", {
+      uid,
+      ...optionalTabId(input),
+      ...(typeof record["timeout_ms"] === "number"
+        ? { timeout_ms: record["timeout_ms"] }
+        : {}),
+    });
+    return { content: formatWaitForUid(result), metadata: rawMetadata(result) };
+  };
+
+  const expectText: Executor = async (input, context) => {
+    const text = stringParam(input, "text", { required: true });
+    const record = asRecord(input);
+    const result = await daemonCall(deps, context, "expect_text", {
+      text,
+      ...optionalTabId(input),
+      ...(typeof record["timeout_ms"] === "number"
+        ? { timeout_ms: record["timeout_ms"] }
+        : {}),
+    });
+    return { content: formatExpectText(result), metadata: rawMetadata(result) };
+  };
+
   const listTabs: Executor = async (_input, context) => {
     const result = await daemonCall(deps, context, "list_tabs", {});
     return { content: formatTabsList(result), metadata: rawMetadata(result) };
@@ -820,6 +902,9 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
     console: consoleLog,
     network,
     network_body: networkBody,
+    route,
+    wait_for_uid: waitForUid,
+    expect_text: expectText,
     list_tabs: listTabs,
     close_tab: closeTab,
   };
@@ -1087,6 +1172,71 @@ export function registerBrowserTools(
           },
         },
         ["request_id"],
+      ),
+      options: { ...baseOptions },
+    },
+    {
+      name: "route",
+      description:
+        "Mock a request URL pattern on your session tab: fulfill with a fixture body or abort it. Literal substring/prefix/host match, never regex; mocks die with the tab.",
+      input: schema(
+        {
+          pattern: {
+            type: "string",
+            description:
+              "Literal URL substring, prefix, or bare host to match (max 512 chars).",
+          },
+          action: { type: "string", description: "fulfill or abort." },
+          kind: {
+            type: "string",
+            description: "substring (default), prefix, or host.",
+          },
+          status: {
+            type: "number",
+            description: "Fulfill HTTP status (default 200).",
+          },
+          body: { type: "string", description: "Fulfill fixture body." },
+          content_type: {
+            type: "string",
+            description: "Fulfill content-type (default text/plain).",
+          },
+          tab_id: SCHEMA_TAB_ID,
+        },
+        ["pattern", "action"],
+      ),
+      options: { ...baseOptions },
+    },
+    {
+      name: "wait_for_uid",
+      description:
+        "Wait until the element with the given [uid] appears (bounded poll, default 5s, max 30s). Success reports elapsed_ms; a blown deadline is NAV_TIMEOUT.",
+      input: schema(
+        {
+          uid: { type: "string", description: "Element uid to wait for." },
+          tab_id: SCHEMA_TAB_ID,
+          timeout_ms: {
+            type: "number",
+            description: "Wait budget (default 5000, max 30000).",
+          },
+        },
+        ["uid"],
+      ),
+      options: { ...baseOptions },
+    },
+    {
+      name: "expect_text",
+      description:
+        "Wait until the page text contains the substring (bounded poll, plain case-sensitive match, default 5s, max 30s). A blown deadline is NAV_TIMEOUT.",
+      input: schema(
+        {
+          text: { type: "string", description: "Substring to wait for." },
+          tab_id: SCHEMA_TAB_ID,
+          timeout_ms: {
+            type: "number",
+            description: "Wait budget (default 5000, max 30000).",
+          },
+        },
+        ["text"],
       ),
       options: { ...baseOptions },
     },

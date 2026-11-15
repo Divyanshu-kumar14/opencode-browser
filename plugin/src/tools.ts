@@ -20,7 +20,7 @@ import type {
   ToolEditor,
 } from "@opencode/plugin/promise/tool";
 import type { PermissionDomain } from "@opencode/plugin/promise/permission";
-import { DaemonError } from "./errors.ts";
+import { DaemonError, isUidStaleError } from "./errors.ts";
 import type { RpcClient } from "./rpc.ts";
 
 /**
@@ -133,6 +133,66 @@ function clampLogLimit(limit: unknown): number {
   const fallback = 100;
   if (typeof limit !== "number" || !Number.isFinite(limit)) return fallback;
   return Math.min(Math.max(Math.floor(limit), 1), MAX_LOG_ENTRIES);
+}
+
+// ---------------------------------------------------------------------------
+// Stale-uid recovery (shim-only, exactly-once).
+//
+// A uid encodes its navigation generation (`g{gen}-{n}`), so acting on an
+// element from a previous page fails with `UID_STALE`. The recovery is a
+// fixed 4-step sequence with no loop: re-snapshot once, re-resolve the stale
+// uid to a fresh one by matching its cached role+name, retry the action
+// exactly once. Any miss surfaces the ORIGINAL error so the agent — not this
+// wrapper — decides the next move.
+// ---------------------------------------------------------------------------
+
+/** Minimal identity of a snapshot node, enough to re-resolve it later. */
+export interface SnapshotRefNode {
+  readonly uid: string;
+  readonly role: string;
+  readonly name: string;
+}
+
+const SNAPSHOT_LINE_PATTERN = /^\[([^\]]+)\]\s+(\S+)(?:\s+"([^"]*)")?/;
+
+/**
+ * Pull re-resolvable nodes out of a snapshot result. Prefers the structured
+ * `nodes` array; falls back to parsing the rendered `[uid] role "name"`
+ * text lines so an older daemon shape still recovers.
+ */
+export function extractSnapshotNodes(result: unknown): SnapshotRefNode[] {
+  const record = asRecord(result);
+  const nodes = record["nodes"];
+  if (Array.isArray(nodes)) {
+    const structured: SnapshotRefNode[] = [];
+    for (const entry of nodes) {
+      const node = asRecord(entry);
+      const uid = node["uid"];
+      const role = node["role"];
+      const name = node["name"];
+      if (
+        typeof uid === "string" &&
+        typeof role === "string" &&
+        typeof name === "string"
+      ) {
+        structured.push({ uid, role, name });
+      }
+    }
+    if (structured.length > 0) return structured;
+    // Empty/foreign `nodes` shape: try the text rendering below.
+  }
+  const text = textField(result, "text");
+  if (text === undefined) return [];
+  const parsed: SnapshotRefNode[] = [];
+  for (const line of text.split("\n")) {
+    const match = SNAPSHOT_LINE_PATTERN.exec(line.trim());
+    const uid = match?.[1];
+    const role = match?.[2];
+    if (uid !== undefined && role !== undefined) {
+      parsed.push({ uid, role, name: match?.[3] ?? "" });
+    }
+  }
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +437,78 @@ function pathsParam(input: unknown, key: string): string[] {
 
 /** The 16 browser executors, keyed by RPC method. Tested directly. */
 export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
+  // Last good snapshot nodes per session+tab, so a UID_STALE failure can be
+  // re-resolved by role+name. Populated by the snapshot executor and by every
+  // recovery re-snapshot below.
+  const snapshotCache = new Map<string, SnapshotRefNode[]>();
+  const cacheKey = (sessionID: string, tabId: string | undefined): string =>
+    `${sessionID} ${tabId ?? ""}`;
+
+  const rememberSnapshot = (
+    context: ToolContext,
+    tabId: string | undefined,
+    result: unknown,
+  ): void => {
+    snapshotCache.set(
+      cacheKey(context.sessionID, tabId),
+      extractSnapshotNodes(result),
+    );
+  };
+
+  /**
+   * Run `attempt` with `uid`; on `UID_STALE` only, re-snapshot once and retry
+   * exactly once with the fresh uid whose role+name matches the stale one.
+   * No loop: every miss (unknown uid, failed re-snapshot, no match) rethrows
+   * the ORIGINAL error. A failure of the retry itself surfaces as-is — it is
+   * the freshest signal (e.g. the new node is occluded).
+   */
+  async function callWithStaleUidRetry(
+    context: ToolContext,
+    uid: string | undefined,
+    tabId: string | undefined,
+    attempt: (uid: string | undefined) => Promise<ToolResult>,
+  ): Promise<ToolResult> {
+    let original: unknown;
+    try {
+      return await attempt(uid);
+    } catch (error) {
+      original = error;
+    }
+    // Only a generation mismatch can heal via a fresh snapshot. Anything
+    // else (UID_NOT_FOUND, occlusion, permission) retries nothing.
+    if (!isUidStaleError(original)) throw original;
+    const wanted = snapshotCache
+      .get(cacheKey(context.sessionID, tabId))
+      ?.find((node) => node.uid === uid);
+    if (wanted === undefined) throw original;
+    let fresh: unknown;
+    try {
+      fresh = await daemonCall(
+        deps,
+        context,
+        "snapshot",
+        tabId === undefined ? {} : { tab_id: tabId },
+      );
+    } catch {
+      throw original;
+    }
+    const freshNodes = extractSnapshotNodes(fresh);
+    snapshotCache.set(cacheKey(context.sessionID, tabId), freshNodes);
+    const match = freshNodes.find(
+      (node) => node.role === wanted.role && node.name === wanted.name,
+    );
+    if (match === undefined) throw original;
+    const retried = await attempt(match.uid);
+    return {
+      content: retried.content,
+      metadata: {
+        ...asRecord(retried.metadata),
+        recovered_from: uid,
+        recovered_uid: match.uid,
+      },
+    };
+  }
+
   const navigate: Executor = async (input, context) => {
     const url = stringParam(input, "url", { required: true });
     const record = asRecord(input);
@@ -398,8 +530,9 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
 
   const snapshot: Executor = async (input, context) => {
     const record = asRecord(input);
+    const tabId = stringParam(input, "tab_id");
     const result = await daemonCall(deps, context, "snapshot", {
-      ...optionalTabId(input),
+      ...(tabId === undefined ? {} : { tab_id: tabId }),
       ...(typeof record["max_nodes"] === "number"
         ? { max_nodes: record["max_nodes"] }
         : {}),
@@ -407,6 +540,7 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
         ? { include_ax: record["include_ax"] }
         : {}),
     });
+    rememberSnapshot(context, tabId, result);
     const formatted = formatSnapshot(result);
     return { content: formatted.content, metadata: formatted.metadata };
   };
@@ -444,74 +578,107 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
   const click: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
     const record = asRecord(input);
-    const result = await daemonCall(deps, context, "click", {
-      uid,
-      ...optionalTabId(input),
+    const tabId = stringParam(input, "tab_id");
+    const extras = {
       ...(typeof record["button"] === "string"
         ? { button: record["button"] }
         : {}),
       ...(typeof record["click_count"] === "number"
         ? { click_count: record["click_count"] }
         : {}),
-    });
-    return {
-      content: `clicked ${uid}`,
-      metadata: rawMetadata(result),
     };
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "click", {
+        uid: nextUid,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+        ...extras,
+      }).then((result) => ({
+        content: `clicked ${nextUid}`,
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const fill: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
     const value = stringParam(input, "value", { required: true });
     const record = asRecord(input);
-    const result = await daemonCall(deps, context, "fill", {
-      uid,
-      value,
-      ...optionalTabId(input),
+    const tabId = stringParam(input, "tab_id");
+    const extras = {
       ...(typeof record["submit"] === "boolean"
         ? { submit: record["submit"] }
         : {}),
-    });
-    return { content: `filled ${uid}`, metadata: rawMetadata(result) };
+    };
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "fill", {
+        uid: nextUid,
+        value,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+        ...extras,
+      }).then((result) => ({
+        content: `filled ${nextUid}`,
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const hover: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
-    const result = await daemonCall(deps, context, "hover", {
-      uid,
-      ...optionalTabId(input),
-    });
-    return { content: `hovered ${uid}`, metadata: rawMetadata(result) };
+    const tabId = stringParam(input, "tab_id");
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "hover", {
+        uid: nextUid,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+      }).then((result) => ({
+        content: `hovered ${nextUid}`,
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const select: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
     const record = asRecord(input);
-    const result = await daemonCall(deps, context, "select", {
-      uid,
-      ...optionalTabId(input),
+    const tabId = stringParam(input, "tab_id");
+    const extras = {
       ...(typeof record["value"] === "string" ? { value: record["value"] } : {}),
       ...(typeof record["label"] === "string" ? { label: record["label"] } : {}),
       ...(typeof record["index"] === "number" ? { index: record["index"] } : {}),
-    });
-    return { content: formatSelect(result), metadata: rawMetadata(result) };
+    };
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "select", {
+        uid: nextUid,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+        ...extras,
+      }).then((result) => ({
+        content: formatSelect(result),
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const upload: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
     const paths = pathsParam(input, "paths");
+    const tabId = stringParam(input, "tab_id");
     // The prompt names the files: reading them is the risky half, not the page.
+    // Asserted once up front — the retry reuses the same paths, so it must
+    // not prompt twice for one user action.
     await deps.permission.assert({
       sessionID: context.sessionID,
       action: UPLOAD_PERMISSION,
       resources: paths,
     });
-    const result = await daemonCall(deps, context, "upload", {
-      uid,
-      paths,
-      ...optionalTabId(input),
-    });
-    return { content: formatUpload(result), metadata: rawMetadata(result) };
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "upload", {
+        uid: nextUid,
+        paths,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+      }).then((result) => ({
+        content: formatUpload(result),
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const dialog: Executor = async (input, context) => {
@@ -541,12 +708,20 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
   const pressKey: Executor = async (input, context) => {
     const key = stringParam(input, "key", { required: true });
     const uid = stringParam(input, "uid");
-    const result = await daemonCall(deps, context, "press_key", {
-      key,
-      ...optionalTabId(input),
-      ...(uid === undefined ? {} : { uid }),
-    });
-    return { content: `pressed ${key}`, metadata: rawMetadata(result) };
+    const tabId = stringParam(input, "tab_id");
+    const attempt = (nextUid: string | undefined): Promise<ToolResult> =>
+      daemonCall(deps, context, "press_key", {
+        key,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+        ...(nextUid === undefined ? {} : { uid: nextUid }),
+      }).then((result) => ({
+        content: `pressed ${key}`,
+        metadata: rawMetadata(result),
+      }));
+    // Without a uid there is nothing that can go stale — skip the recovery
+    // path (and its extra snapshot) entirely.
+    if (uid === undefined) return attempt(uid);
+    return callWithStaleUidRetry(context, uid, tabId, attempt);
   };
 
   const evaluate: Executor = async (input, context) => {

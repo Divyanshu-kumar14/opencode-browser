@@ -60,6 +60,8 @@ function usage() {
     "  --out PATH              results JSON path (default: bench/results/results.json)",
     "  --report PATH           decision-memo markdown path (default: bench/results/report.md)",
     "  --compare PATH          another results.json (the other baseline) to evaluate the kill rule",
+    "  --guard PATH            baseline results.json for the CI regression guard",
+    "  --max-regression-pct N  fail if any warm p95 regresses more than N% vs --guard (default: 10)",
     "  --help                  print this help and exit 0",
     "",
     "examples:",
@@ -81,6 +83,8 @@ function parseArgs(argv) {
     out: DEFAULT_OUT,
     report: DEFAULT_REPORT,
     compare: "",
+    guard: "",
+    maxRegressionPct: 10,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -128,6 +132,13 @@ function parseArgs(argv) {
       opts.report = resolve(next());
     } else if (arg === "--compare") {
       opts.compare = resolve(next());
+    } else if (arg === "--guard") {
+      opts.guard = resolve(next());
+    } else if (arg === "--max-regression-pct") {
+      opts.maxRegressionPct = Number(next());
+      if (!Number.isFinite(opts.maxRegressionPct) || opts.maxRegressionPct < 0) {
+        throw new Error("--max-regression-pct must be >= 0");
+      }
     } else {
       throw new Error(`unknown flag ${arg} (see --help)`);
     }
@@ -214,6 +225,53 @@ function summarize(samples) {
 
 function round2(n) {
   return Math.round(n * 100) / 100;
+}
+
+/// Minimum warm samples per method for p50/p95 to be more than
+/// interpolation noise (Blind-spot #7: floor, then flag).
+const N_FLOOR = 30;
+
+function tCrit95(df) {
+  const table = {1:12.706,2:4.303,3:3.182,4:2.776,5:2.571,6:2.447,7:2.365,8:2.306,9:2.262,10:2.228,11:2.201,12:2.179,13:2.160,14:2.145,15:2.131,16:2.120,17:2.110,18:2.101,19:2.093,20:2.086,21:2.080,22:2.074,23:2.069,24:2.064,25:2.060,26:2.056,27:2.052,28:2.048,29:2.045,30:2.042};
+  if (Number.isInteger(df) && df >= 1 && df <= 30) return table[df];
+  return 1.96;
+}
+
+/// Ordinary least-squares slope of ys over xs with two-sided 95% CI
+/// (t, df = n-2) and R². With 2 points there is no CI: the slope is
+/// reported as-is with a note to re-run with ≥3 session counts.
+function olsSlopeCI(xs, ys) {
+  const n = xs.length;
+  if (n < 2 || xs[n - 1] === xs[0]) {
+    return { slope: 0, lo: 0, hi: 0, r2: 0, note: "need >=2 distinct session counts" };
+  }
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sxx += (xs[i] - mx) ** 2;
+    sxy += (xs[i] - mx) * (ys[i] - my);
+  }
+  if (sxx === 0) {
+    return { slope: 0, lo: 0, hi: 0, r2: 0, note: "degenerate session counts" };
+  }
+  const slope = sxy / sxx;
+  const intercept = my - slope * mx;
+  let sse = 0;
+  let sst = 0;
+  for (let i = 0; i < n; i++) {
+    const resid = ys[i] - (slope * xs[i] + intercept);
+    sse += resid * resid;
+    sst += (ys[i] - my) ** 2;
+  }
+  const r2 = sst > 0 ? 1 - sse / sst : 0;
+  if (n < 3) {
+    return { slope: round2(slope), lo: round2(slope), hi: round2(slope), r2: round2(r2), note: "2 points: no CI, re-run with >=3 session counts" };
+  }
+  const se = Math.sqrt(sse / (n - 2) / sxx);
+  const t = tCrit95(n - 2);
+  return { slope: round2(slope), lo: round2(slope - t * se), hi: round2(slope + t * se), r2: round2(r2), note: "" };
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +473,43 @@ function methodTable(summaries) {
   return ["| method | n | p50 ms | p95 ms | max ms |", "|---|---|---|---|---|", ...rows].join("\n");
 }
 
-function buildReport(results, comparison) {
+/// CI regression guard: fail when any warm p95 (per method + aggregate)
+/// regresses more than `maxPct`% versus a committed baseline results.json.
+/// Same driver, same fixture, same machine class — otherwise the comparison
+/// is meaningless and the guard must not run.
+function evaluateGuard(current, baselinePath, maxPct) {
+  const baseline = JSON.parse(readFileSync(baselinePath, "utf8"));
+  if (!baseline.warm?.byMethod || current.warm == null) {
+    throw new Error(`${baselinePath} has no warm.byMethod stats`);
+  }
+  const deltas = [];
+  const keys = [...METHODS, "all"];
+  for (const key of keys) {
+    const base = key === "all" ? baseline.warm.all?.p95 : baseline.warm.byMethod[key]?.p95;
+    const cur = key === "all" ? current.warm.all.p95 : current.warm.byMethod[key]?.p95;
+    if (typeof base !== "number" || typeof cur !== "number" || base <= 0) {
+      deltas.push({ key, base, cur, pct: null, ok: true, note: "no baseline" });
+      continue;
+    }
+    const pct = round2(((cur - base) / base) * 100);
+    deltas.push({ key, base, cur, pct, ok: pct <= maxPct, note: "" });
+  }
+  const failures = deltas.filter((d) => !d.ok);
+  const lines = [
+    `Baseline: \`${baselinePath}\` (generated ${baseline.generatedAt ?? "unknown"}), threshold: +${maxPct}% warm p95.`,
+    ...deltas.map((d) =>
+      d.pct == null
+        ? `- ${d.key}: cur=${d.cur}ms, no baseline — skipped.`
+        : `- ${d.key}: base=${d.base}ms cur=${d.cur}ms (${d.pct >= 0 ? "+" : ""}${d.pct}%) ${d.ok ? "OK" : "**REGRESSED**"}`,
+    ),
+    failures.length === 0
+      ? "Guard: **PASS** — no warm p95 regressed beyond the threshold."
+      : `Guard: **FAIL** — ${failures.length} warm p95(s) regressed >+${maxPct}%: ${failures.map((f) => f.key).join(", ")}.`,
+  ];
+  return { baseline: baselinePath, maxRegressionPct: maxPct, pass: failures.length === 0, deltas, lines };
+}
+
+function buildReport(results, comparison, guard) {
   const { config, cold, warm, rss, collisions, failures, soak: soakResult } = results;
   let verdict;
   let killBox;
@@ -488,10 +582,21 @@ function buildReport(results, comparison) {
     "",
     `- Bench-process idle RSS: ${rss.selfIdleMb} MB.`,
     `- Peak total tree RSS by session count: ${Object.entries(rss.peakTreeMbBySessions).map(([k, v]) => `${k}=${v}MB`).join(", ")}.`,
-    `- Marginal RSS/session: **${rss.marginalPerSessionMb} MB** (linear fit across session counts).`,
+    `- Marginal RSS/session: **${rss.marginalPerSessionMb} MB** (OLS slope across session counts, 95% CI [${rss.marginalSlopeCI95.lo}, ${rss.marginalSlopeCI95.hi}], R²=${rss.marginalR2})${rss.marginalNote ? ` — ${rss.marginalNote}` : ""}.`,
+    ...(results.nFloorMet
+      ? []
+      : [`- n-floor WARNING: per-method n<${N_FLOOR} for ${METHODS.filter((m) => !results.nFloors[m]).join(",")}: p50/p95 are interpolation noise, re-run with more calls/runs.`]),
     `- Collisions (cross-session tab access): ${collisions}. Failures (other errors): ${failures}.`,
     `- ${soakLine}`,
     "",
+    ...(guard
+      ? [
+          "## Regression guard",
+          "",
+          ...guard.lines,
+          "",
+        ]
+      : []),
     "## Decision",
     "",
     killBox,
@@ -576,13 +681,18 @@ async function main() {
   const byMethod = {};
   for (const method of METHODS) byMethod[method] = summarize(warmMethods[method]);
 
-  // Marginal RSS/session: slope of peak tree RSS over session counts.
+  // Marginal RSS/session: ordinary least-squares slope of peak tree RSS
+  // over session counts (Blind-spot #7: the old 2-point slope amplified
+  // noise). Reports the slope, its two-sided 95% CI (t, df = n-2) and R².
   const xs = Object.keys(peakTreeMbBySessions).map(Number).sort((a, b) => a - b);
   const ys = xs.map((x) => peakTreeMbBySessions[String(x)]);
-  let marginal = 0;
-  if (xs.length >= 2 && xs[xs.length - 1] !== xs[0]) {
-    marginal = (ys[ys.length - 1] - ys[0]) / (xs[xs.length - 1] - xs[0]);
-  }
+  const fit = olsSlopeCI(xs, ys);
+  const marginal = fit.slope;
+
+  // n≥30/method floor: percentiles on tiny samples are interpolation noise.
+  const nFloors = {};
+  for (const method of METHODS) nFloors[method] = byMethod[method].n >= N_FLOOR;
+  const floorMet = METHODS.every((m) => nFloors[m]);
 
   let soakResult = null;
   if (opts.soakMinutes > 0) {
@@ -609,11 +719,26 @@ async function main() {
       selfIdleMb: round2(readVmRssKb(process.pid) / 1024),
       peakTreeMbBySessions,
       marginalPerSessionMb: round2(marginal),
+      marginalSlopeCI95: { lo: fit.lo, hi: fit.hi },
+      marginalR2: fit.r2,
+      marginalNote: fit.note,
     },
+    nFloors,
+    nFloorMet: floorMet,
     collisions,
     failures,
     soak: soakResult,
+    guard: null,
   };
+
+  if (opts.guard) {
+    try {
+      results.guard = evaluateGuard(results, opts.guard, opts.maxRegressionPct);
+    } catch (error) {
+      console.error(`error: cannot evaluate --guard: ${error.message}`);
+      process.exit(2);
+    }
+  }
 
   let comparison = null;
   if (opts.compare) {
@@ -629,11 +754,18 @@ async function main() {
   // results.json is gitignored (bench/results/*.json) — it is an artifact, not a claim.
   writeFileSync(opts.out, `${JSON.stringify(results, null, 2)}\n`);
   mkdirSync(dirname(opts.report), { recursive: true });
-  writeFileSync(opts.report, buildReport(results, comparison));
+  writeFileSync(opts.report, buildReport(results, comparison, results.guard));
 
-  console.log(`driver=${results.driverKind} cold=${coldMs}ms warm-p50=${results.warm.all.p50}ms warm-p95=${results.warm.all.p95}ms marginal=${results.rss.marginalPerSessionMb}MB/ses collisions=${collisions} failures=${failures}`);
+  console.log(`driver=${results.driverKind} cold=${coldMs}ms warm-p50=${results.warm.all.p50}ms warm-p95=${results.warm.all.p95}ms marginal=${results.rss.marginalPerSessionMb}MB/ses CI95=[${results.rss.marginalSlopeCI95.lo},${results.rss.marginalSlopeCI95.hi}] R²=${results.rss.marginalR2} nFloor=${results.nFloorMet ? "ok" : "WARN"} collisions=${collisions} failures=${failures}`);
   console.log(`wrote ${opts.out}`);
   console.log(`wrote ${opts.report}`);
+  if (!results.nFloorMet) {
+    console.log(`warning: per-method n<${N_FLOOR} for ${METHODS.filter((m) => !results.nFloors[m]).join(",")}: p50/p95 are interpolation noise`);
+  }
+  if (results.guard) {
+    console.log(`guard: ${results.guard.pass ? "PASS" : "FAIL"} vs ${results.guard.baseline} (threshold +${results.guard.maxRegressionPct}% warm p95)`);
+    if (!results.guard.pass) process.exitCode = 1;
+  }
 }
 
 await main();

@@ -28,7 +28,7 @@ use chromiumoxide::{Command, Page};
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock};
 use tracing::{debug, warn};
 
 use crate::chrome::ChromeManager;
@@ -40,6 +40,9 @@ pub const CDP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Ring-buffer cap per tab for console/network entries (P1-6: ~0.5 MB total).
 pub const BUFFER_CAP: usize = 500;
+
+/// Cap on in-flight network correlations per tab (fail-soft bound).
+const MAX_PENDING: usize = 1000;
 
 /// One console/log entry kept per tab.
 #[derive(Debug, Clone, Serialize)]
@@ -193,7 +196,25 @@ pub struct Tab {
     dead: AtomicBool,
     chrome_alive: Arc<AtomicBool>,
     /// Serializes snapshot/click/fill/screenshot on this tab.
+    ///
+    /// PROPOSAL (nav-mutex vs op-mutex split, not yet implemented): navigate
+    /// holds this lock across a multi-second readiness poll, head-of-line
+    /// blocking every other op on the tab. Splitting into `nav_lock`
+    /// (navigation + `bump_generation`) and `op_lock` (everything else) would
+    /// fix that, but only with a strict lock order (`nav_lock` -> `op_lock`,
+    /// never the reverse) plus a generation re-check after acquiring
+    /// `op_lock`, so a click/snapshot can never act on uids from a superseded
+    /// document and `assert_owned_by` still runs before any CDP call. Until
+    /// that lands, every op keeps taking this one lock.
     pub op_lock: AsyncMutex<()>,
+    /// Queue-wait metric: total ms spent awaiting `op_lock` plus acquisition
+    /// count. Recorded by [`Tab::lock_op`]; read via [`Tab::op_wait_mean_ms`]
+    /// by status/bench guards. `u64` ms cannot wrap in practice.
+    pub op_wait_total_ms: AtomicU64,
+    pub op_wait_count: AtomicU64,
+    /// Correlations dropped by the network pump's overflow policy
+    /// (drop-oldest, never drop-all). Exposed for bench guards.
+    pub net_drop_count: AtomicU64,
     console: StdMutex<VecDeque<ConsoleEntry>>,
     network: StdMutex<VecDeque<NetworkEntry>>,
     console_seq: AtomicU64,
@@ -220,6 +241,9 @@ impl Tab {
             dead: AtomicBool::new(false),
             chrome_alive,
             op_lock: AsyncMutex::new(()),
+            op_wait_total_ms: AtomicU64::new(0),
+            op_wait_count: AtomicU64::new(0),
+            net_drop_count: AtomicU64::new(0),
             console: StdMutex::new(VecDeque::new()),
             network: StdMutex::new(VecDeque::new()),
             console_seq: AtomicU64::new(0),
@@ -243,6 +267,28 @@ impl Tab {
 
     pub fn set_dialog(&self, info: Option<DialogInfo>) {
         *lock(&self.dialog) = info;
+    }
+
+    /// Acquire `op_lock`, recording the queue wait. C1: snapshot (highest
+    /// contention) uses this so lock-wait is MEASURED; the guard still spans
+    /// the full CDP sequence to preserve per-tab ordering. Callers must
+    /// `drop` the guard before CPU-only tail work (response serialization).
+    pub async fn lock_op(&self) -> (AsyncMutexGuard<'_, ()>, u64) {
+        let t0 = std::time::Instant::now();
+        let guard = self.op_lock.lock().await;
+        let wait_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.op_wait_total_ms.fetch_add(wait_ms, Ordering::Relaxed);
+        self.op_wait_count.fetch_add(1, Ordering::Relaxed);
+        (guard, wait_ms)
+    }
+
+    /// Mean `op_lock` queue wait in ms, or `None` when never acquired.
+    // TODO(C1-followup): wire into `status` / bench guards (E lane) so the
+    // queue-wait metric is observable at runtime; allowed dead until then.
+    #[allow(dead_code)]
+    pub fn op_wait_mean_ms(&self) -> Option<u64> {
+        let n = self.op_wait_count.load(Ordering::Relaxed);
+        (n > 0).then(|| self.op_wait_total_ms.load(Ordering::Relaxed) / n)
     }
 
     pub fn owner(&self) -> Option<String> {
@@ -653,8 +699,15 @@ impl Tab {
                 biased;
                 next = will_be_sent.next() => {
                     let Some(event) = next else { break };
-                    if pending.len() > 1000 {
-                        pending.clear();
+                    if pending.len() >= MAX_PENDING {
+                        // Fail-soft, not fail-open: evict the single oldest
+                        // pending request; each overflow loses one
+                        // correlation (counted) instead of orphaning all of
+                        // them on a chatty page.
+                        if let Some(oldest) = pick_oldest_key(&pending, |p| p.t0) {
+                            pending.remove(&oldest);
+                            tab.net_drop_count.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     let kind = event
                         .r#type
@@ -1168,6 +1221,20 @@ impl TabRegistry {
     }
 }
 
+/// Overflow policy for the network pump's pending map: return the key with
+/// the smallest `t0` so exactly one correlation is dropped per overflow
+/// instead of `clear()`-ing all of them (fail-open on chatty pages: one
+/// burst orphaned up to 1000 in-flight responses).
+fn pick_oldest_key<V>(map: &HashMap<String, V>, t0_of: impl Fn(&V) -> f64) -> Option<String> {
+    map.iter()
+        .min_by(|a, b| {
+            t0_of(a.1)
+                .partial_cmp(&t0_of(b.1))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(id, _)| id.clone())
+}
+
 /// Choose a tab to evict: never the caller's own tab, never a live tab owned by
 /// another active session unless its lease expired. Oldest `last_used` wins.
 pub fn pick_eviction(
@@ -1247,6 +1314,31 @@ mod tests {
     fn eviction_returns_none_when_every_tab_is_actively_owned() {
         let tabs = vec![("t1".to_string(), Some("other".to_string()), 99_999)];
         assert_eq!(pick_eviction(&tabs, "me", 10_000, 100_000), None);
+    }
+
+    #[test]
+    fn pending_overflow_evicts_only_the_oldest() {
+        let mut map: HashMap<String, f64> = HashMap::new();
+        map.insert("a".to_string(), 3.0);
+        map.insert("b".to_string(), 1.0);
+        map.insert("c".to_string(), 2.0);
+        assert_eq!(pick_oldest_key(&map, |t0| *t0).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn pending_overflow_with_no_entries_evicts_nothing() {
+        let map: HashMap<String, f64> = HashMap::new();
+        assert_eq!(pick_oldest_key(&map, |t0| *t0), None);
+    }
+
+    #[test]
+    fn pending_overflow_with_nan_t0_still_returns_a_key() {
+        let mut map: HashMap<String, f64> = HashMap::new();
+        map.insert("a".to_string(), f64::NAN);
+        map.insert("b".to_string(), 1.0);
+        // NaN never compares less; the fallback keeps this total and
+        // panic-free so the pump cannot wedge on a bad timestamp.
+        assert!(pick_oldest_key(&map, |t0| *t0).is_some());
     }
 
     #[derive(Clone, Debug)]

@@ -1,7 +1,7 @@
 //! Wire protocol (§2.2): NDJSON request/response envelopes and typed params.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::error::{ErrorCode, RpcError};
 
@@ -256,12 +256,21 @@ pub struct BenchParams {
 
 /// Deserialize method params, mapping a schema error onto `INTERNAL` with a
 /// hint that names the offending method. Never panics on client input.
-pub fn parse_params<T: for<'de> Deserialize<'de>>(
+///
+/// Takes `params` by value: `serde_json::from_value` reuses the owned
+/// `String`/`Vec` buffers instead of copying them, so the dispatch path pays
+/// zero clones for the params tree itself (matters for 1 MiB `fill`/`eval`
+/// payloads).
+pub fn parse_params_owned<T: for<'de> Deserialize<'de>>(
     method: &str,
-    params: &Value,
+    params: Value,
 ) -> Result<T, RpcError> {
-    let params = if params.is_null() { &json!({}) } else { params };
-    serde_json::from_value(params.clone()).map_err(|err| {
+    let params = if params.is_null() {
+        Value::Object(Default::default())
+    } else {
+        params
+    };
+    serde_json::from_value(params).map_err(|err| {
         RpcError::new(
             ErrorCode::Internal,
             format!("invalid params for `{method}`: {err}"),
@@ -281,6 +290,7 @@ pub fn request_key(id: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn response_omits_the_unused_side() {
@@ -315,11 +325,21 @@ mod tests {
 
     #[test]
     fn params_default_to_empty_and_report_bad_types() {
-        let hello: HelloParams = parse_params("hello", &Value::Null).expect("empty params ok");
+        let hello: HelloParams = parse_params_owned("hello", Value::Null).expect("empty params ok");
         assert!(hello.protocol.is_none());
 
-        let bad = parse_params::<NavigateParams>("navigate", &json!({"url": 5}));
+        let bad = parse_params_owned::<NavigateParams>("navigate", json!({"url": 5}));
         assert!(bad.is_err());
         assert_eq!(bad.expect_err("err").code, ErrorCode::Internal);
+
+        // Regression guard: the owned path accepts good params and rejects
+        // bad ones with the same INTERNAL code (protocol v1 additive).
+        let good: FillParams =
+            parse_params_owned("fill", json!({"uid": "g7-3", "value": "hi"})).expect("ok");
+        assert_eq!(good.uid, "g7-3");
+        assert_eq!(good.value, "hi");
+        let bad_fill = parse_params_owned::<FillParams>("fill", json!({"uid": 5}));
+        assert!(bad_fill.is_err());
+        assert_eq!(bad_fill.expect_err("err").code, ErrorCode::Internal);
     }
 }

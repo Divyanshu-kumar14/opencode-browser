@@ -388,26 +388,23 @@ async fn serve_conn(app: Arc<App>, stream: UnixStream, conn_tag: String) {
                 break;
             }
         };
-        let raw: serde_json::Value = match serde_json::from_slice(&frame) {
-            Ok(value) => value,
-            Err(err) => {
-                let _ = tx.send(
-                    Response::protocol_failure(RpcError::internal(format!(
-                        "malformed JSON frame (connection continues): {err}"
-                    )))
-                    .to_line(),
-                );
-                continue;
-            }
-        };
-        let raw_req: crate::rpc::RawRequest = match serde_json::from_value(raw) {
+        // One parse straight into the envelope: no intermediate `Value` tree,
+        // i.e. one fewer full-frame alloc + deserialization per request.
+        let raw_req: crate::rpc::RawRequest = match serde_json::from_slice(&frame) {
             Ok(parsed) => parsed,
             Err(err) => {
+                // Cold path only: re-parse untyped to keep the two
+                // protocol-failure messages distinct (malformed JSON vs
+                // well-formed JSON that is not an envelope).
+                let malformed = serde_json::from_slice::<serde_json::Value>(&frame).is_err();
+                let label = if malformed {
+                    "malformed JSON frame (connection continues)"
+                } else {
+                    "bad request envelope"
+                };
                 let _ = tx.send(
-                    Response::protocol_failure(RpcError::internal(format!(
-                        "bad request envelope: {err}"
-                    )))
-                    .to_line(),
+                    Response::protocol_failure(RpcError::internal(format!("{label}: {err}")))
+                        .to_line(),
                 );
                 continue;
             }
@@ -419,7 +416,7 @@ async fn serve_conn(app: Arc<App>, stream: UnixStream, conn_tag: String) {
 
         if method == "cancel" {
             let params: CancelParams =
-                match rpc::parse_params("cancel", &raw_req.params.unwrap_or(Value::Null)) {
+                match rpc::parse_params_owned("cancel", raw_req.params.unwrap_or(Value::Null)) {
                     Ok(parsed) => parsed,
                     Err(err) => {
                         if let Some(id) = raw_req.id {

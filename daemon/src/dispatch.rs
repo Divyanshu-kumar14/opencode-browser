@@ -160,7 +160,7 @@ fn page_err(tab: &Tab, what: &str, err: impl std::fmt::Display) -> RpcError {
 }
 
 async fn handle_hello(app: &App, params: Value) -> Result<Value, RpcError> {
-    let parsed: HelloParams = rpc::parse_params("hello", &params)?;
+    let parsed: HelloParams = rpc::parse_params_owned("hello", params)?;
     if parsed.protocol != Some(rpc::PROTOCOL) {
         return Err(RpcError::new(
             ErrorCode::ProtocolMismatch,
@@ -207,7 +207,7 @@ async fn handle_status(app: &App) -> Result<Value, RpcError> {
 }
 
 async fn handle_navigate(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: NavigateParams = rpc::parse_params("navigate", &params)?;
+    let parsed: NavigateParams = rpc::parse_params_owned("navigate", params)?;
     if parsed.url.trim().is_empty() {
         return Err(RpcError::nav_failed("navigation target is empty"));
     }
@@ -344,16 +344,21 @@ async fn handle_navigate(app: &App, params: Value, session: &str) -> Result<Valu
 }
 
 async fn handle_snapshot(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: SnapshotParams = rpc::parse_params("snapshot", &params)?;
+    let parsed: SnapshotParams = rpc::parse_params_owned("snapshot", params)?;
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
     tab.start_listeners();
-    let _guard = tab.op_lock.lock().await;
+    // C1: timed acquisition (queue-wait metric) + the guard spans only the
+    // CDP sequence. Per-tab ordering is preserved: inject/DOM/AX + set_uids
+    // stay mutually exclusive; the guard is dropped before response
+    // serialization so a large snapshot body never blocks the next op.
+    let (guard, _wait_ms) = tab.lock_op().await;
     let out = snapshot::run_snapshot(
         &tab,
         parsed.max_nodes.unwrap_or(DEFAULT_MAX_NODES),
         parsed.include_ax.unwrap_or(true),
     )
     .await?;
+    drop(guard);
     Ok(json!({
         "tab_id": out.tab_id,
         "url": out.url,
@@ -414,7 +419,7 @@ async fn handle_click(app: &App, params: Value, session: &str) -> Result<Value, 
     use chromiumoxide::cdp::browser_protocol::input::{
         DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
     };
-    let parsed: ClickParams = rpc::parse_params("click", &params)?;
+    let parsed: ClickParams = rpc::parse_params_owned("click", params)?;
     if parsed.uid.trim().is_empty() {
         return Err(RpcError::uid_not_found("(empty uid)"));
     }
@@ -463,7 +468,7 @@ async fn handle_click(app: &App, params: Value, session: &str) -> Result<Value, 
 
 async fn handle_fill(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
     use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
-    let parsed: FillParams = rpc::parse_params("fill", &params)?;
+    let parsed: FillParams = rpc::parse_params_owned("fill", params)?;
     if parsed.uid.trim().is_empty() {
         return Err(RpcError::uid_not_found("(empty uid)"));
     }
@@ -531,7 +536,7 @@ async fn handle_hover(app: &App, params: Value, session: &str) -> Result<Value, 
     use chromiumoxide::cdp::browser_protocol::input::{
         DispatchMouseEventParams, DispatchMouseEventType,
     };
-    let parsed: HoverParams = rpc::parse_params("hover", &params)?;
+    let parsed: HoverParams = rpc::parse_params_owned("hover", params)?;
     if parsed.uid.trim().is_empty() {
         return Err(RpcError::uid_not_found("(empty uid)"));
     }
@@ -552,7 +557,7 @@ async fn handle_hover(app: &App, params: Value, session: &str) -> Result<Value, 
 /// Change a `<select>` by option value, visible label or index. Exactly one of
 /// the three selectors is required, so a typo can never silently pick option 0.
 async fn handle_select(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: SelectParams = rpc::parse_params("select", &params)?;
+    let parsed: SelectParams = rpc::parse_params_owned("select", params)?;
     if parsed.uid.trim().is_empty() {
         return Err(RpcError::uid_not_found("(empty uid)"));
     }
@@ -648,7 +653,7 @@ async fn handle_upload(app: &App, params: Value, session: &str) -> Result<Value,
         DescribeNodeParams, GetDocumentParams, QuerySelectorParams, SetFileInputFilesParams,
     };
 
-    let parsed: UploadParams = rpc::parse_params("upload", &params)?;
+    let parsed: UploadParams = rpc::parse_params_owned("upload", params)?;
     if parsed.uid.trim().is_empty() {
         return Err(RpcError::uid_not_found("(empty uid)"));
     }
@@ -752,7 +757,7 @@ async fn handle_upload(app: &App, params: Value, session: &str) -> Result<Value,
 async fn handle_dialog(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
     use chromiumoxide::cdp::browser_protocol::page::HandleJavaScriptDialogParams;
 
-    let parsed: DialogParams = rpc::parse_params("dialog", &params)?;
+    let parsed: DialogParams = rpc::parse_params_owned("dialog", params)?;
     let action = parsed.action.to_ascii_lowercase();
     if !matches!(action.as_str(), "accept" | "dismiss") {
         return Err(RpcError::new(
@@ -774,7 +779,7 @@ async fn handle_dialog(app: &App, params: Value, session: &str) -> Result<Value,
 
 /// Scroll the document. Fires real scroll events, so infinite feeds load.
 async fn handle_scroll(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: ScrollParams = rpc::parse_params("scroll", &params)?;
+    let parsed: ScrollParams = rpc::parse_params_owned("scroll", params)?;
     let direction = parsed.direction.to_ascii_lowercase();
     if !matches!(
         direction.as_str(),
@@ -833,7 +838,7 @@ async fn handle_scroll(app: &App, params: Value, session: &str) -> Result<Value,
 }
 
 async fn handle_press_key(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: PressKeyParams = rpc::parse_params("press_key", &params)?;
+    let parsed: PressKeyParams = rpc::parse_params_owned("press_key", params)?;
     if parsed.key.is_empty() {
         return Err(RpcError::new(
             ErrorCode::Internal,
@@ -854,7 +859,7 @@ async fn handle_press_key(app: &App, params: Value, session: &str) -> Result<Val
 }
 
 async fn handle_eval(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: EvalParams = rpc::parse_params("eval", &params)?;
+    let parsed: EvalParams = rpc::parse_params_owned("eval", params)?;
     if parsed.js.trim().is_empty() {
         return Err(RpcError::eval_error("expression is empty"));
     }
@@ -919,7 +924,7 @@ fn truncate_value(rendered: &str) -> (Value, bool) {
 async fn handle_screenshot(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
     use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
     use chromiumoxide::page::ScreenshotParams as PageShot;
-    let parsed: ScreenshotParams = rpc::parse_params("screenshot", &params)?;
+    let parsed: ScreenshotParams = rpc::parse_params_owned("screenshot", params)?;
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
     let _guard = tab.op_lock.lock().await;
 
@@ -956,7 +961,7 @@ async fn handle_screenshot(app: &App, params: Value, session: &str) -> Result<Va
 }
 
 async fn handle_console(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: ConsoleParams = rpc::parse_params("console", &params)?;
+    let parsed: ConsoleParams = rpc::parse_params_owned("console", params)?;
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
     let limit = parsed.limit.unwrap_or(100).clamp(1, 500);
     let (messages, truncated, next_since) =
@@ -965,7 +970,7 @@ async fn handle_console(app: &App, params: Value, session: &str) -> Result<Value
 }
 
 async fn handle_network(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: NetworkParams = rpc::parse_params("network", &params)?;
+    let parsed: NetworkParams = rpc::parse_params_owned("network", params)?;
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
     let limit = parsed.limit.unwrap_or(100).clamp(1, 500);
     let (mut requests, truncated, next_since) =
@@ -982,7 +987,7 @@ async fn handle_network(app: &App, params: Value, session: &str) -> Result<Value
 }
 
 async fn handle_network_body(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: NetworkBodyParams = rpc::parse_params("network_body", &params)?;
+    let parsed: NetworkBodyParams = rpc::parse_params_owned("network_body", params)?;
     if parsed.request_id.is_empty() {
         return Err(RpcError::internal(
             "network_body: `request_id` must not be empty",
@@ -1018,19 +1023,19 @@ async fn handle_list_tabs(app: &App) -> Result<Value, RpcError> {
 }
 
 async fn handle_close_tab(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
-    let parsed: CloseTabParams = rpc::parse_params("close_tab", &params)?;
+    let parsed: CloseTabParams = rpc::parse_params_owned("close_tab", params)?;
     app.tabs.close(session, &parsed.tab_id).await?;
     Ok(json!({"closed": true}))
 }
 
 async fn handle_shutdown(app: &App, params: Value) -> Result<Value, RpcError> {
-    let _parsed: ShutdownParams = rpc::parse_params("shutdown", &params)?;
+    let _parsed: ShutdownParams = rpc::parse_params_owned("shutdown", params)?;
     app.request_shutdown();
     Ok(json!({}))
 }
 
 async fn handle_bench(app: &App, params: Value) -> Result<Value, RpcError> {
-    let parsed: BenchParams = rpc::parse_params("bench", &params)?;
+    let parsed: BenchParams = rpc::parse_params_owned("bench", params)?;
     let sessions = parsed.sessions.unwrap_or(1).clamp(1, 8);
     let calls = parsed.calls.unwrap_or(10).clamp(1, 20);
     if app.tabs.count().await + sessions > app.tabs.max_tabs() {

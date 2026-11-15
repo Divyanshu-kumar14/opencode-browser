@@ -24,6 +24,9 @@ pub enum ErrorCode {
     UidNotFound,
     UidStale,
     ElementOccluded,
+    DialogNotOpen,
+    UploadDenied,
+    BodyUnavailable,
     EvalError,
     PermissionDenied,
     Internal,
@@ -125,6 +128,38 @@ impl RpcError {
             "the expression threw; check the JS for syntax/runtime errors",
         )
     }
+
+    pub fn dialog_not_open() -> Self {
+        Self::new(
+            ErrorCode::DialogNotOpen,
+            "no JavaScript dialog is open",
+            "the dialog may have been auto-dismissed; navigate with dialog_policy:\"manual\" and schedule the dialog first",
+        )
+    }
+
+    pub fn upload_denied(message: impl Into<String>) -> Self {
+        Self::new(
+            ErrorCode::UploadDenied,
+            message,
+            "pass absolute paths to regular files (max 8 files, 100 MiB total); directories and symlinks are rejected",
+        )
+    }
+
+    pub fn body_unavailable(request_id: &str, reason: &str) -> Self {
+        Self::new(
+            ErrorCode::BodyUnavailable,
+            format!("no response body for request {request_id}: {reason}"),
+            "Chrome evicts bodies after a navigation or when its cache fills; re-run the request and read the body immediately",
+        )
+    }
+
+    pub fn eval_timeout(ms: u64) -> Self {
+        Self::new(
+            ErrorCode::EvalError,
+            format!("evaluation exceeded the {ms}ms timeout"),
+            "raise timeout_ms, or make the expression resolve sooner; the page script may still be running",
+        )
+    }
 }
 
 impl fmt::Display for RpcError {
@@ -170,6 +205,9 @@ mod tests {
             ErrorCode::UidNotFound,
             ErrorCode::UidStale,
             ErrorCode::ElementOccluded,
+            ErrorCode::DialogNotOpen,
+            ErrorCode::UploadDenied,
+            ErrorCode::BodyUnavailable,
             ErrorCode::EvalError,
             ErrorCode::PermissionDenied,
             ErrorCode::Internal,

@@ -100,6 +100,9 @@ pub struct NavigateParams {
     pub wait_until: Option<String>,
     pub timeout_ms: Option<u64>,
     pub allow_file: Option<bool>,
+    /// `auto` (default) dismisses dialogs so a page can never wedge the tab;
+    /// `manual` leaves them open for `dialog`.
+    pub dialog_policy: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -142,6 +145,50 @@ pub struct EvalParams {
     pub js: String,
     pub tab_id: Option<String>,
     pub await_promise: Option<bool>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct HoverParams {
+    pub uid: String,
+    pub tab_id: Option<String>,
+}
+
+/// Exactly one of `value`, `label` or `index` selects the option.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SelectParams {
+    pub uid: String,
+    pub value: Option<String>,
+    pub label: Option<String>,
+    pub index: Option<usize>,
+    pub tab_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UploadParams {
+    pub uid: String,
+    pub paths: Vec<String>,
+    pub tab_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DialogParams {
+    /// `accept` or `dismiss`.
+    pub action: String,
+    pub prompt_text: Option<String>,
+    pub tab_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ScrollParams {
+    pub direction: String,
+    pub amount: Option<f64>,
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -157,6 +204,8 @@ pub struct ConsoleParams {
     pub tab_id: Option<String>,
     pub limit: Option<usize>,
     pub level: Option<String>,
+    /// Cursor from a previous response's `next_since`; returns only newer entries.
+    pub since: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -165,6 +214,19 @@ pub struct NetworkParams {
     pub tab_id: Option<String>,
     pub limit: Option<usize>,
     pub filter: Option<String>,
+    /// Include redacted request/response headers (default false).
+    pub include_headers: Option<bool>,
+    /// Cursor from a previous response's `next_since`; returns only newer entries.
+    pub since: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct NetworkBodyParams {
+    pub tab_id: Option<String>,
+    pub request_id: String,
+    /// Truncation bound; default 16 KiB, cap 256 KiB.
+    pub max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -7,6 +7,11 @@
 
 use crate::error::RpcError;
 
+/// Upload limits. File inputs are an exfiltration primitive, so the daemon —
+/// not the shim — is the trust boundary for what may be handed to the page.
+pub const MAX_UPLOAD_FILES: usize = 8;
+pub const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Schemes navigable without extra opt-in (`IMPLEMENTATION-PLAN.md` §2.2).
 fn scheme_allowed(scheme: &str) -> bool {
     matches!(scheme, "http" | "https" | "about")
@@ -56,6 +61,54 @@ pub fn check_navigate_url(url: &str, allow_file: bool) -> Result<(), RpcError> {
     Err(RpcError::nav_failed(format!(
         "navigation to {scheme}: URLs is not allowed"
     )))
+}
+
+/// Shape-only checks for `upload` paths (pure; the filesystem checks live in
+/// the dispatcher). Fails closed with `UPLOAD_DENIED`:
+///
+/// - 1–8 paths, each non-empty and absolute;
+/// - no `..` component, so a relative traversal can never widen the set;
+/// - the full path is never echoed — errors carry the basename only.
+pub fn check_upload_paths(paths: &[String]) -> Result<(), RpcError> {
+    use std::path::{Component, Path};
+
+    if paths.is_empty() {
+        return Err(RpcError::upload_denied("no files given"));
+    }
+    if paths.len() > MAX_UPLOAD_FILES {
+        return Err(RpcError::upload_denied(format!(
+            "{} files given, the limit is {MAX_UPLOAD_FILES}",
+            paths.len()
+        )));
+    }
+    for path in paths {
+        let label = file_label(path);
+        if path.trim().is_empty() {
+            return Err(RpcError::upload_denied("empty upload path"));
+        }
+        if !Path::new(path).is_absolute() {
+            return Err(RpcError::upload_denied(format!(
+                "{label} is not an absolute path"
+            )));
+        }
+        if Path::new(path)
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(RpcError::upload_denied(format!(
+                "{label} contains a `..` component"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Last path component, for error messages and logs. Never the full path.
+pub fn file_label(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "(unnamed)".to_string())
 }
 
 /// Strip query string and fragment from a URL for logs and stored metadata.
@@ -145,5 +198,24 @@ mod tests {
         let redacted = redact_url(&long);
         assert!(redacted.len() <= 520, "len={}", redacted.len());
         assert!(!redacted.contains('?'));
+    }
+
+    #[test]
+    fn upload_paths_must_be_absolute_regular_and_bounded() {
+        let ok = vec!["/tmp/a.png".to_string(), "/home/u/b.pdf".to_string()];
+        assert!(check_upload_paths(&ok).is_ok());
+
+        assert!(check_upload_paths(&[]).is_err());
+        assert!(check_upload_paths(&["relative/a.png".to_string()]).is_err());
+        assert!(check_upload_paths(&["/tmp/../etc/passwd".to_string()]).is_err());
+        assert!(check_upload_paths(&["   ".to_string()]).is_err());
+
+        let too_many: Vec<String> = (0..9).map(|i| format!("/tmp/{i}.png")).collect();
+        assert!(check_upload_paths(&too_many).is_err());
+
+        let err = check_upload_paths(&["/tmp/../etc/passwd".to_string()]).expect_err("denied");
+        assert_eq!(err.code, crate::error::ErrorCode::UploadDenied);
+        // The full path never leaks into the payload.
+        assert!(!err.message.contains("etc/passwd"), "{}", err.message);
     }
 }

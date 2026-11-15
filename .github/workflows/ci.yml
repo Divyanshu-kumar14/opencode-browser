@@ -44,7 +44,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: node scripts/build-native.mjs
       - run: test -x prebuilds/linux-x64/browserd
-      - run: npm pack --pack-destination /tmp/opencode-pack
+      - run: mkdir -p /tmp/opencode-pack && npm pack --pack-destination /tmp/opencode-pack
       - run: |
           TARBALL=$(ls /tmp/opencode-pack/*.tgz)
           SIZE=$(stat -c%s "$TARBALL")
@@ -64,9 +64,11 @@ jobs:
       - run: google-chrome --version || chromium --version
       - run: npm install -g opencode-ai@latest
       - run: opencode --version
-      # Smoke probe: browser_ping is the Phase 0 conformance tool. If the tool
-      # surface changes, point this at the current stable smoke tool instead.
+      # Smoke probe: browse_ping is the Phase 0 conformance tool (debug-gated).
+      # If the tool surface changes, point this at the current stable smoke tool instead.
       - run: |
           printf '{"$schema":"https://opencode.ai/config.json","plugins":["./plugin"]}' > opencode.jsonc
-          opencode run "call browser_ping with value ci and report the exact output" 2>&1 | tee e2e.log
+          opencode run "call browse_ping with value ci and report the exact output" 2>&1 | tee e2e.log
           grep -q "pong:ci" e2e.log
+        env:
+          OPENCODE_BROWSER_DEBUG: "1"

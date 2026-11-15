@@ -254,6 +254,83 @@ pub struct BenchParams {
     pub calls: Option<usize>,
 }
 
+/// Bounded-wait budget shared by `wait_for_uid` and `expect_text` (D lane).
+/// Sane default 5 s, floor 100 ms (one poll), hard cap 30 s so the outer
+/// `request_timeout_ms` headroom (+5 s, cap 40 s) always covers the poll loop.
+pub const DEFAULT_WAIT_MS: u64 = 5_000;
+pub const MIN_WAIT_MS: u64 = 100;
+pub const MAX_WAIT_MS: u64 = 30_000;
+
+/// Poll cadence for the wait loops in `dispatch.rs`. Short enough that a
+/// fast-appearing condition resolves in ~one interval, long enough that a
+/// full-timeout wait costs ~200 CDP round trips, not thousands.
+pub const WAIT_POLL_MS: u64 = 150;
+
+/// Upper bound on the `expect_text` needle so a hostile client cannot stuff a
+/// multi-megabyte string into every poll's page script.
+pub const MAX_EXPECT_TEXT_LEN: usize = 10_000;
+
+/// Clamp a `timeout_ms` onto the wait budget. `None` (omitted) degrades to
+/// the default instead of failing deserialization.
+pub fn clamp_wait_timeout_ms(timeout_ms: Option<u64>) -> u64 {
+    timeout_ms
+        .unwrap_or(DEFAULT_WAIT_MS)
+        .clamp(MIN_WAIT_MS, MAX_WAIT_MS)
+}
+
+/// `wait_for_uid`: poll until the element carrying this uid exists in the
+/// page. The uid is matched verbatim against `data-oc-uid`; an empty uid is
+/// rejected by the handler before any tab or CDP call.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct WaitForUidParams {
+    pub uid: String,
+    pub tab_id: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+/// `expect_text`: poll until the page's visible text contains this substring.
+/// Matching is a plain substring search (case-sensitive); empty needles are
+/// rejected by the handler before any tab or CDP call.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ExpectTextParams {
+    pub text: String,
+    pub tab_id: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+/// `route`: mock one URL pattern on the session tab — fulfill with a fixture
+/// body or abort the request. Matching is a literal substring/prefix/host
+/// comparison, never regex; over-limit patterns are rejected by the handler
+/// before any tab or CDP call. Session-scoped: the tab owner check in
+/// `resolve` is the authorization, and mocks die with the tab.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RouteParams {
+    pub tab_id: Option<String>,
+    pub pattern: String,
+    /// `substring` (default), `prefix`, or `host`.
+    pub kind: Option<String>,
+    /// `fulfill` or `abort`.
+    pub action: String,
+    /// Fulfill only: HTTP status (default 200, must be 100-599).
+    pub status: Option<i64>,
+    /// Fulfill only: fixture body (default "", cap 256 KiB).
+    pub body: Option<String>,
+    /// Fulfill only: single `content-type` header value (default
+    /// `text/plain; charset=utf-8`, printable ASCII, max 128 chars).
+    pub content_type: Option<String>,
+}
+
+/// `status`: `verbose: true` adds the global `op_lock` queue-wait mean
+/// (counter sums only, no /proc walk). Default off.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct StatusParams {
+    pub verbose: Option<bool>,
+}
+
 /// Deserialize method params, mapping a schema error onto `INTERNAL` with a
 /// hint that names the offending method. Never panics on client input.
 ///
@@ -341,5 +418,36 @@ mod tests {
         let bad_fill = parse_params_owned::<FillParams>("fill", json!({"uid": 5}));
         assert!(bad_fill.is_err());
         assert_eq!(bad_fill.expect_err("err").code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn wait_params_parse_and_clamp() {
+        let good: WaitForUidParams =
+            parse_params_owned("wait_for_uid", json!({"uid": "g7-3"})).expect("ok");
+        assert_eq!(good.uid, "g7-3");
+        assert!(good.tab_id.is_none());
+        assert_eq!(clamp_wait_timeout_ms(good.timeout_ms), DEFAULT_WAIT_MS);
+
+        let bad = parse_params_owned::<WaitForUidParams>("wait_for_uid", json!({"uid": 5}));
+        assert!(bad.is_err());
+        assert_eq!(bad.expect_err("err").code, ErrorCode::Internal);
+
+        let text: ExpectTextParams =
+            parse_params_owned("expect_text", json!({"text": "Sign in"})).expect("ok");
+        assert_eq!(text.text, "Sign in");
+        assert_eq!(clamp_wait_timeout_ms(text.timeout_ms), DEFAULT_WAIT_MS);
+
+        // Missing text degrades to "" (serde default); the handler rejects it
+        // with an explicit validation error before any tab or CDP call.
+        let empty: ExpectTextParams = parse_params_owned("expect_text", json!({})).expect("ok");
+        assert!(empty.text.is_empty());
+        let bad_text = parse_params_owned::<ExpectTextParams>("expect_text", json!({"text": 5}));
+        assert!(bad_text.is_err());
+        assert_eq!(bad_text.expect_err("err").code, ErrorCode::Internal);
+
+        assert_eq!(clamp_wait_timeout_ms(None), DEFAULT_WAIT_MS);
+        assert_eq!(clamp_wait_timeout_ms(Some(50)), MIN_WAIT_MS);
+        assert_eq!(clamp_wait_timeout_ms(Some(999_999_999)), MAX_WAIT_MS);
+        assert_eq!(clamp_wait_timeout_ms(Some(7_500)), 7_500);
     }
 }

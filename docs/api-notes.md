@@ -162,3 +162,65 @@ drops tools matched by a `resource:"*", effect:"deny"` rule.
 Verified live: the host pushed `browse (16 tools, 12 shown)` and removed
 `browser`. Do not "restore" `browser` — every colliding tool would disappear
 again.
+
+## 8. Bounded waits — `wait_for_uid` + `expect_text` (D lane, additive)
+
+**Date:** 2026-11-16 · **Protocol:** v1 additive only — two methods appended
+to `METHODS` (`daemon/src/dispatch.rs`), two param structs appended to
+`daemon/src/rpc.rs` (`WaitForUidParams`, `ExpectTextParams`), two executors +
+specs appended in `plugin/src/tools.ts`. No existing method, error code, or
+lock site touched.
+
+**Shape:**
+
+| Tool | Params | Success | Deadline blown |
+|---|---|---|---|
+| `browse_wait_for_uid` | `uid` (required), `tab_id?`, `timeout_ms?` | `{found: true, uid, elapsed_ms, timeout_ms}` | `NAV_TIMEOUT`: `uid {uid} did not appear within {ms}ms` |
+| `browse_expect_text` | `text` (required, ≤10 KiB), `tab_id?`, `timeout_ms?` | `{matched: true, elapsed_ms, timeout_ms}` | `NAV_TIMEOUT`: `text did not appear within {ms}ms` |
+
+**Budget:** `timeout_ms` clamps to 100 ms–30 s, default 5 s
+(`clamp_wait_timeout_ms`, unit-tested in `rpc.rs`). Poll cadence 150 ms
+(`WAIT_POLL_MS`): one short `eval_json` per interval. The outer
+`request_timeout_ms` arm adds 5 s headroom (cap 40 s), so the handler's typed
+`NAV_TIMEOUT` always wins the race — the connection layer can never mask it
+with a bare `INTERNAL`.
+
+**Locking:** the handlers resolve the tab (which enforces `assert_owned_by`)
+but never take `op_lock`: the loop sleeps *between* CDP round trips, so a 30 s
+wait cannot head-of-line block snapshot/click/fill on the same tab.
+Transient eval failures (e.g. mid-navigation) keep polling until the deadline.
+
+**Matching:** uid = verbatim `data-oc-uid` selector (JSON-escaped into the
+page script, P1-2 style); text = plain case-sensitive `body.innerText`
+substring — never a regex, so no backtracking bomb. Empty uid/text and an
+over-cap needle are rejected before any tab or CDP call.
+
+## 9. Route mocks — `route` (E lane, additive)
+
+**Protocol:** v1 additive only — `route` appended to `METHODS`
+(`daemon/src/dispatch.rs`), `RouteParams` + `StatusParams` appended to
+`daemon/src/rpc.rs`, one executor + spec appended in `plugin/src/tools.ts`
+(network-adjacent). No existing method, error code, or lock site touched.
+
+**Shape:** `{pattern (required, ≤512 chars), action: fulfill|abort
+(required), kind: substring|prefix|host, status?, body?, content_type?,
+tab_id?}` → `{pattern, kind, action, routes}` (active-route count).
+`status` (default 200, 100–599), `body` (default "", 256 KiB), and
+`content_type` (default `text/plain`, printable ASCII, 128 chars) apply to
+fulfill only — `abort` rejects them rather than silently dropping them.
+
+**Enforcement:** `Fetch.enable` with no patterns pauses *every* request on
+the tab; the daemon pump answers each pause with exactly one of
+continue/fulfill/fail (`BlockedByClient` for abort), so the page can never
+wedge on an unanswered pause. First matching route (insertion order) wins;
+no match passes through. `Fetch.enable` + pump spawn happen once per tab
+(`fetch_started`/`fetch_armed` election); the table holds 20 routes max.
+
+**Trust boundary:** substring/prefix/host are literal string operations
+(`*`/`?` match themselves) — no regex crate touches untrusted input, so no
+ReDoS. Fulfilled bodies carry exactly `content-type`; no secret header
+(`authorization`, `cookie`, …) is ever reflected. Session-scoped via
+`resolve` ownership; `mark_dead` clears the table, so `close_tab`,
+`remove_all`, `sweep`, and eviction all drop every mock. `status` gained an
+opt-in `verbose` flag reporting the global `op_lock` queue-wait mean
+(counter sums only, no /proc walk).

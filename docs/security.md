@@ -85,6 +85,31 @@ malicious page plus one approved upload can read anything the user can read.
 - `next_since` is a monotonic per-tab cursor, not a timestamp: it leaks nothing
   about other sessions.
 
+## Route mocks (`browse_route`)
+
+Deterministic fixtures for agent tests: one literal URL pattern bound to
+`fulfill` (serve a fixture body) or `abort` (fail the request) on the
+session tab.
+
+- Matching is substring (default), `prefix`, or bare-`host` comparison —
+  literal string operations only. `*` and `?` match themselves; no regex
+  crate ever sees untrusted input, so there is no backtracking bomb.
+- Patterns cap at 512 chars; `status` must be 100–599, `body` 256 KiB,
+  `content-type` printable ASCII ≤ 128 chars. Oversized or malformed input
+  is rejected before any tab or CDP call, and `abort` rejects fulfill-only
+  fields instead of silently dropping them.
+- A fulfilled mock sends exactly one response header (`content-type`).
+  Request headers — `authorization`, `cookie`, `set-cookie`, `x-api-key` —
+  are never reflected into a mock, so fulfilled fixtures cannot leak
+  session secrets.
+- Session-scoped: installing a route resolves the caller's owned tab
+  (`TAB_FORBIDDEN` otherwise), and `mark_dead` clears the table, so
+  `close_tab`, `remove_all`, `sweep`, and eviction all drop every mock.
+  Requests with no matching route pass through untouched.
+- Arming pauses every request on the tab (`Fetch.enable`, no patterns);
+  the daemon pump answers each pause with exactly one continue/fulfill/fail,
+  so a mock can never wedge the page.
+
 ## Session and tab isolation
 
 - One tab per OpenCode session; `TAB_FORBIDDEN` when a client addresses

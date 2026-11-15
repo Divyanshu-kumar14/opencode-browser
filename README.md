@@ -68,6 +68,9 @@ colliding tool id is silently dropped, so this plugin must own a namespace):
 | `browse_console` | recent console messages (ring buffer, 500/tab) | `{messages, next_since}` |
 | `browse_network` | recent requests (ring buffer, 500/tab) | `{requests, next_since}` |
 | `browse_network_body` | one response body by `request_id` | `{body, bytes, truncated}` |
+| `browse_route` | mock a URL pattern: fulfill with a fixture or abort it | `{pattern, action, routes}` |
+| `browse_wait_for_uid` | wait for a `[uid]` to appear (bounded poll) | `{found, elapsed_ms}` or `NAV_TIMEOUT` |
+| `browse_expect_text` | wait for a page-text substring (bounded poll, plain match) | `{matched, elapsed_ms}` or `NAV_TIMEOUT` |
 | `browse_list_tabs` / `browse_close_tab` | inspect / close tabs (yours only) | `{tabs}` / `{closed}` |
 
 `browse_console` / `browse_network` accept `since` (the previous response's
@@ -75,6 +78,25 @@ colliding tool id is silently dropped, so this plugin must own a namespace):
 `browse_network` returns redacted request/response headers only with
 `include_headers: true`; `browse_network_body` reads one body (default 16 KiB,
 cap 256 KiB) and reports `BODY_UNAVAILABLE` once Chrome has evicted it.
+
+Route mocks: `browse_route` binds one literal URL pattern (`substring`
+default, `prefix`, or bare-`host`) to `fulfill` or `abort` on your session
+tab, so agent tests run deterministically. Patterns are capped at 512 chars
+and matched literally — never a regex — and `status`/`body`/`content_type`
+are bounded (100–599, 256 KiB, printable ASCII). A fulfilled mock answers
+with exactly one header (`content-type`); request headers and their secrets
+are never reflected. Mocks are session-scoped and die with the tab
+(`close_tab` clears them); with no matching route the request passes
+through untouched.
+
+Bounded waits: `browse_wait_for_uid` polls (every 150 ms) until the element
+carrying the uid exists (`data-oc-uid` match); `browse_expect_text` polls
+until the visible text contains the substring (plain case-sensitive match —
+never a regex). Both take `timeout_ms` (default 5 s, clamp 100 ms–30 s) and
+never hold the per-tab lock across sleeps, so a long wait cannot wedge the
+tab. Success reports `{found: true, elapsed_ms}` / `{matched: true,
+elapsed_ms}`; a blown deadline is a typed `NAV_TIMEOUT` naming the condition
+and the budget (retry with a larger `timeout_ms`, or snapshot what rendered).
 
 Stale-uid rule: every uid encodes its navigation generation (`g7-3`). Using
 one after the page changed returns `UID_STALE` ("re-run `browse_snapshot`")

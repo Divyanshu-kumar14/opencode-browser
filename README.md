@@ -3,13 +3,18 @@
 Browser automation for OpenCode: a TypeScript shim plus a Rust CDP daemon that
 keeps **one shared Chromium** warm across sessions. Linux x86_64 only for v1.
 
-> **Status: pre-release.** The daemon core (M0) and the full `browser_*` tool
+> **Status: pre-release.** The daemon core (M0) and the full `browse_*` tool
 > surface (M2) are under construction. No "faster/lighter" performance claim
 > in this file is backed by measurement yet — see
 > [`bench/results/report.md`](bench/results/report.md) (M3) before quoting any
 > number. The raw-WS JS baseline driver
 > (`plugin/src/driver/js.ts`, selectable via `driver: "js"`) already runs the
 > full bench workload against real Chrome.
+>
+> **Tool-surface gap closure:** [`docs/PLAN-tool-surface-gaps.md`](docs/PLAN-tool-surface-gaps.md)
+> — why the host once showed 6 tools while the source registered 16 (built-in
+> `browser` namespace collision; fixed by renaming to `browse`), and the
+> phased plan for interaction, network depth, tabs, and tests.
 
 ## Quickstart
 
@@ -42,30 +47,50 @@ Plugin options (all optional; defaults shown):
 
 ## Tools
 
-Planned surface (M2; `codemode: true` on all):
+Shipped surface (`codemode: true` on all; the `browse_` prefix is added by the
+namespace — the host reserves `browser` for its built-in desktop tools and a
+colliding tool id is silently dropped, so this plugin must own a namespace):
 
 | Tool | What it does | Returns |
 |---|---|---|
-| `browser_navigate` | go to a URL in your session tab | `{tab_id, url, title, status}` |
-| `browser_snapshot` | compact accessibility snapshot with `[uid]` refs | text tree, `max_nodes` default 300 |
-| `browser_click` | real mouse click at the element center (occlusion-checked) | `{ok}` |
-| `browser_fill` | focus + real key events (works with React/Vue) | `{ok}` |
-| `browser_press_key` | key press, optionally into a uid | `{ok}` |
-| `browser_eval` | run JS in the page (**permission-gated**, see below) | `{value}` |
-| `browser_screenshot` | PNG capture | file attachment + `{path}` |
-| `browser_console` | recent console messages (ring buffer, 500/tab) | `{messages}` |
-| `browser_network` | recent requests (ring buffer, 500/tab) | `{requests}` |
-| `browser_list_tabs` / `browser_close_tab` | inspect / close tabs (yours only) | `{tabs}` / `{closed}` |
+| `browse_navigate` | go to a URL in your session tab | `{tab_id, url, title, status}` |
+| `browse_snapshot` | compact accessibility snapshot with `[uid]` refs | text tree, `max_nodes` default 300 |
+| `browse_click` | real mouse click at the element center (occlusion-checked) | `{ok}` |
+| `browse_fill` | focus + real key events (works with React/Vue) | `{ok}` |
+| `browse_hover` | move the mouse over a uid (menu/hover states) | `{ok, x, y}` |
+| `browse_select` | pick a `<select>` option by value, label or index | `{value, label, index}` |
+| `browse_upload` | attach local files to a file input (**permission-gated**) | `{files}` |
+| `browse_dialog` | accept/dismiss a JS dialog (after `dialog_policy: manual`) | `{action, dialog}` |
+| `browse_scroll` | scroll up/down/left/right/top/bottom | `{scrollX, scrollY, at_bottom}` |
+| `browse_press_key` | key press, optionally into a uid | `{ok}` |
+| `browse_eval` | run JS in the page (**permission-gated**, see below) | `{value}` |
+| `browse_screenshot` | PNG capture | file attachment + `{path}` |
+| `browse_console` | recent console messages (ring buffer, 500/tab) | `{messages, next_since}` |
+| `browse_network` | recent requests (ring buffer, 500/tab) | `{requests, next_since}` |
+| `browse_network_body` | one response body by `request_id` | `{body, bytes, truncated}` |
+| `browse_list_tabs` / `browse_close_tab` | inspect / close tabs (yours only) | `{tabs}` / `{closed}` |
+
+`browse_console` / `browse_network` accept `since` (the previous response's
+`next_since`) and return only newer entries, so a polling loop cannot skip rows.
+`browse_network` returns redacted request/response headers only with
+`include_headers: true`; `browse_network_body` reads one body (default 16 KiB,
+cap 256 KiB) and reports `BODY_UNAVAILABLE` once Chrome has evicted it.
 
 Stale-uid rule: every uid encodes its navigation generation (`g7-3`). Using
-one after the page changed returns `UID_STALE` ("re-run `browser_snapshot`")
+one after the page changed returns `UID_STALE` ("re-run `browse_snapshot`")
 instead of clicking the wrong node. Driving another session's tab returns
 `TAB_FORBIDDEN`.
 
-`browser_eval` is gated by the native permission domain: the executor calls
+`browse_eval` is gated by the native permission domain: the executor calls
 `ctx.permission.assert({sessionID, action: "browser_eval", resources: [url]})`,
 so allow/deny follows the session's permission rules with a UI prompt — there
-is no bypass via hook input rewriting.
+is no bypass via hook input rewriting. `browse_upload` uses the same gate with
+`action: "browser_upload"` and the file paths as resources.
+
+Dialogs: `navigate` defaults to `dialog_policy: "auto"`, which dismisses
+`alert`/`confirm`/`prompt` and accepts `beforeunload` so a page can never wedge
+the tab. Pass `dialog_policy: "manual"` and call `browse_dialog` to drive one
+explicitly.
 
 ## Security (summary)
 
@@ -76,7 +101,11 @@ is no bypass via hook input rewriting.
   explicit opt-in; `javascript:` rejected.
 - **Eval:** permission-gated per session (see above); attach mode is opt-in
   and tags only daemon-owned targets.
-- **Logs:** query strings/fragments are redacted from logged URLs.
+- **Upload:** permission-gated with the file paths as resources; the daemon
+  re-validates every path (absolute, regular file, no `..`, no symlinks,
+  ≤8 files / 100 MiB) so a hostile client cannot bypass the shim.
+- **Logs:** query strings/fragments are redacted from logged URLs; upload
+  errors name basenames only.
 - **Not protected:** a page you navigate to can still attack the browser
   itself (standard CDP caveat); the daemon does not sandbox web content.
 
@@ -113,7 +142,7 @@ download for v1). **Size budget: ≤20 MB compressed**, enforced by CI
 | `DAEMON_UNAVAILABLE` / empty reply | Is it running? `ss -x \| grep opencode-browser` or send `{"id":1,"method":"status","params":{}}` via `socat`. If dead, the shim respawns it on next call (≤2 s backoff). |
 | `PROTOCOL_MISMATCH` | Shim/daemon version skew. Socket path embeds the protocol major (`.../v1/`), so this means a stale daemon: kill it (below) and retry. |
 | `CHROME_DEAD` | Chrome crashed; the daemon relaunches once automatically — just retry. Persistent? Run the binary by hand: `google-chrome --headless=new about:blank`. |
-| `UID_STALE` / `UID_NOT_FOUND` | Page changed since the snapshot. Re-run `browser_snapshot`, use the new uids. |
+| `UID_STALE` / `UID_NOT_FOUND` | Page changed since the snapshot. Re-run `browse_snapshot`, use the new uids. |
 | `TAB_FORBIDDEN` | That tab belongs to another session. Navigate in your own session instead. |
 | Need the socket path | `${XDG_RUNTIME_DIR:-/tmp/opencode-browser-$UID}/opencode-browser/v1/daemon.sock` (see `daemon/src/paths.rs`). |
 | Kill the daemon | `pkill -x browserd`, or send `{"id":1,"method":"shutdown","params":{}}` on the socket. Tabs die with it; Chrome's profile dir is removed. |

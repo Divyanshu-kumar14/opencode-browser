@@ -131,9 +131,9 @@ catalog instead of letting the call fail** — Phase 3 error taxonomy must treat
   (`Authorization failed` / stale `openrouter` key `User not found`); the working path
   was `opencode/*` models via stored auth. Not our problem to fix, just don't depend
   on those providers for gates.
-- The `[browser] registered: …` stderr line in `setup()` is intentional diagnostic
+- The `[browse] registered: …` stderr line in `setup()` is intentional diagnostic
   logging, not leftover debug print — keep it; it is the cheapest registration proof
-  in every future E2E run. Same for the per-call `[browser_ping] sessionID=…` line
+  in every future E2E run. Same for the per-call `[browse_ping] sessionID=…` line
   (remove or rate-limit it when call volume grows in Phase 3 chaos tests).
 
 ## 6. Gate A0 verdict
@@ -142,3 +142,23 @@ catalog instead of letting the call fail** — Phase 3 error taxonomy must treat
 prompt path characterized as far as non-interactive runs allow (allowed / auto-reject /
 hidden-on-deny); zero unresolved API surprises — the one surprise found (per-tool
 namespace) is resolved and encoded in `plugin/src/index.ts`.
+
+## 7. Host tool-catalog collision — the namespace must not be `browser`
+
+**Symptom (2026-11-15):** `ctx.tool.list()` reported all 16 plugin tools, but the
+Code Mode catalog exposed only 6. The six were exactly the ids with no built-in
+counterpart: `upload`, `press_key`, `eval`, `network`, `list_tabs`, `close_tab`.
+The ten missing ones (`navigate`, `snapshot`, `screenshot`, `click`, `fill`,
+`hover`, `select`, `dialog`, `scroll`, `console`) all collide with the host's
+built-in `browser` namespace (`b_ = [ri("tabs.list", …)]`, 45 tools incl.
+`navigate`, `snapshot`, `evaluate`, `click`, `fill`, `dialog`, `console`).
+
+**Cause:** both registries key tools by `${namespace}_${name}`. A colliding
+built-in wins; the plugin entry vanishes from the catalog while still appearing
+in `ctx.tool.list()`. No permission rule is involved — the catalog filter only
+drops tools matched by a `resource:"*", effect:"deny"` rule.
+
+**Fix:** the plugin namespace is `browse` (`plugin/src/tools.ts` → `NAMESPACE`).
+Verified live: the host pushed `browse (16 tools, 12 shown)` and removed
+`browser`. Do not "restore" `browser` — every colliding tool would disappear
+again.

@@ -1,30 +1,62 @@
-# opencode-browser
+<div align="center">
 
-Browser automation for OpenCode: a TypeScript shim plus a Rust CDP daemon that keeps **one shared Chromium** warm across sessions. Built for agents — token-efficient snapshots, session-scoped tabs, and a permission model that treats page content as data, never instructions.
+# 🌐 opencode-browser
 
-**Status: v1 on Linux x64.** The full tool surface is implemented, the 61-check smoke suite passes, and CI is green (typecheck, tests, pack budget, end-to-end). macOS/Windows are post-v1.
+**Browser automation for OpenCode, built for agents** — one warm Chromium, token-cheap snapshots, safety by construction.
 
-## Why this exists
+[![CI](https://github.com/Divyanshu-kumar14/opencode-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/Divyanshu-kumar14/opencode-browser/actions/workflows/ci.yml)
+[![Linux x64](https://img.shields.io/badge/OS-Linux%20x64-blue)](https://github.com/Divyanshu-kumar14/opencode-browser)
+[![OpenCode V2](https://img.shields.io/badge/OpenCode-V2%20plugin-purple)](https://github.com/Divyanshu-kumar14/opencode-browser)
+[![Tools](https://img.shields.io/badge/tools-20-green)](https://github.com/Divyanshu-kumar14/opencode-browser#--tools)
 
-General-purpose automation (Playwright, raw CDP) optimizes for test authors. This plugin optimizes for an LLM driving a browser inside OpenCode:
+[🚀 Quickstart](#-quickstart) · [🧰 Tools](#-tools) · [🔒 Security](#-security) · [🛠 Development](#-development)
 
-- **Cheap to observe.** Snapshots are compact accessibility trees with stable `[uid]` references, so an agent reads the page in hundreds of tokens instead of dumping DOM.
-- **Cheap to run.** One daemon-owned Chromium stays warm across sessions — no per-task browser launch.
-- **Safe by construction.** Tabs are owned per session with leases, risky actions are permission-gated per page, and secrets are redacted at capture time, before they can reach a transcript.
+**Status: v1 on Linux x64.** Full tool surface implemented, 61-check smoke suite green, CI green. macOS/Windows are post-v1.
 
-## How it works
+</div>
 
-```text
-agent → browse_* tools (shim, in OpenCode server)
-          ↕ NDJSON over Unix socket ($XDG_RUNTIME_DIR/opencode-browser/v1/daemon.sock)
-      browserd (Rust daemon, own process group)
-          ↕ CDP
-      one shared Chromium (daemon-owned profile, isolated from your real Chrome)
+## 👀 At a glance
+
+<div align="center">
+
+| 👁 Observe cheaply | 🖱 Act reliably | 🛡 Stay safe |
+|---|---|---|
+| Compact snapshots with stable `[uid]` refs — pages cost hundreds of tokens, not DOM dumps | Auto-wait, occlusion checks, exactly-once stale-uid retry, typed timeouts | Session-owned tabs, permission-gated eval/upload, secrets redacted at capture |
+
+</div>
+
+## 🏗 How it works
+
+```mermaid
+flowchart LR
+    A["🤖 Agent\nOpenCode session"] -->|"browse_* tools"| B["Shim\nTypeScript plugin"]
+    B -->|"NDJSON · Unix socket\n0700 dir · 0600 socket"| C["browserd\nRust daemon"]
+    C -->|"CDP"| D[("One shared Chromium\ndaemon-owned profile")]
+    B -.->|"dies? respawn ≤2s"| C
 ```
 
-The shim (`plugin/`) translates tool calls into daemon RPCs. The daemon owns exactly one Chromium, multiplexes session tabs onto it (max 8, LRU, 10-minute leases), and survives OpenCode restarts. If the daemon ever dies, the shim respawns it on the next call.
+The shim translates tool calls into daemon RPCs. The daemon owns exactly one Chromium, multiplexes session tabs onto it (max 8, LRU, 10-minute leases), and survives OpenCode restarts.
 
-## Quickstart
+A typical round-trip:
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Shim as Plugin shim
+    participant Daemon as browserd
+    participant Chrome as Chromium
+    Agent->>Shim: browse_snapshot
+    Shim->>Daemon: snapshot {tab}
+    Daemon->>Chrome: DOM + accessibility tree
+    Chrome-->>Daemon: nodes
+    Daemon-->>Shim: compact tree with [uids]
+    Shim-->>Agent: g7-1 Email · g7-3 Sign in…
+    Agent->>Shim: browse_click uid=g7-3
+    Shim->>Daemon: click (occlusion + actionability checked)
+    Daemon->>Chrome: real mouse click
+```
+
+## 🚀 Quickstart
 
 ```jsonc
 // opencode.jsonc
@@ -35,7 +67,17 @@ The shim (`plugin/`) translates tool calls into daemon RPCs. The daemon owns exa
 opencode run "navigate to http://127.0.0.1:8787, snapshot, and tell me what you see"
 ```
 
-## Configuration
+What the agent sees:
+
+```text
+page http://127.0.0.1:8787 (g7)
+  textbox "Email" [g7-1]
+  button "Sign in" [g7-3]
+```
+
+…and clicks `g7-3` with a real mouse event. Uids encode the page generation, so a stale uid fails safe (`UID_STALE`) instead of clicking the wrong node.
+
+## ⚙️ Configuration
 
 All options are optional; defaults shown.
 
@@ -48,9 +90,13 @@ All options are optional; defaults shown.
 | `max_tabs` | 1–32 | `8` | hard cap; LRU evicts unowned/idle tabs first, never an actively-owned tab |
 | `idle_timeout_s` | seconds | `1800` | daemon exits after 30 min with zero tabs |
 
-## Tools
+## 🧰 Tools
 
-20 tools, all `codemode: true`. (The `browse_` prefix comes from the plugin namespace — the host reserves `browser` for its built-in desktop tools, and a colliding tool id is silently dropped.)
+<div align="center">
+
+20 tools · all `codemode: true` · `browse_` prefix (the host reserves `browser` for its built-in tools, where a colliding id is silently dropped)
+
+</div>
 
 | Tool | What it does | Returns |
 |---|---|---|
@@ -74,37 +120,26 @@ All options are optional; defaults shown.
 | `browse_expect_text` | wait for a page-text substring (bounded poll, plain match) | `{matched, elapsed_ms}` or `NAV_TIMEOUT` |
 | `browse_list_tabs` / `browse_close_tab` | inspect / close tabs (yours only) | `{tabs}` / `{closed}` |
 
-### Reading logs without missing rows
+**📜 Logs without gaps.** `browse_console` / `browse_network` accept `since` (the previous response's `next_since`) and return only newer entries, so polling loops can't skip rows. Headers are included only with `include_headers: true` (already redacted). Bodies default to 16 KiB (cap 256 KiB) and report `BODY_UNAVAILABLE` once Chrome evicts them.
 
-`browse_console` / `browse_network` accept `since` (the previous response's `next_since`) and return only newer entries, so a polling loop cannot skip rows. `browse_network` includes redacted request/response headers only with `include_headers: true`. `browse_network_body` reads one body (default 16 KiB, cap 256 KiB) and reports `BODY_UNAVAILABLE` once Chrome has evicted it.
+**🎭 Deterministic mocks.** `browse_route` binds one literal URL pattern (`substring`, `prefix`, or bare `host`) to `fulfill` or `abort` on your session tab. Patterns are capped at 512 chars and matched literally — never a regex. Fulfilled mocks answer with exactly one header (`content-type`); secrets are never reflected. Mocks die with the tab; unmatched requests pass through untouched.
 
-### Deterministic mocks
+**⏳ Bounded waits.** Both wait tools poll every 150 ms (`timeout_ms` default 5 s, clamp 100 ms–30 s) without holding the per-tab lock, so a long wait can't wedge the tab. Success reports elapsed time; a blown deadline is a typed `NAV_TIMEOUT`.
 
-`browse_route` binds one literal URL pattern (`substring` default, `prefix`, or bare `host`) to `fulfill` or `abort` on your session tab, so agent tests don't depend on the network. Patterns are capped at 512 chars and matched literally — never a regex. A fulfilled mock answers with exactly one header (`content-type`); request headers and their secrets are never reflected. Mocks are session-scoped and die with the tab; unmatched requests pass through untouched.
+**🪪 Identity rules.** Stale uids fail safe (`UID_STALE`) — and the shim retries once automatically (re-snapshot, re-resolve by role+name, retry exactly once). Other sessions' tabs answer `TAB_FORBIDDEN`. `browse_eval` is gated per page (`action: "browser_eval"`, UI prompt, no hook bypass); `browse_upload` the same with file paths as resources. Dialogs auto-dismiss by default (`dialog_policy: "auto"`); pass `"manual"` + `browse_dialog` to drive one.
 
-### Bounded waits
+## 🔒 Security (summary)
 
-`browse_wait_for_uid` polls (every 150 ms) until the element carrying the uid exists; `browse_expect_text` polls until the visible text contains the substring (plain case-sensitive match — never a regex). Both take `timeout_ms` (default 5 s, clamp 100 ms–30 s) and never hold the per-tab lock across sleeps, so a long wait cannot wedge the tab. Success reports elapsed time; a blown deadline is a typed `NAV_TIMEOUT` naming the condition and the budget.
-
-### Identity rules
-
-- **Stale uids fail safe.** Every uid encodes its navigation generation (`g7-3`). Using one after the page changed returns `UID_STALE` — and the shim retries once automatically (re-snapshot, re-resolve by role+name, retry exactly once) before surfacing the original error.
-- **Tabs are yours alone.** Driving another session's tab returns `TAB_FORBIDDEN`.
-- **Permissions are per page.** `browse_eval` calls `ctx.permission.assert({sessionID, action: "browser_eval", resources: [url]})`, so allow/deny follows the session's rules with a UI prompt — no bypass via hook input rewriting. `browse_upload` uses the same gate with the file paths as resources.
-- **Dialogs default to safe.** `navigate` uses `dialog_policy: "auto"`, which dismisses `alert`/`confirm`/`prompt` and accepts `beforeunload` so a page can never wedge the tab. Pass `"manual"` and call `browse_dialog` to drive one explicitly.
-
-## Security (summary)
-
-- **Socket:** `$XDG_RUNTIME_DIR/opencode-browser/v1/` (mode `0700`), `daemon.sock` (mode `0600`), `SO_PEERCRED` uid check — another local user cannot connect, even on a shared host.
-- **Navigation allowlist:** `http`, `https`, `about`; `file:` only with explicit opt-in; `javascript:` rejected, with re-check after redirects.
-- **Eval:** permission-gated per session (see above); attach mode is opt-in and tags only daemon-owned targets.
-- **Upload:** permission-gated with the file paths as resources; the daemon re-validates every path (absolute, regular file, no `..`, no symlinks, ≤8 files / 100 MiB) so a hostile client cannot bypass the shim.
-- **Logs:** query strings/fragments are redacted from stored URLs; credential-bearing headers are redacted at capture; upload errors name basenames only.
-- **Not protected:** a page you navigate to can still attack the browser itself (standard CDP caveat); the daemon does not sandbox web content.
+- **Socket:** `$XDG_RUNTIME_DIR/opencode-browser/v1/` (`0700`), `daemon.sock` (`0600`), `SO_PEERCRED` uid check — another local user cannot connect.
+- **Navigation allowlist:** `http`, `https`, `about`; `file:` only with explicit opt-in; `javascript:` rejected, re-checked after redirects.
+- **Eval:** permission-gated per session; attach mode is opt-in and tags only daemon-owned targets.
+- **Upload:** permission-gated; the daemon re-validates every path (absolute, regular file, no `..`, no symlinks, ≤8 files / 100 MiB).
+- **Logs:** query strings/fragments redacted; credential-bearing headers redacted at capture; upload errors name basenames only.
+- **Not protected:** a page you navigate to can still attack the browser itself (standard CDP caveat); web content is not sandboxed.
 
 Full notes: [`docs/security.md`](docs/security.md), [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md).
 
-## Development
+## 🛠 Development
 
 ```sh
 cargo test --manifest-path daemon/Cargo.toml   # Rust unit tests
@@ -116,7 +151,7 @@ node scripts/smoke.mjs                          # 61-check end-to-end vs real Ch
 
 CI runs all of the above plus a pack-size budget and the smoke suite as e2e. The merge bar is green trio + 61/61 smoke; performance claims require same-conditions before/after numbers, never estimates.
 
-## Benchmarks
+## 📊 Benchmarks
 
 Baselines on the same machine/Chrome/fixture: **A** = raw-CDP JS driver in-process, **B** = Rust daemon. Workload: 1/4/8 sessions × 20 calls, 3 runs. Metrics: cold first call, warm p50/p95 per method, idle/marginal/total-tree RSS, collisions.
 
@@ -124,11 +159,11 @@ Baselines on the same machine/Chrome/fixture: **A** = raw-CDP JS driver in-proce
 
 Run it: `node scripts/bench.mjs --mock` (no Chrome) or `node scripts/bench.mjs --driver js` (real Chrome); `--compare <other-results.json>` evaluates the rule. Decision memo: [`bench/results/report.md`](bench/results/report.md).
 
-## Packaging
+## 📦 Packaging
 
-`node scripts/build-native.mjs` builds `browserd --release`, strips it, and stages `prebuilds/linux-x64/browserd` (mode `755`). The npm tarball ships `plugin/ + prebuilds/ + README.md` **inside** the package (no postinstall download for v1). **Size budget: ≤20 MB compressed**, enforced by CI (`pack-smoke` fails the build over budget).
+`node scripts/build-native.mjs` builds `browserd --release`, strips it, and stages `prebuilds/linux-x64/browserd` (`755`). The npm tarball ships `plugin/ + prebuilds/ + README.md` **inside** the package (no postinstall download for v1). **Size budget: ≤20 MB compressed**, enforced by CI.
 
-## Troubleshooting
+## 🆘 Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -141,7 +176,7 @@ Run it: `node scripts/bench.mjs --mock` (no Chrome) or `node scripts/bench.mjs -
 | Need the socket path | `${XDG_RUNTIME_DIR:-/tmp/opencode-browser-$UID}/opencode-browser/v1/daemon.sock` (see `daemon/src/paths.rs`) |
 | Kill the daemon | `pkill -x browserd`, or send `{"id":1,"method":"shutdown","params":{}}` on the socket. Tabs die with it; Chrome's profile dir is removed |
 
-## Compatibility
+## ✅ Compatibility
 
 - OS/CPU: `linux` / `x64` (v1). macOS/Windows are post-v1.
 - Runtimes: Node ≥22 or Bun ≥1 (shim + bench scripts).

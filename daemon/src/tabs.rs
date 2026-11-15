@@ -1063,7 +1063,7 @@ impl TabRegistry {
                     "tab limit ({}) reached with no evictable tab",
                     self.max_tabs
                 ),
-                "close a tab with browser_close_tab, or wait for the 10 minute lease to expire",
+                "close a tab with browse_close_tab, or wait for the 10 minute lease to expire",
             )
         })?;
         let removed = inner.tabs.remove(&victim);

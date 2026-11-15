@@ -242,7 +242,7 @@ async fn handle_navigate(app: &App, params: Value, session: &str) -> Result<Valu
             return Err(RpcError::new(
                 ErrorCode::Internal,
                 format!("invalid dialog_policy {other:?}: expected auto or manual"),
-                "omit dialog_policy to auto-dismiss, or use \"manual\" to drive dialogs with browser_dialog",
+                "omit dialog_policy to auto-dismiss, or use \"manual\" to drive dialogs with browse_dialog",
             ));
         }
     };
@@ -624,7 +624,7 @@ async fn handle_select(app: &App, params: Value, session: &str) -> Result<Value,
                         .and_then(Value::as_str)
                         .unwrap_or("element")
                 ),
-                "use browser_click or browser_fill for non-select elements",
+                "use browse_click or browse_fill for non-select elements",
             ),
             _ => RpcError::new(
                 ErrorCode::Internal,
@@ -633,7 +633,7 @@ async fn handle_select(app: &App, params: Value, session: &str) -> Result<Value,
                     target,
                     value.get("count").and_then(Value::as_u64).unwrap_or(0)
                 ),
-                "call browser_snapshot to read the option values and labels",
+                "call browse_snapshot to read the option values and labels",
             ),
         });
     }
@@ -710,7 +710,7 @@ async fn handle_upload(app: &App, params: Value, session: &str) -> Result<Value,
                 parsed.uid,
                 node.node_name.to_lowercase()
             ),
-            "point upload at an <input type=\"file\"> uid from browser_snapshot",
+            "point upload at an <input type=\"file\"> uid from browse_snapshot",
         ));
     }
     let attrs = node.attributes.unwrap_or_default();
@@ -727,7 +727,7 @@ async fn handle_upload(app: &App, params: Value, session: &str) -> Result<Value,
                 "uid {} is an <input type=\"{kind}\">, not a file input",
                 parsed.uid
             ),
-            "point upload at an <input type=\"file\"> uid from browser_snapshot",
+            "point upload at an <input type=\"file\"> uid from browse_snapshot",
         ));
     }
 
@@ -1037,7 +1037,7 @@ async fn handle_bench(app: &App, params: Value) -> Result<Value, RpcError> {
         return Err(RpcError::new(
             ErrorCode::TabLimit,
             "bench would exceed the tab limit",
-            "close tabs with browser_close_tab first, or bench with fewer sessions",
+            "close tabs with browse_close_tab first, or bench with fewer sessions",
         ));
     }
     let started = std::time::Instant::now();

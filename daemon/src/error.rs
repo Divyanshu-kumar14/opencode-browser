@@ -53,7 +53,7 @@ impl RpcError {
         Self::new(
             ErrorCode::Internal,
             message,
-            "retry the call; if it keeps failing, run browser_status and check the daemon log",
+            "retry the call; if it keeps failing, run browse_status and check the daemon log",
         )
     }
 
@@ -69,7 +69,7 @@ impl RpcError {
         Self::new(
             ErrorCode::TabNotFound,
             message,
-            "call browser_navigate first, or pass a tab_id from browser_list_tabs",
+            "call browse_navigate first, or pass a tab_id from browse_list_tabs",
         )
     }
 
@@ -101,7 +101,7 @@ impl RpcError {
         Self::new(
             ErrorCode::UidStale,
             format!("uid {uid} belongs to a previous page generation"),
-            "the page changed; re-run browser_snapshot and use a uid from the new tree",
+            "the page changed; re-run browse_snapshot and use a uid from the new tree",
         )
     }
 
@@ -109,7 +109,7 @@ impl RpcError {
         Self::new(
             ErrorCode::UidNotFound,
             format!("uid {uid} is not present in the current snapshot"),
-            "re-run browser_snapshot; uids are only valid until the next navigation or snapshot",
+            "re-run browse_snapshot; uids are only valid until the next navigation or snapshot",
         )
     }
 
@@ -179,7 +179,7 @@ mod tests {
         let err = RpcError::new(
             ErrorCode::UidStale,
             "uid g7-3 belongs to a previous page generation",
-            "re-run browser_snapshot",
+            "re-run browse_snapshot",
         );
         let value = serde_json::to_value(&err).expect("serialize");
         assert_eq!(value["code"], "UID_STALE");
@@ -187,7 +187,7 @@ mod tests {
             value["message"],
             "uid g7-3 belongs to a previous page generation"
         );
-        assert_eq!(value["hint"], "re-run browser_snapshot");
+        assert_eq!(value["hint"], "re-run browse_snapshot");
         assert_eq!(value.as_object().expect("object").len(), 3);
     }
 

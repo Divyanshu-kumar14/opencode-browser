@@ -239,13 +239,19 @@ touched.
 
 ### 10a. `browse_click_at{x, y}` — coordinate fallback
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:94c5a126e3d00aa78a1be0fd18215293fc9b8d24e5a6414d6b7678bdaa937578 -->
+
 | Layer | Rule |
 |---|---|
 | Shim (`coordParam`, `MAX_CLICK_COORD = 16384`) | Missing/non-finite/negative/`>16384` rejected with `INTERNAL` before any RPC |
 | Daemon (`validate_click_at_coords`, `MAX_CLICK_AT_COORD = 100_000.0`) | Missing/non-finite/negative/`>100_000` rejected with `INTERNAL` before any tab or CDP call |
 | Ownership | `resolve` (never `resolve_or_create`, so a coordinate click can never mint a tab in another session) + `assert_owned_by` before any CDP; foreign tab → `TAB_FORBIDDEN` |
-| Click | Real mouse click via CDP (`MouseMoved` → `MousePressed`, 20 ms pause with **no lock held**, `MouseReleased`), `{ok, x, y}` echo. **No** uid checks, **no** occlusion/actionability probe — documented tradeoff: a covering element receives the click instead of `ELEMENT_OCCLUDED` |
+| Click | Real mouse click via CDP (`MouseMoved` → `MousePressed` → `MouseReleased`, serialized under `op_lock` with no sleep), `{ok, x, y}` echo. **No** uid checks, **no** occlusion/actionability probe — documented tradeoff: a covering element receives the click instead of `ELEMENT_OCCLUDED` |
 | Timeout | No per-method arm: default 30 s outer bound (`request_timeout_ms("click_at") == 30_000`, unit-tested) |
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 **Parity proof:** `scripts/click-proof.mjs` — on the smoke fixture,
 `click(append uid)` then `click_at(measured button center)` must each add

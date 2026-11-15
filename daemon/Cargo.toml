@@ -19,6 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
 base64 = "0.22"
+url = "2"
 thiserror = "2"
 fs2 = "0.4"
 libc = "0.2"

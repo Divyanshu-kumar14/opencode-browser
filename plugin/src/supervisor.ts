@@ -116,7 +116,7 @@ export function attachOptIn(): boolean {
 /** Hosts that are unambiguously this machine. Anything else is refused. */
 function isLoopbackHost(host: string): boolean {
   const lower = host.toLowerCase();
-  if (lower === "localhost" || lower === "127.0.0.1" || lower === "::1") {
+  if (lower === "localhost" || lower === "127.0.0.1" || lower === "::1" || lower === "[::1]") {
     return true;
   }
   // 127/8 literals need no DNS; validate each octet so `127.999.1.1`
@@ -190,6 +190,8 @@ export async function probeAttachTarget(
   try {
     response = await fetch(`${parsed.origin}/json/version`, {
       signal: AbortSignal.timeout(timeoutMs),
+      redirect: "error",
+      proxy: false,
     });
   } catch {
     // Unreachable or timed out: not an error, just no debuggable Chrome.
@@ -238,7 +240,7 @@ export async function resolveAttachEnv(): Promise<Record<string, string>> {
     return {};
   }
   console.error(
-    `[browse] attaching to the debuggable Chrome at ${probeUrl} ` +
+    `[browse] requesting attachment to the debuggable Chrome at ${probeUrl} ` +
       `(explicit opt-in ${ATTACH_ENV}=1)`,
   );
   return { [ATTACH_URL_ENV]: wsUrl };
@@ -313,9 +315,9 @@ function spawnDetached(
   const child = spawn(binary, [], {
     detached: true,
     stdio: "ignore",
-    // Explicit spread of process.env: identical to the inherited default,
-    // plus the attach endpoint when auto-detect found a debuggable Chrome.
-    env: { ...process.env, ...extraEnv },
+    // Clear the inherited probe override on fallback or opt-out. Only a
+    // validated WebSocket endpoint may reach the daemon attach path.
+    env: { ...process.env, [ATTACH_URL_ENV]: "", ...extraEnv },
   });
   // An async ENOENT (override removed between preflight and spawn) must not
   // crash the server as an unhandled 'error' event.

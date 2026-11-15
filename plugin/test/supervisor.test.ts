@@ -157,6 +157,59 @@ describe("attach auto-detect (D lane, C supervisor)", () => {
     expect(await probeAttachTarget(probeUrl)).toBe(WS_URL);
   });
 
+  test("accepts an IPv6 debugger URL returned by Chrome", async () => {
+    const wsUrl = "ws://[::1]:9222/devtools/browser/ipv6";
+    const probeUrl = await startVersionStub(() => ({
+      status: 200, body: JSON.stringify({ webSocketDebuggerUrl: wsUrl }),
+    }));
+    expect(await probeAttachTarget(probeUrl)).toBe(wsUrl);
+  });
+
+  test("connects directly despite environment proxy settings", async () => {
+    let proxyHits = 0;
+    const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+      proxyHits++;
+      return new Response("proxy must not be used", { status: 502 });
+    }});
+    const probeUrl = await startVersionStub(() => ({
+      status: 200, body: JSON.stringify({ webSocketDebuggerUrl: WS_URL }),
+    }));
+    try {
+      const child = Bun.spawn([process.execPath, "-e", `
+        import { probeAttachTarget } from ${JSON.stringify(new URL("../src/supervisor.ts", import.meta.url).pathname)};
+        console.log(await probeAttachTarget(${JSON.stringify(probeUrl)}));
+      `], {
+        env: { ...process.env, HTTP_PROXY: proxy.url.toString(), HTTPS_PROXY: proxy.url.toString(),
+          http_proxy: proxy.url.toString(), https_proxy: proxy.url.toString(), NO_PROXY: "", no_proxy: "" },
+        stdout: "pipe", stderr: "pipe",
+      });
+      const output = await new Response(child.stdout).text();
+      expect(output).toBe(`${WS_URL}\n`);
+      expect(await child.exited).toBe(0);
+      expect(proxyHits).toBe(0);
+    } finally {
+      proxy.stop(true);
+    }
+  });
+
+  test("does not follow redirects", async () => {
+    let destinationHits = 0;
+    const destination = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+      destinationHits++;
+      return Response.json({ webSocketDebuggerUrl: WS_URL });
+    }});
+    const redirect = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+      return Response.redirect(destination.url);
+    }});
+    try {
+      expect(await probeAttachTarget(redirect.url.toString())).toBeNull();
+      expect(destinationHits).toBe(0);
+    } finally {
+      redirect.stop(true);
+      destination.stop(true);
+    }
+  });
+
   test("probe returns null when nothing listens (refused)", async () => {
     // Grab a loopback port, then close it: connecting must fail fast.
     const probeUrl = await startVersionStub(() => ({
@@ -215,6 +268,12 @@ describe("attach auto-detect (D lane, C supervisor)", () => {
     expect(resolveAttachProbeUrl()).toBe("http://127.0.0.1:9333/json/version");
   });
 
+  test("accepts an IPv6 loopback override", () => {
+    process.env[ATTACH_ENV] = "1";
+    process.env[ATTACH_URL_ENV] = "http://[::1]:9333";
+    expect(resolveAttachProbeUrl()).toBe("http://[::1]:9333/json/version");
+  });
+
   test("resolveAttachProbeUrl refuses non-loopback overrides, never fetched", () => {
     for (const override of [
       "http://example.com:9222",
@@ -233,6 +292,15 @@ describe("attach auto-detect (D lane, C supervisor)", () => {
     delete process.env[ATTACH_ENV];
     delete process.env[ATTACH_URL_ENV];
     expect(await resolveAttachEnv()).toEqual({});
+  });
+
+  test("resolveAttachEnv passes the probed WebSocket endpoint to the daemon", async () => {
+    process.env[ATTACH_ENV] = "1";
+    const probeUrl = await startVersionStub(() => ({
+      status: 200, body: JSON.stringify({ webSocketDebuggerUrl: WS_URL }),
+    }));
+    process.env[ATTACH_URL_ENV] = probeUrl;
+    expect(await resolveAttachEnv()).toEqual({ [ATTACH_URL_ENV]: WS_URL });
   });
 
   test("resolveAttachEnv: opt-in with no Chrome falls back to launch env", async () => {

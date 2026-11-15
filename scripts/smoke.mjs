@@ -255,8 +255,11 @@ try {
         probe.result?.x === center.result.value.x && probe.result?.y === center.result.value.y,
         JSON.stringify(probe.result),
       );
-    } else {
+    } else if (probe.ok === false && probe.error?.code === 'INTERNAL' &&
+               probe.error?.message === 'unknown method `click_at`') {
       console.log(`SKIP  click_at parity — daemon predates click_at (${probe.error?.code ?? 'no result'})`);
+    } else {
+      check('click_at parity probe succeeds', false, JSON.stringify(probe));
     }
   }
 

@@ -200,6 +200,9 @@ async fn handle_hello(app: &App, params: Value) -> Result<Value, RpcError> {
             "upgrade the shim and daemon together; the protocol major is part of the socket path",
         ));
     }
+    if app.chrome.is_attach_mode() {
+        app.chrome.ensure().await?;
+    }
     let chrome = app.chrome.status().await;
     Ok(json!({
         "protocol": rpc::PROTOCOL,
@@ -532,11 +535,8 @@ pub fn validate_click_at_coords(x: Option<f64>, y: Option<f64>) -> Result<(f64, 
 /// instead of an ELEMENT_OCCLUDED error. Coordinates travel as CDP numbers
 /// (`DispatchMouseEventParams.x/y`), never interpolated into page JavaScript.
 ///
-/// Lock discipline (F gate): `op_lock` is never held across the 20 ms
-/// inter-event pause (unlike `click`, whose sleep-under-lock is a known
-/// violation that is deliberately NOT copied here). The press phase and the
-/// release phase each take the lock separately; ownership is re-asserted
-/// after re-acquiring it.
+/// Lock discipline: serialize the entire mouse sequence under `op_lock`.
+/// There is no inter-event sleep while holding the lock.
 async fn handle_click_at(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
     use chromiumoxide::cdp::browser_protocol::input::{
         DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
@@ -578,23 +578,13 @@ async fn handle_click_at(app: &App, params: Value, session: &str) -> Result<Valu
         .build()
         .map_err(RpcError::internal)?;
 
-    // Press phase under the lock; the guard is dropped before any sleep.
-    {
-        let _guard = tab.op_lock.lock().await;
-        tab.assert_owned_by(session)?;
-        tab.exec(moved).await?;
-        tab.exec(mouse(DispatchMouseEventType::MousePressed).map_err(RpcError::internal)?)
-            .await?;
-    }
-    // Inter-event pause with NO lock held (F gate: never sleep under op_lock).
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    // Release phase under a fresh lock; ownership re-checked after re-acquire.
-    {
-        let _guard = tab.op_lock.lock().await;
-        tab.assert_owned_by(session)?;
-        tab.exec(mouse(DispatchMouseEventType::MouseReleased).map_err(RpcError::internal)?)
-            .await?;
-    }
+    let _guard = tab.op_lock.lock().await;
+    tab.assert_owned_by(session)?;
+    tab.exec(moved).await?;
+    tab.exec(mouse(DispatchMouseEventType::MousePressed).map_err(RpcError::internal)?)
+        .await?;
+    tab.exec(mouse(DispatchMouseEventType::MouseReleased).map_err(RpcError::internal)?)
+        .await?;
 
     Ok(json!({"ok": true, "x": x, "y": y}))
 }

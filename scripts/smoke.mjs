@@ -1,7 +1,8 @@
 // browserd smoke test — zero dependencies, plain node:net NDJSON client.
 //
 // Flow: hello → navigate fixture → snapshot → click submit → fill email →
-// screenshot → eval → status (+ occlusion, console and network bonus checks).
+// hover → select → upload → scroll → dialog → screenshot → eval → status
+// (+ occlusion, console and network bonus checks).
 // Exits 0 only when every assertion passes.
 //
 // Env:
@@ -10,6 +11,7 @@
 //   FIXTURE_URL      page under test (default http://127.0.0.1:8787/fixture.html)
 
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -44,10 +46,14 @@ async function fixtureReachable() {
 async function ensureFixtureServer() {
   if (await fixtureReachable()) return null;
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const child = spawn('python3', ['-m', 'http.server', '8787', '-d', here], {
-    stdio: 'ignore',
-    detached: true,
-  });
+  const child = spawn(
+    process.execPath,
+    [path.join(here, 'fixture-server.mjs')],
+    {
+      stdio: 'ignore',
+      detached: true,
+    },
+  );
   child.unref();
   for (let i = 0; i < 50; i++) {
     await new Promise((r) => setTimeout(r, 200));
@@ -172,15 +178,24 @@ try {
   check('snapshot ok', snap.ok === true, snap.error ? `${snap.error.code}` : `${snap.result?.total} nodes`);
   const nodes = snap.result?.nodes ?? [];
   const byName = (name) => nodes.find((n) => n.name === name)?.uid;
+  const byText = (re) => nodes.find((n) => re.test(n.name ?? ''))?.uid;
   const emailUid = byName('you@example.com') ?? nodes.find((n) => n.role === 'textbox')?.uid;
   const submitUid = nodes.find((n) => n.role === 'button' && /sign in/i.test(n.name))?.uid;
   const appendUid = byName('Append text');
   const occludedUid = byName('Occluded button');
+  const planUid = byText(/^Plan$/);
+  const avatarUid = byText(/^Avatar$/);
+  const hoverUid = byText(/Hover me/);
+  const dialogUid = byText(/Open alert/);
   check('snapshot text shape', typeof snap.result?.text === 'string' && snap.result.text.includes('url:'), `${nodes.length} nodes`);
   check('snapshot email uid', !!emailUid, emailUid ?? 'missing');
   check('snapshot submit uid', !!submitUid, submitUid ?? 'missing');
   check('snapshot append uid', !!appendUid, appendUid ?? 'missing');
   check('snapshot occluded uid', !!occludedUid, occludedUid ?? 'missing');
+  check('snapshot select uid', !!planUid, planUid ?? 'missing');
+  check('snapshot file input uid', !!avatarUid, avatarUid ?? 'missing');
+  check('snapshot hover uid', !!hoverUid, hoverUid ?? 'missing');
+  check('snapshot dialog uid', !!dialogUid, dialogUid ?? 'missing');
   if (!emailUid || !submitUid) throw new Error('missing uids; cannot continue');
 
   // click the submit button (form submit is preventDefaulted: no navigation).
@@ -251,6 +266,227 @@ try {
     requests.ok === true && (requests.result?.requests ?? []).some((r) => r.url?.includes('/api/ping')),
     requests.ok ? `${requests.result?.requests?.length ?? 0} requests` : requests.error?.code,
   );
+
+  // --- Phase C: headers, resource metadata, response body -------------------
+
+  const withHeaders = await timed('network-headers', 'network', {
+    tab_id: tabId,
+    filter: '/api/ping',
+    include_headers: true,
+  });
+  // The daemon ring persists per session tab across smoke runs, so the first
+  // match may be a stale entry from an older fixture server: always test the
+  // newest one, whose body Chrome still holds.
+  const pingRows = (withHeaders.result?.requests ?? []).filter((r) =>
+    r.url?.includes('/api/ping'),
+  );
+  const pingRow = pingRows[pingRows.length - 1];
+  const headerValue = (list, name) =>
+    (list ?? []).find((header) => header.name?.toLowerCase() === name)?.value;
+  check(
+    'network request headers are redacted',
+    withHeaders.ok === true &&
+      headerValue(pingRow?.request_headers, 'x-api-key') === '[redacted]',
+    JSON.stringify(pingRow?.request_headers),
+  );
+  check(
+    'network response headers are redacted',
+    headerValue(pingRow?.response_headers, 'x-api-key') === '[redacted]',
+    JSON.stringify(pingRow?.response_headers),
+  );
+  check(
+    'no secret header value leaks into the payload',
+    !JSON.stringify(withHeaders.result ?? {}).includes('page-secret') &&
+      !JSON.stringify(withHeaders.result ?? {}).includes('server-secret'),
+    'payload scanned',
+  );
+  check(
+    'network entry carries resource metadata',
+    typeof pingRow?.kind === 'string' &&
+      typeof pingRow?.from_cache === 'boolean' &&
+      typeof pingRow?.encoded_bytes === 'number' &&
+      pingRow.encoded_bytes >= 0 &&
+      (pingRow.encoded_bytes > 0 || pingRow.from_cache === true),
+    JSON.stringify({
+      kind: pingRow?.kind,
+      from_cache: pingRow?.from_cache,
+      encoded_bytes: pingRow?.encoded_bytes,
+    }),
+  );
+  const body = await timed('network-body', 'network_body', {
+    tab_id: tabId,
+    request_id: pingRow?.request_id,
+  });
+  check(
+    'network_body returns the fixture JSON',
+    body.ok === true && (body.result?.body ?? '').includes('"pong":"smoke"'),
+    body.ok ? `${body.result?.returned_bytes} bytes` : body.error?.code,
+  );
+  check(
+    'network_body reports the full size',
+    body.ok === true &&
+      body.result?.bytes >= body.result?.returned_bytes &&
+      body.result?.truncated === false,
+    JSON.stringify({
+      bytes: body.result?.bytes,
+      returned: body.result?.returned_bytes,
+    }),
+  );
+  const missingBody = await timed('network-body-missing', 'network_body', {
+    tab_id: tabId,
+    request_id: 'missing-request',
+  });
+  check(
+    'network_body missing id is BODY_UNAVAILABLE',
+    missingBody.ok === false && missingBody.error?.code === 'BODY_UNAVAILABLE',
+    missingBody.ok ? 'unexpectedly ok' : missingBody.error?.code,
+  );
+
+  // --- Phase B: hover / select / upload / scroll / dialog -------------------
+
+  // Cursor: `since` must return the oldest unread entries and advance only
+  // over what it returned, so a polling agent cannot skip rows.
+  const firstPage = await timed('network-cursor', 'network', {
+    tab_id: tabId,
+    since: 0,
+    limit: 2,
+  });
+  const firstRows = firstPage.result?.requests ?? [];
+  check(
+    'network since starts at the oldest entry',
+    firstRows.length === 2 && firstRows[0]?.seq === 1 && firstPage.result?.next_since === firstRows[1]?.seq,
+    JSON.stringify({ seqs: firstRows.map((r) => r.seq), next: firstPage.result?.next_since }),
+  );
+  const idlePage = await timed('network-idle', 'network', {
+    tab_id: tabId,
+    since: firstPage.result?.next_since,
+  });
+  check(
+    'network since skips already-read entries',
+    (idlePage.result?.requests ?? []).every((r) => r.seq > (firstPage.result?.next_since ?? 0)),
+    JSON.stringify((idlePage.result?.requests ?? []).map((r) => r.seq)),
+  );
+  const consoleCursor = await timed('console-cursor', 'console', { tab_id: tabId, since: 0, limit: 1 });
+  check(
+    'console returns a next_since cursor',
+    typeof consoleCursor.result?.next_since === 'number' &&
+      (consoleCursor.result?.messages ?? []).length === 1,
+    JSON.stringify({ next: consoleCursor.result?.next_since }),
+  );
+
+  if (hoverUid) {
+    const hover = await timed('hover', 'hover', { uid: hoverUid });
+    check('hover ok', hover.ok === true, hover.error?.code ?? JSON.stringify(hover.result));
+    const state = await timed('eval-hover', 'eval', {
+      js: "document.getElementById('hover-state').textContent",
+    });
+    check('hover fired mouseenter', state.result?.value === 'hovered', JSON.stringify(state.result?.value));
+  }
+
+  if (planUid) {
+    const picked = await timed('select', 'select', { uid: planUid, label: 'Pro' });
+    check(
+      'select ok',
+      picked.ok === true && picked.result?.value === 'pro',
+      picked.error?.code ?? JSON.stringify(picked.result),
+    );
+    const selected = await timed('eval-select', 'eval', {
+      js: "document.getElementById('plan').value",
+    });
+    check('select landed in the DOM', selected.result?.value === 'pro', JSON.stringify(selected.result?.value));
+
+    const badOption = await timed('select-miss', 'select', { uid: planUid, label: 'Nope' });
+    check(
+      'select miss is a typed error',
+      badOption.ok === false && badOption.error?.code === 'INTERNAL',
+      badOption.ok ? 'unexpectedly ok' : badOption.error?.code,
+    );
+  }
+
+  if (avatarUid) {
+    const uploadPath = path.join(os.tmpdir(), `browserd-smoke-${process.pid}.txt`);
+    fs.writeFileSync(uploadPath, 'smoke upload\n');
+    try {
+      const uploaded = await timed('upload', 'upload', { uid: avatarUid, paths: [uploadPath] });
+      check(
+        'upload ok',
+        uploaded.ok === true && (uploaded.result?.files ?? []).includes(path.basename(uploadPath)),
+        uploaded.error ? `${uploaded.error.code}: ${uploaded.error.message}` : JSON.stringify(uploaded.result),
+      );
+      const attached = await timed('eval-upload', 'eval', {
+        js: "document.getElementById('avatar').files[0]?.name ?? null",
+      });
+      check(
+        'upload reached the file input',
+        attached.result?.value === path.basename(uploadPath),
+        JSON.stringify(attached.result?.value),
+      );
+
+      const denied = await timed('upload-relative', 'upload', {
+        uid: avatarUid,
+        paths: ['relative.txt'],
+      });
+      check(
+        'relative upload path is UPLOAD_DENIED',
+        denied.ok === false && denied.error?.code === 'UPLOAD_DENIED',
+        denied.ok ? 'unexpectedly ok' : denied.error?.code,
+      );
+    } finally {
+      fs.unlinkSync(uploadPath);
+    }
+  }
+
+  const scrolled = await timed('scroll', 'scroll', { direction: 'down', amount: 600 });
+  check(
+    'scroll ok',
+    scrolled.ok === true && scrolled.result?.scrollY === 600,
+    scrolled.error?.code ?? JSON.stringify(scrolled.result),
+  );
+  const toTop = await timed('scroll-top', 'scroll', { direction: 'top' });
+  check(
+    'scroll top resets',
+    toTop.ok === true && toTop.result?.scrollY === 0,
+    toTop.error?.code ?? JSON.stringify(toTop.result),
+  );
+
+  // Dialog: `manual` keeps the alert open so it can be accepted explicitly.
+  // `alert()` is deferred in the fixture, so the click returns first.
+  if (dialogUid) {
+    const manualNav = await timed('navigate-manual', 'navigate', {
+      url: FIXTURE_URL,
+      dialog_policy: 'manual',
+    }, 60_000);
+    check('manual dialog navigate ok', manualNav.ok === true, manualNav.error?.code ?? manualNav.result?.url);
+    const manualSnap = await timed('snapshot-manual', 'snapshot', {});
+    const manualNodes = manualSnap.result?.nodes ?? [];
+    const manualDialogUid = manualNodes.find((n) => /Open alert/.test(n.name ?? ''))?.uid;
+    check('manual snapshot dialog uid', !!manualDialogUid, manualDialogUid ?? 'missing');
+    if (manualDialogUid) {
+      const clickDialog = await timed('click-dialog', 'click', { uid: manualDialogUid });
+      check('dialog trigger click ok', clickDialog.ok === true, clickDialog.error?.code ?? 'ok');
+      let handled = null;
+      for (let attempt = 0; attempt < 20 && handled?.ok !== true; attempt++) {
+        await new Promise((r) => setTimeout(r, 100));
+        handled = await timed('dialog-accept', 'dialog', { action: 'accept' });
+      }
+      check(
+        'dialog accept ok',
+        handled?.ok === true && handled.result?.dialog?.kind === 'alert',
+        handled?.ok ? JSON.stringify(handled.result?.dialog) : handled?.error?.code,
+      );
+      const closed = await timed('eval-dialog', 'eval', {
+        js: "document.getElementById('dialog-state').textContent",
+      });
+      check('dialog accept resumed the page', closed.result?.value === 'dismissed', JSON.stringify(closed.result?.value));
+
+      const again = await timed('dialog-again', 'dialog', { action: 'accept' });
+      check(
+        'no dialog open is DIALOG_NOT_OPEN',
+        again.ok === false && again.error?.code === 'DIALOG_NOT_OPEN',
+        again.ok ? 'unexpectedly ok' : again.error?.code,
+      );
+    }
+  }
 
   console.log('\n--- timings (ms) ---');
   for (const [name, ms] of Object.entries(timings)) console.log(`${name}: ${ms}`);

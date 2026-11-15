@@ -13,9 +13,14 @@ import {
   createExecutors,
   EVAL_PERMISSION,
   formatConsole,
+  formatDialog,
   formatNetwork,
+  formatScroll,
+  formatSelect,
+  formatUpload,
   MAX_LOG_ENTRIES,
   toToolError,
+  UPLOAD_PERMISSION,
   type BrowserDeps,
 } from "../src/tools.ts";
 
@@ -131,7 +136,7 @@ describe("executors", () => {
           error: {
             code: "UID_STALE",
             message: "uid g7-3 belongs to a previous page generation",
-            hint: "re-run browser_snapshot",
+            hint: "re-run browse_snapshot",
           },
         },
       },
@@ -143,7 +148,7 @@ describe("executors", () => {
     expect(error).toBeInstanceOf(ToolError);
     expect((error as ToolError).metadata).toMatchObject({
       code: "UID_STALE",
-      hint: "re-run browser_snapshot",
+      hint: "re-run browse_snapshot",
     });
   });
 
@@ -251,6 +256,118 @@ describe("executors", () => {
     expect(out?.content).toContain("GET https://x.example/a 200");
   });
 
+  test("network forwards include_headers only when true", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: { network: { result: { requests: [] } } },
+    });
+    await createExecutors(deps)["network"]?.({}, fakeContext());
+    expect(calls[0]?.params).not.toHaveProperty("include_headers");
+    await createExecutors(deps)["network"]?.(
+      { include_headers: true },
+      fakeContext(),
+    );
+    expect(calls[1]?.params).toMatchObject({ include_headers: true });
+  });
+
+  test("network renders redacted header lines", async () => {
+    const deps = fakeDeps({
+      scripts: {
+        network: {
+          result: {
+            requests: [
+              {
+                method: "GET",
+                url: "https://x.example/a",
+                status: 200,
+                kind: "xhr",
+                ms: 12.4,
+                request_headers: [
+                  { name: "authorization", value: "[redacted]" },
+                ],
+                response_headers: [
+                  { name: "content-type", value: "application/json" },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    });
+    const out = await createExecutors(deps)["network"]?.(
+      { include_headers: true },
+      fakeContext(),
+    );
+    expect(out?.content).toContain("GET https://x.example/a 200 xhr 12ms");
+    expect(out?.content).toContain("  > authorization: [redacted]");
+    expect(out?.content).toContain("  < content-type: application/json");
+  });
+
+  test("network_body forwards request_id and formats the body", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: {
+        network_body: {
+          result: {
+            request_id: "r1",
+            body: '{"ok":true}',
+            bytes: 11,
+            truncated: false,
+          },
+        },
+      },
+    });
+    const out = await createExecutors(deps)["network_body"]?.(
+      { request_id: "r1", max_bytes: 1024 },
+      fakeContext(),
+    );
+    expect(calls[0]?.method).toBe("network_body");
+    expect(calls[0]?.params).toMatchObject({
+      request_id: "r1",
+      max_bytes: 1024,
+    });
+    expect(out?.content).toBe('11/11 bytes\n{"ok":true}');
+  });
+
+  test("network_body marks truncation", async () => {
+    const deps = fakeDeps({
+      scripts: {
+        network_body: {
+          result: { body: "hello", bytes: 11, truncated: true },
+        },
+      },
+    });
+    const out = await createExecutors(deps)["network_body"]?.(
+      { request_id: "r1" },
+      fakeContext(),
+    );
+    expect(out?.content).toContain("5/11 bytes, truncated");
+  });
+
+  test("network_body surfaces BODY_UNAVAILABLE as a Tool.Error", async () => {
+    const deps = fakeDeps({
+      scripts: {
+        network_body: {
+          error: {
+            code: "BODY_UNAVAILABLE",
+            message: "no response body for request r1: gone",
+            hint: "re-run the request",
+          },
+        },
+      },
+    });
+    const error = await createExecutors(deps)["network_body"]?.(
+      { request_id: "r1" },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).metadata).toMatchObject({
+      code: "BODY_UNAVAILABLE",
+    });
+  });
+
   test("missing required params fail before any RPC", async () => {
     const calls: { method: string; params: Record<string, unknown> }[] = [];
     const deps = fakeDeps({ calls });
@@ -267,6 +384,159 @@ describe("executors", () => {
   });
 });
 
+describe("interaction executors", () => {
+  test("hover forwards the uid and tab id", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: { hover: { result: { ok: true, x: 10, y: 20 } } },
+    });
+    const out = await createExecutors(deps)["hover"]?.(
+      { uid: "g7-3", tab_id: "t2" },
+      fakeContext(),
+    );
+    expect(calls[0]).toEqual({
+      method: "hover",
+      params: { uid: "g7-3", tab_id: "t2" },
+    });
+    expect(out?.content).toBe("hovered g7-3");
+  });
+
+  test("select forwards exactly one selector", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: {
+        select: { result: { ok: true, index: 1, value: "b", label: "Bravo" } },
+      },
+    });
+    const out = await createExecutors(deps)["select"]?.(
+      { uid: "g7-4", label: "Bravo" },
+      fakeContext(),
+    );
+    expect(calls[0]?.params).toEqual({ uid: "g7-4", label: "Bravo" });
+    expect(out?.content).toContain('selected "b"');
+  });
+
+  test("select surfaces the daemon's selector validation", async () => {
+    const deps = fakeDeps({
+      scripts: {
+        select: {
+          error: {
+            code: "INTERNAL",
+            message: "select needs exactly one of value, label or index (got 0)",
+            hint: "pass value for option.value, label for the visible text, or index for the position",
+          },
+        },
+      },
+    });
+    const error = await createExecutors(deps)["select"]?.(
+      { uid: "g7-4" },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).metadata).toMatchObject({ code: "INTERNAL" });
+    expect((error as ToolError).message).toContain("exactly one");
+  });
+
+  test("upload asserts browser_upload with the paths, then uploads", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const assertResources: string[][] = [];
+    const deps = fakeDeps({
+      calls,
+      assertResources,
+      scripts: { upload: { result: { ok: true, files: ["a.png"] } } },
+    });
+    const out = await createExecutors(deps)["upload"]?.(
+      { uid: "g7-5", paths: ["/tmp/a.png"] },
+      fakeContext(),
+    );
+    expect(assertResources).toEqual([["/tmp/a.png"]]);
+    expect(calls[0]?.params).toEqual({ uid: "g7-5", paths: ["/tmp/a.png"] });
+    expect(out?.content).toContain("a.png");
+  });
+
+  test("upload denial never reaches the daemon", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({ calls, denyPermission: true });
+    const error = await createExecutors(deps)["upload"]?.(
+      { uid: "g7-5", paths: ["/tmp/a.png"] },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect(calls).toEqual([]);
+  });
+
+  test("upload rejects relative paths and empty lists before any RPC", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({ calls });
+    const executors = createExecutors(deps);
+    for (const paths of [[], ["relative/a.png"]]) {
+      const error = await executors["upload"]?.(
+        { uid: "g7-5", paths },
+        fakeContext(),
+      ).catch((e) => e);
+      expect(error).toBeInstanceOf(ToolError);
+      expect((error as ToolError).metadata).toMatchObject({
+        code: "UPLOAD_DENIED",
+      });
+    }
+    expect(calls).toEqual([]);
+  });
+
+  test("dialog forwards the action and prompt text", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: {
+        dialog: {
+          result: {
+            ok: true,
+            action: "accept",
+            dialog: { kind: "prompt", message: "Name?" },
+          },
+        },
+      },
+    });
+    const out = await createExecutors(deps)["dialog"]?.(
+      { action: "accept", prompt_text: "Ada" },
+      fakeContext(),
+    );
+    expect(calls[0]?.params).toEqual({ action: "accept", prompt_text: "Ada" });
+    expect(out?.content).toBe("accept prompt: Name?");
+  });
+
+  test("scroll forwards direction and amount", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: {
+        scroll: { result: { ok: true, scrollX: 0, scrollY: 640, at_bottom: false } },
+      },
+    });
+    const out = await createExecutors(deps)["scroll"]?.(
+      { direction: "down", amount: 640 },
+      fakeContext(),
+    );
+    expect(calls[0]?.params).toEqual({ direction: "down", amount: 640 });
+    expect(out?.content).toBe("scrolled to 0,640");
+  });
+
+  test("eval and navigate forward their optional deadlines", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({ calls });
+    const executors = createExecutors(deps);
+    await executors["eval"]?.({ js: "1", timeout_ms: 60_000 }, fakeContext());
+    await executors["navigate"]?.(
+      { url: "https://a.example", dialog_policy: "manual" },
+      fakeContext(),
+    );
+    expect(calls[1]?.params).toMatchObject({ timeout_ms: 60_000 });
+    expect(calls[2]?.params).toMatchObject({ dialog_policy: "manual" });
+    expect(UPLOAD_PERMISSION).toBe("browser_upload");
+  });
+});
+
 describe("formatters", () => {
   test("console/network tolerate stub shapes", () => {
     expect(formatConsole({})).toBe("(no console messages)");
@@ -275,5 +545,22 @@ describe("formatters", () => {
     );
     expect(formatNetwork({})).toBe("(no network requests)");
     expect(formatNetwork({ requests: [] })).toBe("(no network requests)");
+  });
+
+  test("interaction formatters tolerate stub shapes", () => {
+    expect(formatSelect({})).toContain("(unknown value)");
+    expect(formatSelect({ index: 2, value: "c", label: "Charlie" })).toBe(
+      'selected "c" — Charlie (index 2)',
+    );
+    expect(formatUpload({})).toBe("attached files");
+    expect(formatUpload({ files: ["a.png", "b.pdf"] })).toContain("2 file(s)");
+    expect(formatDialog({})).toBe("handled dialog");
+    expect(formatDialog({ action: "dismiss", dialog: { kind: "alert" } })).toBe(
+      "dismiss alert",
+    );
+    expect(formatScroll({})).toBe("scrolled to 0,0");
+    expect(formatScroll({ scrollY: 900, at_bottom: true })).toBe(
+      "scrolled to 0,900 (at bottom)",
+    );
   });
 });

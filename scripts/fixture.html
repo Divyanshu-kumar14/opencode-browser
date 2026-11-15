@@ -31,12 +31,33 @@
 
   <p><a id="plain-link" href="/about">A normal link</a></p>
 
+  <label>Plan
+    <select id="plan" name="plan">
+      <option value="free">Free</option>
+      <option value="pro">Pro</option>
+      <option value="team">Team</option>
+    </select>
+  </label>
+
+  <label>Avatar <input id="avatar" name="avatar" type="file"></label>
+
+  <button id="hover-target">Hover me</button>
+  <p id="hover-state"></p>
+
+  <!-- The alert is deferred so the click that starts it still returns: a
+       blocking alert() inside the handler would stall the renderer. -->
+  <button id="dialog-button">Open alert</button>
+  <p id="dialog-state"></p>
+
+  <!-- Scroll room for the scroll tool. -->
+  <div id="spacer" style="height: 2400px" aria-hidden="true"></div>
+
   <div id="overlay">covering overlay</div>
   <button id="occluded" aria-label="Occluded button">You cannot click me</button>
 
   <script>
     console.log('smoke fixture loaded');
-    fetch('/api/ping').catch(() => {});
+    fetch('/api/ping', { headers: { 'x-api-key': 'page-secret' } }).catch(() => {});
     document.getElementById('login').addEventListener('submit', (event) => {
       // Stay on the page so the smoke test keeps valid uids after clicking.
       event.preventDefault();
@@ -47,6 +68,15 @@
       p.className = 'line';
       p.textContent = 'appended line';
       document.getElementById('appended').appendChild(p);
+    });
+    document.getElementById('hover-target').addEventListener('mouseenter', () => {
+      document.getElementById('hover-state').textContent = 'hovered';
+    });
+    document.getElementById('dialog-button').addEventListener('click', () => {
+      setTimeout(() => {
+        alert('dialog opened');
+        document.getElementById('dialog-state').textContent = 'dismissed';
+      }, 0);
     });
   </script>
 </body>

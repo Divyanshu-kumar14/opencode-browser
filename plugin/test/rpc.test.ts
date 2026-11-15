@@ -77,7 +77,7 @@ describe("RpcClient framing", () => {
         throw {
           code: "UID_STALE",
           message: "uid g7-3 belongs to a previous page generation",
-          hint: "re-run browser_snapshot",
+          hint: "re-run browse_snapshot",
         };
       },
     });
@@ -87,7 +87,7 @@ describe("RpcClient framing", () => {
       const error = await client.request("click", { uid: "g7-3" }).catch((e) => e);
       expect(error).toBeInstanceOf(DaemonError);
       expect((error as DaemonError).code).toBe("UID_STALE");
-      expect((error as DaemonError).hint).toContain("browser_snapshot");
+      expect((error as DaemonError).hint).toContain("browse_snapshot");
       client.dispose();
     } finally {
       await mock.close();

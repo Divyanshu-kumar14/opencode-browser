@@ -7,7 +7,7 @@
 [![CI](https://github.com/Divyanshu-kumar14/opencode-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/Divyanshu-kumar14/opencode-browser/actions/workflows/ci.yml)
 [![Linux x64](https://img.shields.io/badge/OS-Linux%20x64-blue)](https://github.com/Divyanshu-kumar14/opencode-browser)
 [![OpenCode V2](https://img.shields.io/badge/OpenCode-V2%20plugin-purple)](https://github.com/Divyanshu-kumar14/opencode-browser)
-[![Tools](https://img.shields.io/badge/tools-20-green)](https://github.com/Divyanshu-kumar14/opencode-browser#--tools)
+[![Tools](https://img.shields.io/badge/tools-22-green)](https://github.com/Divyanshu-kumar14/opencode-browser#--tools)
 
 [🚀 Quickstart](#-quickstart) · [🧰 Tools](#-tools) · [🔒 Security](#-security) · [🛠 Development](#-development)
 
@@ -89,12 +89,13 @@ All options are optional; defaults shown.
 | `profile` | `"fresh"` \| `"persistent"` \| `"<path>"` | `"fresh"` | `persistent` reuses cookies across runs (still isolated from your real Chrome) |
 | `max_tabs` | 1–32 | `8` | hard cap; LRU evicts unowned/idle tabs first, never an actively-owned tab |
 | `idle_timeout_s` | seconds | `1800` | daemon exits after 30 min with zero tabs |
+| `OPENCODE_BROWSER_ATTACH` (env) | `"1"` | unset | probe local `:9222` and attach to a debug-enabled Chrome instead of launching — explicit opt-in, localhost-only, fails closed |
 
 ## 🧰 Tools
 
 <div align="center">
 
-20 tools · all `codemode: true` · `browse_` prefix (the host reserves `browser` for its built-in tools, where a colliding id is silently dropped)
+22 tools · all `codemode: true` · `browse_` prefix (the host reserves `browser` for its built-in tools, where a colliding id is silently dropped)
 
 </div>
 
@@ -103,6 +104,7 @@ All options are optional; defaults shown.
 | `browse_navigate` | go to a URL in your session tab | `{tab_id, url, title, status}` |
 | `browse_snapshot` | compact accessibility snapshot with `[uid]` refs | text tree, `max_nodes` default 300 |
 | `browse_click` | real mouse click at the element center (occlusion-checked, auto-waits) | `{ok}` |
+| `browse_click_at` | click at viewport CSS pixels `{x, y}` — canvas/exotic-widget fallback (no occlusion/actionability checks) | `{ok, x, y}` |
 | `browse_fill` | focus + real key events (works with React/Vue) | `{ok}` |
 | `browse_hover` | move the mouse over a uid (menu/hover states) | `{ok, x, y}` |
 | `browse_select` | pick a `<select>` option by value, label or index | `{value, label, index}` |
@@ -112,6 +114,7 @@ All options are optional; defaults shown.
 | `browse_press_key` | key press, optionally into a uid | `{ok}` |
 | `browse_eval` | run JS in the page (**permission-gated**, see below) | `{value}` |
 | `browse_screenshot` | PNG capture | file attachment + `{path}` |
+| `browse_look` | snapshot + screenshot in one call (both halves must succeed) | text + file attachment, `{path, hint}` |
 | `browse_console` | recent console messages (ring buffer, 500/tab) | `{messages, next_since}` |
 | `browse_network` | recent requests (ring buffer, 500/tab) | `{requests, next_since}` |
 | `browse_network_body` | one response body by `request_id` | `{body, bytes, truncated}` |
@@ -146,10 +149,11 @@ cargo test --manifest-path daemon/Cargo.toml   # Rust unit tests
 cargo fmt --check --manifest-path daemon/Cargo.toml
 cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 cd plugin && ./node_modules/.bin/tsc --noEmit && bun test   # shim
-node scripts/smoke.mjs                          # 61-check end-to-end vs real Chrome
+node scripts/smoke.mjs                          # 61-check end-to-end vs real Chrome (+2 click_at parity when the daemon supports it)
+node scripts/click-proof.mjs                    # click_at vs click parity on the fixture
 ```
 
-CI runs all of the above plus a pack-size budget and the smoke suite as e2e. The merge bar is green trio + 61/61 smoke; performance claims require same-conditions before/after numbers, never estimates.
+CI runs all of the above plus a pack-size budget and the smoke suite as e2e. The merge bar is green trio + smoke (61 baseline, 63 with `click_at` parity) + `click-proof.mjs` PASS; performance claims require same-conditions before/after numbers, never estimates.
 
 ## 📊 Benchmarks
 

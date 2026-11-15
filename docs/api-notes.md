@@ -227,3 +227,66 @@ ReDoS. Fulfilled bodies carry exactly `content-type`; no secret header
 `remove_all`, `sweep`, and eviction all drop every mock. `status` gained an
 opt-in `verbose` flag reporting the global `op_lock` queue-wait mean
 (counter sums only, no /proc walk).
+
+## 10. Vision + visible loop — `click_at`, `look`, attach auto-detect (D lane)
+
+**Date:** 2026-11-16 · **Protocol:** v1 additive only — `click_at` appended to
+`METHODS` (`daemon/src/dispatch.rs`), `ClickAtParams` appended to
+`daemon/src/rpc.rs`, `click_at`/`look` executors + specs appended in
+`plugin/src/tools.ts`, attach auto-detect appended in
+`plugin/src/supervisor.ts`. No existing method, error code, or lock site
+touched.
+
+### 10a. `browse_click_at{x, y}` — coordinate fallback
+
+| Layer | Rule |
+|---|---|
+| Shim (`coordParam`, `MAX_CLICK_COORD = 16384`) | Missing/non-finite/negative/`>16384` rejected with `INTERNAL` before any RPC |
+| Daemon (`validate_click_at_coords`, `MAX_CLICK_AT_COORD = 100_000.0`) | Missing/non-finite/negative/`>100_000` rejected with `INTERNAL` before any tab or CDP call |
+| Ownership | `resolve` (never `resolve_or_create`, so a coordinate click can never mint a tab in another session) + `assert_owned_by` before any CDP; foreign tab → `TAB_FORBIDDEN` |
+| Click | Real mouse click via CDP (`MouseMoved` → `MousePressed`, 20 ms pause with **no lock held**, `MouseReleased`), `{ok, x, y}` echo. **No** uid checks, **no** occlusion/actionability probe — documented tradeoff: a covering element receives the click instead of `ELEMENT_OCCLUDED` |
+| Timeout | No per-method arm: default 30 s outer bound (`request_timeout_ms("click_at") == 30_000`, unit-tested) |
+
+**Parity proof:** `scripts/click-proof.mjs` — on the smoke fixture,
+`click(append uid)` then `click_at(measured button center)` must each add
+exactly one `#appended .line` (run: `node scripts/click-proof.mjs`).
+`scripts/smoke.mjs` carries the same probe inline (emits checks only when
+the daemon answers `click_at`, otherwise a `SKIP` line, so the CI count is
+unchanged on older daemons).
+
+### 10b. `browse_look` — snapshot + screenshot composition
+
+One call, sequential on the same tab: `snapshot` first (also refreshes the
+stale-uid cache), then `screenshot`. Returns the snapshot text plus
+`open file://<path> to view` and the PNG as a `file` attachment; metadata
+carries `path`/`width`/`height`/`hint` alongside the snapshot metadata.
+**Partial-failure semantics:** either half failing fails the whole call — a
+failed snapshot attempts no screenshot; a failed screenshot rethrows labeled
+with `look_phase: "screenshot"`, so an unpaired snapshot is never returned
+as a success. The standalone `screenshot` result metadata now also carries
+the same `file://` hint.
+
+### 10c. Attach auto-detect + `bringToFront` (visible loop)
+
+- **Opt-in only:** nothing is probed unless `OPENCODE_BROWSER_ATTACH=1`.
+  An explicit `OPENCODE_BROWSER_ATTACH_URL` wins; otherwise the loopback
+  default `http://127.0.0.1:9222/json/version` is probed with a 2 s budget
+  (`ATTACH_PROBE_TIMEOUT_MS`). A debuggable target yields its
+  `webSocketDebuggerUrl` to the daemon child; anything else (refused,
+  timeout, non-2xx, non-JSON, no debugger URL) falls back to a fresh launch
+  with a clear log line. Fail closed: unparseable / non-http(s) /
+  non-loopback overrides — including a non-loopback debugger URL — throw
+  `PERMISSION_DENIED` and are never fetched (`isLoopbackHost` validates
+  `localhost`/`127.0.0.1`/`::1`/full `127/8`, octet-checked).
+- **`Page.bringToFront` after navigate resolve** (`chromey::Page::bring_to_front`,
+  verified in the pinned fork `chromey-2.58.2/src/page.rs:2447` → CDP
+  `Page.bringToFront`): best-effort, result swallowed so it can never fail a
+  navigation, and invoked before `op_lock` so it never extends a lock hold.
+  Headless-harmless; a headed effect is only observable on a visible browser
+  (`BROWSERD_ATTACH_PROOF=1` smoke block + manual attach run).
+
+**Measured status (no estimates):** daemon unit tests 67/67, `tsc` clean,
+`bun test` 75/75 (tools 56, supervisor 13, rpc 6), smoke 63/63 on the
+launch path (61 baseline + 2 `click_at` parity), `click-proof.mjs` 10/10
+PASS on this machine/Chrome/fixture. Headed/attach parity is recorded when
+a visible-Chrome run exists — until then the attach smoke block logs `SKIP`.

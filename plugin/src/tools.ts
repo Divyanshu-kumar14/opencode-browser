@@ -1,5 +1,5 @@
 /**
- * Browser tool surface (plan §Phase 2–3): 16 executors over the daemon RPC.
+ * Browser tool surface (plan §Phase 2–3): 19 executors over the daemon RPC.
  *
  * Effective names come from `options.namespace` (`browse_navigate`, … —
  * see docs/api-notes.md), declared names below are the short suffixes.
@@ -20,7 +20,7 @@ import type {
   ToolEditor,
 } from "@opencode/plugin/promise/tool";
 import type { PermissionDomain } from "@opencode/plugin/promise/permission";
-import { DaemonError } from "./errors.ts";
+import { DaemonError, isUidStaleError } from "./errors.ts";
 import type { RpcClient } from "./rpc.ts";
 
 /**
@@ -37,6 +37,8 @@ export const UPLOAD_PERMISSION = "browser_upload";
 export const MAX_LOG_ENTRIES = 500;
 /** Mirrors `daemon/src/policy.rs`; the daemon is the real boundary. */
 export const MAX_UPLOAD_FILES = 8;
+/** Mirrors `daemon/src/tabs.rs` (`MAX_ROUTE_PATTERN`); the daemon is the real boundary. */
+export const MAX_ROUTE_PATTERN = 512;
 
 export interface BrowserDeps {
   readonly permission: Pick<PermissionDomain, "assert">;
@@ -136,6 +138,66 @@ function clampLogLimit(limit: unknown): number {
 }
 
 // ---------------------------------------------------------------------------
+// Stale-uid recovery (shim-only, exactly-once).
+//
+// A uid encodes its navigation generation (`g{gen}-{n}`), so acting on an
+// element from a previous page fails with `UID_STALE`. The recovery is a
+// fixed 4-step sequence with no loop: re-snapshot once, re-resolve the stale
+// uid to a fresh one by matching its cached role+name, retry the action
+// exactly once. Any miss surfaces the ORIGINAL error so the agent — not this
+// wrapper — decides the next move.
+// ---------------------------------------------------------------------------
+
+/** Minimal identity of a snapshot node, enough to re-resolve it later. */
+export interface SnapshotRefNode {
+  readonly uid: string;
+  readonly role: string;
+  readonly name: string;
+}
+
+const SNAPSHOT_LINE_PATTERN = /^\[([^\]]+)\]\s+(\S+)(?:\s+"([^"]*)")?/;
+
+/**
+ * Pull re-resolvable nodes out of a snapshot result. Prefers the structured
+ * `nodes` array; falls back to parsing the rendered `[uid] role "name"`
+ * text lines so an older daemon shape still recovers.
+ */
+export function extractSnapshotNodes(result: unknown): SnapshotRefNode[] {
+  const record = asRecord(result);
+  const nodes = record["nodes"];
+  if (Array.isArray(nodes)) {
+    const structured: SnapshotRefNode[] = [];
+    for (const entry of nodes) {
+      const node = asRecord(entry);
+      const uid = node["uid"];
+      const role = node["role"];
+      const name = node["name"];
+      if (
+        typeof uid === "string" &&
+        typeof role === "string" &&
+        typeof name === "string"
+      ) {
+        structured.push({ uid, role, name });
+      }
+    }
+    if (structured.length > 0) return structured;
+    // Empty/foreign `nodes` shape: try the text rendering below.
+  }
+  const text = textField(result, "text");
+  if (text === undefined) return [];
+  const parsed: SnapshotRefNode[] = [];
+  for (const line of text.split("\n")) {
+    const match = SNAPSHOT_LINE_PATTERN.exec(line.trim());
+    const uid = match?.[1];
+    const role = match?.[2];
+    if (uid !== undefined && role !== undefined) {
+      parsed.push({ uid, role, name: match?.[3] ?? "" });
+    }
+  }
+  return parsed;
+}
+
+// ---------------------------------------------------------------------------
 // Result formatters (pure; unit-tested). All tolerate missing/empty results —
 // the daemon may stub console/network with empty arrays.
 // ---------------------------------------------------------------------------
@@ -230,6 +292,14 @@ export function formatNetworkBody(result: unknown): string {
   return body.length === 0 ? `(empty body; ${summary})` : `${summary}\n${body}`;
 }
 
+export function formatRoute(result: unknown): string {
+  const action = textField(result, "action") ?? "(unknown action)";
+  const pattern = textField(result, "pattern") ?? "(unknown pattern)";
+  const routes = asRecord(result)["routes"];
+  const count = typeof routes === "number" ? ` (${routes} active)` : "";
+  return `route ${action} ${pattern}${count}`;
+}
+
 export function formatTabsList(result: unknown): string {
   const tabs = asRecord(result)["tabs"];
   if (!Array.isArray(tabs) || tabs.length === 0) {
@@ -293,6 +363,21 @@ export function formatScroll(result: unknown): string {
   const y = typeof record["scrollY"] === "number" ? record["scrollY"] : 0;
   const bottom = record["at_bottom"] === true ? " (at bottom)" : "";
   return `scrolled to ${x},${y}${bottom}`;
+}
+
+export function formatWaitForUid(result: unknown): string {
+  const record = asRecord(result);
+  if (record["found"] !== true) return "uid not found";
+  const uid = textField(result, "uid") ?? "(unknown uid)";
+  const ms = typeof record["elapsed_ms"] === "number" ? record["elapsed_ms"] : 0;
+  return `found uid ${uid} in ${ms}ms`;
+}
+
+export function formatExpectText(result: unknown): string {
+  const record = asRecord(result);
+  if (record["matched"] !== true) return "text not matched";
+  const ms = typeof record["elapsed_ms"] === "number" ? record["elapsed_ms"] : 0;
+  return `matched text in ${ms}ms`;
 }
 
 type Executor = (
@@ -375,8 +460,80 @@ function pathsParam(input: unknown, key: string): string[] {
   return paths;
 }
 
-/** The 16 browser executors, keyed by RPC method. Tested directly. */
+/** The 19 browser executors, keyed by RPC method. Tested directly. */
 export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
+  // Last good snapshot nodes per session+tab, so a UID_STALE failure can be
+  // re-resolved by role+name. Populated by the snapshot executor and by every
+  // recovery re-snapshot below.
+  const snapshotCache = new Map<string, SnapshotRefNode[]>();
+  const cacheKey = (sessionID: string, tabId: string | undefined): string =>
+    `${sessionID} ${tabId ?? ""}`;
+
+  const rememberSnapshot = (
+    context: ToolContext,
+    tabId: string | undefined,
+    result: unknown,
+  ): void => {
+    snapshotCache.set(
+      cacheKey(context.sessionID, tabId),
+      extractSnapshotNodes(result),
+    );
+  };
+
+  /**
+   * Run `attempt` with `uid`; on `UID_STALE` only, re-snapshot once and retry
+   * exactly once with the fresh uid whose role+name matches the stale one.
+   * No loop: every miss (unknown uid, failed re-snapshot, no match) rethrows
+   * the ORIGINAL error. A failure of the retry itself surfaces as-is — it is
+   * the freshest signal (e.g. the new node is occluded).
+   */
+  async function callWithStaleUidRetry(
+    context: ToolContext,
+    uid: string | undefined,
+    tabId: string | undefined,
+    attempt: (uid: string | undefined) => Promise<ToolResult>,
+  ): Promise<ToolResult> {
+    let original: unknown;
+    try {
+      return await attempt(uid);
+    } catch (error) {
+      original = error;
+    }
+    // Only a generation mismatch can heal via a fresh snapshot. Anything
+    // else (UID_NOT_FOUND, occlusion, permission) retries nothing.
+    if (!isUidStaleError(original)) throw original;
+    const wanted = snapshotCache
+      .get(cacheKey(context.sessionID, tabId))
+      ?.find((node) => node.uid === uid);
+    if (wanted === undefined) throw original;
+    let fresh: unknown;
+    try {
+      fresh = await daemonCall(
+        deps,
+        context,
+        "snapshot",
+        tabId === undefined ? {} : { tab_id: tabId },
+      );
+    } catch {
+      throw original;
+    }
+    const freshNodes = extractSnapshotNodes(fresh);
+    snapshotCache.set(cacheKey(context.sessionID, tabId), freshNodes);
+    const match = freshNodes.find(
+      (node) => node.role === wanted.role && node.name === wanted.name,
+    );
+    if (match === undefined) throw original;
+    const retried = await attempt(match.uid);
+    return {
+      content: retried.content,
+      metadata: {
+        ...asRecord(retried.metadata),
+        recovered_from: uid,
+        recovered_uid: match.uid,
+      },
+    };
+  }
+
   const navigate: Executor = async (input, context) => {
     const url = stringParam(input, "url", { required: true });
     const record = asRecord(input);
@@ -398,8 +555,9 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
 
   const snapshot: Executor = async (input, context) => {
     const record = asRecord(input);
+    const tabId = stringParam(input, "tab_id");
     const result = await daemonCall(deps, context, "snapshot", {
-      ...optionalTabId(input),
+      ...(tabId === undefined ? {} : { tab_id: tabId }),
       ...(typeof record["max_nodes"] === "number"
         ? { max_nodes: record["max_nodes"] }
         : {}),
@@ -407,6 +565,7 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
         ? { include_ax: record["include_ax"] }
         : {}),
     });
+    rememberSnapshot(context, tabId, result);
     const formatted = formatSnapshot(result);
     return { content: formatted.content, metadata: formatted.metadata };
   };
@@ -444,74 +603,107 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
   const click: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
     const record = asRecord(input);
-    const result = await daemonCall(deps, context, "click", {
-      uid,
-      ...optionalTabId(input),
+    const tabId = stringParam(input, "tab_id");
+    const extras = {
       ...(typeof record["button"] === "string"
         ? { button: record["button"] }
         : {}),
       ...(typeof record["click_count"] === "number"
         ? { click_count: record["click_count"] }
         : {}),
-    });
-    return {
-      content: `clicked ${uid}`,
-      metadata: rawMetadata(result),
     };
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "click", {
+        uid: nextUid,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+        ...extras,
+      }).then((result) => ({
+        content: `clicked ${nextUid}`,
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const fill: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
     const value = stringParam(input, "value", { required: true });
     const record = asRecord(input);
-    const result = await daemonCall(deps, context, "fill", {
-      uid,
-      value,
-      ...optionalTabId(input),
+    const tabId = stringParam(input, "tab_id");
+    const extras = {
       ...(typeof record["submit"] === "boolean"
         ? { submit: record["submit"] }
         : {}),
-    });
-    return { content: `filled ${uid}`, metadata: rawMetadata(result) };
+    };
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "fill", {
+        uid: nextUid,
+        value,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+        ...extras,
+      }).then((result) => ({
+        content: `filled ${nextUid}`,
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const hover: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
-    const result = await daemonCall(deps, context, "hover", {
-      uid,
-      ...optionalTabId(input),
-    });
-    return { content: `hovered ${uid}`, metadata: rawMetadata(result) };
+    const tabId = stringParam(input, "tab_id");
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "hover", {
+        uid: nextUid,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+      }).then((result) => ({
+        content: `hovered ${nextUid}`,
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const select: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
     const record = asRecord(input);
-    const result = await daemonCall(deps, context, "select", {
-      uid,
-      ...optionalTabId(input),
+    const tabId = stringParam(input, "tab_id");
+    const extras = {
       ...(typeof record["value"] === "string" ? { value: record["value"] } : {}),
       ...(typeof record["label"] === "string" ? { label: record["label"] } : {}),
       ...(typeof record["index"] === "number" ? { index: record["index"] } : {}),
-    });
-    return { content: formatSelect(result), metadata: rawMetadata(result) };
+    };
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "select", {
+        uid: nextUid,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+        ...extras,
+      }).then((result) => ({
+        content: formatSelect(result),
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const upload: Executor = async (input, context) => {
     const uid = stringParam(input, "uid", { required: true });
     const paths = pathsParam(input, "paths");
+    const tabId = stringParam(input, "tab_id");
     // The prompt names the files: reading them is the risky half, not the page.
+    // Asserted once up front — the retry reuses the same paths, so it must
+    // not prompt twice for one user action.
     await deps.permission.assert({
       sessionID: context.sessionID,
       action: UPLOAD_PERMISSION,
       resources: paths,
     });
-    const result = await daemonCall(deps, context, "upload", {
-      uid,
-      paths,
-      ...optionalTabId(input),
-    });
-    return { content: formatUpload(result), metadata: rawMetadata(result) };
+    return callWithStaleUidRetry(context, uid, tabId, (nextUid) =>
+      daemonCall(deps, context, "upload", {
+        uid: nextUid,
+        paths,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+      }).then((result) => ({
+        content: formatUpload(result),
+        metadata: rawMetadata(result),
+      })),
+    );
   };
 
   const dialog: Executor = async (input, context) => {
@@ -541,12 +733,20 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
   const pressKey: Executor = async (input, context) => {
     const key = stringParam(input, "key", { required: true });
     const uid = stringParam(input, "uid");
-    const result = await daemonCall(deps, context, "press_key", {
-      key,
-      ...optionalTabId(input),
-      ...(uid === undefined ? {} : { uid }),
-    });
-    return { content: `pressed ${key}`, metadata: rawMetadata(result) };
+    const tabId = stringParam(input, "tab_id");
+    const attempt = (nextUid: string | undefined): Promise<ToolResult> =>
+      daemonCall(deps, context, "press_key", {
+        key,
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+        ...(nextUid === undefined ? {} : { uid: nextUid }),
+      }).then((result) => ({
+        content: `pressed ${key}`,
+        metadata: rawMetadata(result),
+      }));
+    // Without a uid there is nothing that can go stale — skip the recovery
+    // path (and its extra snapshot) entirely.
+    if (uid === undefined) return attempt(uid);
+    return callWithStaleUidRetry(context, uid, tabId, attempt);
   };
 
   const evaluate: Executor = async (input, context) => {
@@ -616,6 +816,63 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
     return { content: formatNetworkBody(result), metadata: rawMetadata(result) };
   };
 
+  const route: Executor = async (input, context) => {
+    const pattern = stringParam(input, "pattern", { required: true });
+    const action = stringParam(input, "action", { required: true });
+    // Fail fast on the mirrored bound; the daemon re-validates (it is the
+    // trust boundary) so a hostile client gains nothing by skipping this.
+    if (pattern !== undefined && pattern.length > MAX_ROUTE_PATTERN) {
+      throw new ToolError({
+        message: `route pattern is ${pattern.length} chars, over the ${MAX_ROUTE_PATTERN} char limit`,
+        metadata: {
+          code: "INTERNAL",
+          hint: "use a shorter, distinctive substring instead of a whole URL",
+        },
+      });
+    }
+    const record = asRecord(input);
+    const result = await daemonCall(deps, context, "route", {
+      pattern,
+      action,
+      ...optionalTabId(input),
+      ...(typeof record["kind"] === "string" ? { kind: record["kind"] } : {}),
+      ...(typeof record["status"] === "number"
+        ? { status: record["status"] }
+        : {}),
+      ...(typeof record["body"] === "string" ? { body: record["body"] } : {}),
+      ...(typeof record["content_type"] === "string"
+        ? { content_type: record["content_type"] }
+        : {}),
+    });
+    return { content: formatRoute(result), metadata: rawMetadata(result) };
+  };
+
+  const waitForUid: Executor = async (input, context) => {
+    const uid = stringParam(input, "uid", { required: true });
+    const record = asRecord(input);
+    const result = await daemonCall(deps, context, "wait_for_uid", {
+      uid,
+      ...optionalTabId(input),
+      ...(typeof record["timeout_ms"] === "number"
+        ? { timeout_ms: record["timeout_ms"] }
+        : {}),
+    });
+    return { content: formatWaitForUid(result), metadata: rawMetadata(result) };
+  };
+
+  const expectText: Executor = async (input, context) => {
+    const text = stringParam(input, "text", { required: true });
+    const record = asRecord(input);
+    const result = await daemonCall(deps, context, "expect_text", {
+      text,
+      ...optionalTabId(input),
+      ...(typeof record["timeout_ms"] === "number"
+        ? { timeout_ms: record["timeout_ms"] }
+        : {}),
+    });
+    return { content: formatExpectText(result), metadata: rawMetadata(result) };
+  };
+
   const listTabs: Executor = async (_input, context) => {
     const result = await daemonCall(deps, context, "list_tabs", {});
     return { content: formatTabsList(result), metadata: rawMetadata(result) };
@@ -645,6 +902,9 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
     console: consoleLog,
     network,
     network_body: networkBody,
+    route,
+    wait_for_uid: waitForUid,
+    expect_text: expectText,
     list_tabs: listTabs,
     close_tab: closeTab,
   };
@@ -912,6 +1172,71 @@ export function registerBrowserTools(
           },
         },
         ["request_id"],
+      ),
+      options: { ...baseOptions },
+    },
+    {
+      name: "route",
+      description:
+        "Mock a request URL pattern on your session tab: fulfill with a fixture body or abort it. Literal substring/prefix/host match, never regex; mocks die with the tab.",
+      input: schema(
+        {
+          pattern: {
+            type: "string",
+            description:
+              "Literal URL substring, prefix, or bare host to match (max 512 chars).",
+          },
+          action: { type: "string", description: "fulfill or abort." },
+          kind: {
+            type: "string",
+            description: "substring (default), prefix, or host.",
+          },
+          status: {
+            type: "number",
+            description: "Fulfill HTTP status (default 200).",
+          },
+          body: { type: "string", description: "Fulfill fixture body." },
+          content_type: {
+            type: "string",
+            description: "Fulfill content-type (default text/plain).",
+          },
+          tab_id: SCHEMA_TAB_ID,
+        },
+        ["pattern", "action"],
+      ),
+      options: { ...baseOptions },
+    },
+    {
+      name: "wait_for_uid",
+      description:
+        "Wait until the element with the given [uid] appears (bounded poll, default 5s, max 30s). Success reports elapsed_ms; a blown deadline is NAV_TIMEOUT.",
+      input: schema(
+        {
+          uid: { type: "string", description: "Element uid to wait for." },
+          tab_id: SCHEMA_TAB_ID,
+          timeout_ms: {
+            type: "number",
+            description: "Wait budget (default 5000, max 30000).",
+          },
+        },
+        ["uid"],
+      ),
+      options: { ...baseOptions },
+    },
+    {
+      name: "expect_text",
+      description:
+        "Wait until the page text contains the substring (bounded poll, plain case-sensitive match, default 5s, max 30s). A blown deadline is NAV_TIMEOUT.",
+      input: schema(
+        {
+          text: { type: "string", description: "Substring to wait for." },
+          tab_id: SCHEMA_TAB_ID,
+          timeout_ms: {
+            type: "number",
+            description: "Wait budget (default 5000, max 30000).",
+          },
+        },
+        ["text"],
       ),
       options: { ...baseOptions },
     },

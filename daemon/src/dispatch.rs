@@ -15,12 +15,15 @@ use crate::paths;
 use crate::policy::{check_navigate_url, redact_url};
 use crate::rpc::{
     self, BenchParams, ClickParams, CloseTabParams, ConsoleParams, DialogParams, EvalParams,
-    FillParams, HelloParams, HoverParams, NavigateParams, NetworkBodyParams, NetworkParams,
-    PressKeyParams, Request, Response, ScreenshotParams, ScrollParams, SelectParams,
-    ShutdownParams, SnapshotParams, UploadParams,
+    ExpectTextParams, FillParams, HelloParams, HoverParams, NavigateParams, NetworkBodyParams,
+    NetworkParams, PressKeyParams, Request, Response, RouteParams, ScreenshotParams, ScrollParams,
+    SelectParams, ShutdownParams, SnapshotParams, StatusParams, UploadParams, WaitForUidParams,
 };
 use crate::snapshot::{self, DEFAULT_MAX_NODES};
-use crate::tabs::{now_ms, Tab, TabRegistry};
+use crate::tabs::{
+    actionability_js, actionability_timeout, classify_probe, now_ms, ActionKind, ProbeOutcome, Tab,
+    TabRegistry,
+};
 
 /// Methods served by this daemon (also used in the unknown-method hint).
 pub const METHODS: &[&str] = &[
@@ -45,8 +48,18 @@ pub const METHODS: &[&str] = &[
     "status",
     "shutdown",
     "bench",
+    "wait_for_uid",
+    "expect_text",
+    "route",
     "cancel",
 ];
+
+/// Bound for the actionability wait on click/fill/hover/select/press_key
+/// (B lane, F-gate ~2 s): the element must become visible + enabled +
+/// stable within this long; slower pages surface a typed NAV_TIMEOUT and
+/// the agent retries via the D-lane wait tools. Well under the 30 s outer
+/// request bound, so the action itself always keeps headroom.
+const ACTIONABILITY_TIMEOUT_MS: u64 = 2_000;
 
 /// Outer per-request timeout: 30 s by default. `navigate` and `eval` carry
 /// their own deadline, so the outer bound is that deadline plus headroom
@@ -62,6 +75,15 @@ pub fn request_timeout_ms(method: &str, params: &Value) -> u64 {
     match method {
         "navigate" => (inner(15_000, 1_000) + 10_000).min(130_000),
         "eval" => (inner(30_000, 100) + 5_000).min(125_000),
+        // Bounded waits carry their own deadline (clamped to MAX_WAIT_MS by
+        // the handler); the outer bound is that deadline plus poll headroom.
+        "wait_for_uid" | "expect_text" => (params
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(rpc::DEFAULT_WAIT_MS)
+            .clamp(rpc::MIN_WAIT_MS, rpc::MAX_WAIT_MS)
+            + 5_000)
+            .min(40_000),
         _ => 30_000,
     }
 }
@@ -133,9 +155,12 @@ pub async fn dispatch(app: &App, req: Request, session: String) -> Response {
         "network_body" => handle_network_body(app, req.params, &session).await,
         "list_tabs" => handle_list_tabs(app).await,
         "close_tab" => handle_close_tab(app, req.params, &session).await,
-        "status" => handle_status(app).await,
+        "status" => handle_status(app, req.params).await,
         "shutdown" => handle_shutdown(app, req.params).await,
         "bench" => handle_bench(app, req.params).await,
+        "wait_for_uid" => handle_wait_for_uid(app, req.params, &session).await,
+        "expect_text" => handle_expect_text(app, req.params, &session).await,
+        "route" => handle_route(app, req.params, &session).await,
         "cancel" => {
             Ok(json!({"cancelled": false, "note": "nothing to cancel on a completed request"}))
         }
@@ -185,9 +210,10 @@ async fn handle_hello(app: &App, params: Value) -> Result<Value, RpcError> {
     }))
 }
 
-async fn handle_status(app: &App) -> Result<Value, RpcError> {
+async fn handle_status(app: &App, params: Value) -> Result<Value, RpcError> {
+    let parsed: StatusParams = rpc::parse_params_owned("status", params)?;
     let chrome = app.chrome.status().await;
-    Ok(json!({
+    let mut result = json!({
         "tabs": app.tabs.count().await,
         "sessions": app.tabs.session_count().await,
         "rss_mb": paths::self_rss_mb(),
@@ -203,7 +229,13 @@ async fn handle_status(app: &App) -> Result<Value, RpcError> {
         },
         "daemon_version": rpc::DAEMON_VERSION,
         "protocol": rpc::PROTOCOL,
-    }))
+    });
+    // Verbose only: the global `op_lock` queue-wait mean (counter sums, no
+    // /proc walk). `None` renders as null when no op ever queued.
+    if parsed.verbose.unwrap_or(false) {
+        result["op_wait_mean_ms"] = json!(app.tabs.op_wait_mean_ms().await);
+    }
+    Ok(result)
 }
 
 async fn handle_navigate(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
@@ -370,49 +402,24 @@ async fn handle_snapshot(app: &App, params: Value, session: &str) -> Result<Valu
     }))
 }
 
-/// Evaluate the center-point + occlusion probe inside the page. Returns
-/// viewport CSS pixels and an optional covering element description.
+/// Evaluate the center-point + occlusion + actionability probe inside the
+/// page. Returns viewport CSS pixels. One shot, no polling: callers wait via
+/// `wait_actionable` first (outside `op_lock`), then re-verify here under the
+/// lock before acting, so a cover that lands mid-wait still blocks the click.
+/// Contract preserved: unknown uid → UID_NOT_FOUND, cover → ELEMENT_OCCLUDED.
 async fn probe_click_point(tab: &Tab, uid: &str) -> Result<(f64, f64), RpcError> {
-    let want = serde_json::to_string(uid)
-        .map_err(|err| RpcError::internal(format!("cannot encode uid for page script: {err}")))?;
-    let js = format!(
-        r#"(async () => {{
-  const want = {want};
-  const el = document.querySelector('[data-oc-uid="' + want + '"]');
-  if (!el) return {{ ok: false, reason: 'missing' }};
-  const vw = window.innerWidth, vh = window.innerHeight;
-  let r = el.getBoundingClientRect();
-  if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) {{
-    el.scrollIntoView({{ block: 'center', inline: 'center' }});
-    await new Promise((f) => requestAnimationFrame(() => requestAnimationFrame(f)));
-    r = el.getBoundingClientRect();
-  }}
-  const x = r.x + r.width / 2, y = r.y + r.height / 2;
-  let cover = null;
-  const top = document.elementFromPoint(x, y);
-  if (top && top !== el && !el.contains(top)) {{
-    const label = ((top.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 60)
-      || top.getAttribute('aria-label') || '');
-    cover = (top.tagName || '?').toLowerCase() + (label ? ' "' + label + '"' : '');
-  }}
-  return {{ ok: true, x, y, cover }};
-}})()"#
-    );
+    tab.check_uid(uid)?;
     let value = tab
-        .eval_json(&js)
+        .eval_json(&actionability_js(uid))
         .await
         .map_err(|err| RpcError::internal(format!("click occlusion probe failed: {err}")))?;
-    if value.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(RpcError::uid_not_found(uid));
-    }
-    if let Some(cover) = value.get("cover").and_then(Value::as_str) {
-        if !cover.is_empty() {
-            return Err(RpcError::element_occluded(cover));
+    match classify_probe(&value, ActionKind::Click, uid) {
+        ProbeOutcome::Ready { x, y } => Ok((x, y)),
+        ProbeOutcome::Failed(err) => Err(err),
+        ProbeOutcome::Pending(state) => {
+            Err(actionability_timeout(uid, &state, ACTIONABILITY_TIMEOUT_MS))
         }
     }
-    let x = value.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-    let y = value.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-    Ok((x, y))
 }
 
 async fn handle_click(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
@@ -424,7 +431,16 @@ async fn handle_click(app: &App, params: Value, session: &str) -> Result<Value, 
         return Err(RpcError::uid_not_found("(empty uid)"));
     }
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    // B lane: wait for actionable OUTSIDE `op_lock` (never sleep under it),
+    // then re-check ownership + generation under the lock before any CDP.
+    tab.wait_actionable(
+        &parsed.uid,
+        ActionKind::Click,
+        std::time::Duration::from_millis(ACTIONABILITY_TIMEOUT_MS),
+    )
+    .await?;
     let _guard = tab.op_lock.lock().await;
+    tab.assert_owned_by(session)?;
     tab.check_uid(&parsed.uid)?;
     let (x, y) = probe_click_point(&tab, &parsed.uid).await?;
 
@@ -480,7 +496,14 @@ async fn handle_fill(app: &App, params: Value, session: &str) -> Result<Value, R
         ));
     }
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    tab.wait_actionable(
+        &parsed.uid,
+        ActionKind::Fill,
+        std::time::Duration::from_millis(ACTIONABILITY_TIMEOUT_MS),
+    )
+    .await?;
     let _guard = tab.op_lock.lock().await;
+    tab.assert_owned_by(session)?;
     tab.check_uid(&parsed.uid)?;
 
     let want = serde_json::to_string(&parsed.uid).map_err(|e| RpcError::internal(e.to_string()))?;
@@ -541,7 +564,14 @@ async fn handle_hover(app: &App, params: Value, session: &str) -> Result<Value, 
         return Err(RpcError::uid_not_found("(empty uid)"));
     }
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    tab.wait_actionable(
+        &parsed.uid,
+        ActionKind::Hover,
+        std::time::Duration::from_millis(ACTIONABILITY_TIMEOUT_MS),
+    )
+    .await?;
     let _guard = tab.op_lock.lock().await;
+    tab.assert_owned_by(session)?;
     tab.check_uid(&parsed.uid)?;
     let (x, y) = probe_click_point(&tab, &parsed.uid).await?;
     let moved = DispatchMouseEventParams::builder()
@@ -580,7 +610,14 @@ async fn handle_select(app: &App, params: Value, session: &str) -> Result<Value,
     };
 
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    tab.wait_actionable(
+        &parsed.uid,
+        ActionKind::Select,
+        std::time::Duration::from_millis(ACTIONABILITY_TIMEOUT_MS),
+    )
+    .await?;
     let _guard = tab.op_lock.lock().await;
+    tab.assert_owned_by(session)?;
     tab.check_uid(&parsed.uid)?;
 
     let want = serde_json::to_string(&parsed.uid).map_err(|e| RpcError::internal(e.to_string()))?;
@@ -847,7 +884,18 @@ async fn handle_press_key(app: &App, params: Value, session: &str) -> Result<Val
         ));
     }
     let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    if let Some(uid) = parsed.uid.as_deref() {
+        // Unfocused press needs no element; a uid-targeted press waits for an
+        // actionable focus target first (fill/select/press_key were unprobed).
+        tab.wait_actionable(
+            uid,
+            ActionKind::PressKey,
+            std::time::Duration::from_millis(ACTIONABILITY_TIMEOUT_MS),
+        )
+        .await?;
+    }
     let _guard = tab.op_lock.lock().await;
+    tab.assert_owned_by(session)?;
     if let Some(uid) = parsed.uid.as_deref() {
         tab.focus_uid(uid).await?;
     }
@@ -1085,6 +1133,163 @@ async fn handle_bench(app: &App, params: Value) -> Result<Value, RpcError> {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// D lane: bounded waits (additive, protocol v1). Both handlers poll with a
+// clamped deadline and NEVER hold `op_lock` across sleeps: the loop sleeps
+// between single-shot CDP evals, so a 30 s wait cannot head-of-line block
+// every other op on the tab. Transient eval failures (e.g. mid-navigation)
+// keep polling until the deadline; only the timeout decides the outcome.
+// ---------------------------------------------------------------------------
+
+/// Poll until the element carrying `uid` exists in the page (`data-oc-uid`
+/// match). Success reports `{found: true, elapsed_ms}`; a blown deadline is
+/// a typed `NAV_TIMEOUT` naming the uid and the budget — never a bare
+/// INTERNAL, so the outer `request_timeout_ms` headroom always loses the race
+/// to this verdict instead of the reverse.
+async fn handle_wait_for_uid(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    let parsed: WaitForUidParams = rpc::parse_params_owned("wait_for_uid", params)?;
+    if parsed.uid.trim().is_empty() {
+        return Err(RpcError::uid_not_found("(empty uid)"));
+    }
+    let timeout_ms = rpc::clamp_wait_timeout_ms(parsed.timeout_ms);
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+
+    // The uid is JSON-escaped into the script (P1-2): even if the uid shape
+    // ever widens past `g{gen}-{n}`, it stays a string literal.
+    let want = serde_json::to_string(&parsed.uid)
+        .map_err(|err| RpcError::internal(format!("cannot encode uid for page script: {err}")))?;
+    let js = format!(
+        r#"(() => {{
+  const want = {want};
+  return !!document.querySelector('[data-oc-uid="' + want + '"]');
+}})()"#
+    );
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(timeout_ms);
+    let poll = std::time::Duration::from_millis(rpc::WAIT_POLL_MS);
+    loop {
+        let present = tab
+            .eval_json(&js)
+            .await
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if present {
+            return Ok(json!({
+                "found": true,
+                "uid": parsed.uid,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "timeout_ms": timeout_ms,
+            }));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(RpcError::nav_timeout(format!(
+                "uid {} did not appear within {timeout_ms}ms",
+                parsed.uid
+            )));
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Poll until the page's visible text contains `text` (plain case-sensitive
+/// substring over `body.innerText` — never a regex, so no backtracking bomb).
+/// Success reports `{matched: true, elapsed_ms}`; a blown deadline is a
+/// typed `NAV_TIMEOUT` (same outer-headroom argument as `wait_for_uid`).
+async fn handle_expect_text(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    let parsed: ExpectTextParams = rpc::parse_params_owned("expect_text", params)?;
+    if parsed.text.is_empty() {
+        return Err(RpcError::new(
+            ErrorCode::Internal,
+            "expect_text needs a non-empty text",
+            "pass the substring to wait for, e.g. {\"text\": \"Sign in\"}",
+        ));
+    }
+    if parsed.text.len() > rpc::MAX_EXPECT_TEXT_LEN {
+        return Err(RpcError::new(
+            ErrorCode::Internal,
+            format!(
+                "expect_text needle is {} bytes, over the {} byte limit",
+                parsed.text.len(),
+                rpc::MAX_EXPECT_TEXT_LEN
+            ),
+            "wait for a shorter, distinctive substring instead of a whole document",
+        ));
+    }
+    let timeout_ms = rpc::clamp_wait_timeout_ms(parsed.timeout_ms);
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+
+    let needle = serde_json::to_string(&parsed.text)
+        .map_err(|err| RpcError::internal(format!("cannot encode text for page script: {err}")))?;
+    let js = format!(
+        r#"(() => {{
+  const needle = {needle};
+  const root = document.body || document.documentElement;
+  const body = root && typeof root.innerText === 'string' ? root.innerText : '';
+  return body.includes(needle);
+}})()"#
+    );
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(timeout_ms);
+    let poll = std::time::Duration::from_millis(rpc::WAIT_POLL_MS);
+    loop {
+        let matched = tab
+            .eval_json(&js)
+            .await
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if matched {
+            return Ok(json!({
+                "matched": true,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "timeout_ms": timeout_ms,
+            }));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(RpcError::nav_timeout(format!(
+                "text did not appear within {timeout_ms}ms",
+            )));
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E lane: deterministic network mocks (additive, protocol v1). A route binds
+// one literal URL pattern to fulfill-with-fixture or abort on the session
+// tab. Ordering is fail-closed: validate bounds first (never regex), resolve
+// the owned tab second, arm `Fetch.enable` third, record the mock last — a
+// route that is stored but unenforced would be fail-open.
+// ---------------------------------------------------------------------------
+
+/// Mock one request URL pattern: fulfill with a fixture body or abort it.
+/// Session-scoped (ownership enforced by `resolve`); mocks die with the tab.
+async fn handle_route(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    let parsed: RouteParams = rpc::parse_params_owned("route", params)?;
+    // Fail closed before any tab or CDP call: literal-only matching, bounded
+    // pattern/body/status/content-type; abort rejects fulfill-only fields
+    // rather than silently dropping them.
+    let route = Tab::new_route(
+        parsed.pattern.clone(),
+        parsed.kind.clone(),
+        &parsed.action,
+        parsed.status,
+        parsed.body.clone(),
+        parsed.content_type.clone(),
+    )?;
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    // Arm interception before recording: a stored-but-unenforced mock lies.
+    tab.ensure_fetch_intercept().await?;
+    let count = tab.add_route(route)?;
+    Ok(json!({
+        "pattern": parsed.pattern,
+        "kind": parsed.kind.unwrap_or_else(|| "substring".to_string()),
+        "action": parsed.action,
+        "routes": count,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1124,6 +1329,19 @@ mod tests {
     }
 
     #[test]
+    fn wait_methods_get_their_own_bounded_deadline() {
+        // New additive waits: default 5 s inner + 5 s headroom, hard-capped so
+        // the outer bound always covers the poll loop (D lane).
+        assert!(METHODS.contains(&"wait_for_uid"));
+        assert!(METHODS.contains(&"expect_text"));
+        assert_eq!(request_timeout_ms("wait_for_uid", &json!({})), 10_000);
+        assert_eq!(request_timeout_ms("expect_text", &json!({})), 10_000);
+        let huge = json!({"timeout_ms": 999_999_999});
+        assert_eq!(request_timeout_ms("wait_for_uid", &huge), 35_000);
+        assert_eq!(request_timeout_ms("expect_text", &huge), 35_000);
+    }
+
+    #[test]
     fn every_method_is_routed() {
         // The dispatch table must cover the §2.2 surface: no silent gaps.
         for method in METHODS {
@@ -1151,6 +1369,9 @@ mod tests {
                         | "status"
                         | "shutdown"
                         | "bench"
+                        | "wait_for_uid"
+                        | "expect_text"
+                        | "route"
                         | "cancel"
                 ),
                 "{method}"

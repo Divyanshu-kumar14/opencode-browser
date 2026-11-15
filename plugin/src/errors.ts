@@ -111,3 +111,20 @@ function safePreview(value: unknown): string {
     return String(value);
   }
 }
+
+/**
+ * True when a failure is a stale-uid generation mismatch. Checked
+ * structurally so it matches both a raw `DaemonError` and the converted
+ * `Tool.Error` (which carries the code in `metadata.code`) — the retry
+ * wrapper in `tools.ts` only sees the converted shape.
+ */
+export function isUidStaleError(error: unknown): boolean {
+  if (error instanceof DaemonError) return error.code === "UID_STALE";
+  if (typeof error === "object" && error !== null) {
+    const metadata = (error as { metadata?: unknown }).metadata;
+    if (typeof metadata === "object" && metadata !== null) {
+      return (metadata as Record<string, unknown>)["code"] === "UID_STALE";
+    }
+  }
+  return false;
+}

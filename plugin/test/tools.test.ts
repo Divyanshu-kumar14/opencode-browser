@@ -13,6 +13,8 @@ import {
   createExecutors,
   EVAL_PERMISSION,
   formatConsole,
+  formatExpectText,
+  formatWaitForUid,
   formatDialog,
   formatNetwork,
   formatScroll,
@@ -42,6 +44,7 @@ interface Script {
 
 function fakeDeps(options: {
   scripts?: Record<string, Script>;
+  sequences?: Record<string, Script[]>;
   calls?: { method: string; params: Record<string, unknown> }[];
   assertResources?: string[][];
   denyPermission?: boolean;
@@ -51,6 +54,18 @@ function fakeDeps(options: {
   const client = {
     request: async (method: string, params: Record<string, unknown>) => {
       calls.push({ method, params });
+      const queue = options.sequences?.[method];
+      if (queue !== undefined && queue.length > 0) {
+        const next = queue.shift();
+        if (next?.error !== undefined) {
+          throw new DaemonError(
+            next.error.code as DaemonError["code"],
+            next.error.message,
+            next.error.hint,
+          );
+        }
+        return next?.result ?? {};
+      }
       if (method === "list_tabs" && options.scripts?.["list_tabs"] === undefined) {
         return { tabs: [{ tab_id: "t1", url: "https://page.example", owner: "ses_test" }] };
       }
@@ -368,6 +383,72 @@ describe("executors", () => {
     });
   });
 
+  test("route forwards pattern, action and fulfill options", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: {
+        route: {
+          result: { pattern: "/api/ping", action: "fulfill", routes: 1 },
+        },
+      },
+    });
+    const out = await createExecutors(deps)["route"]?.(
+      {
+        pattern: "/api/ping",
+        action: "fulfill",
+        kind: "substring",
+        status: 200,
+        body: '{"pong":"mock"}',
+        content_type: "application/json",
+      },
+      fakeContext(),
+    );
+    expect(calls[0]?.method).toBe("route");
+    expect(calls[0]?.params).toMatchObject({
+      pattern: "/api/ping",
+      action: "fulfill",
+      kind: "substring",
+      status: 200,
+      body: '{"pong":"mock"}',
+      content_type: "application/json",
+    });
+    expect(out?.content).toBe("route fulfill /api/ping (1 active)");
+  });
+
+  test("route omits unset optionals and rejects empty params before any RPC", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: { route: { result: { pattern: "/ads/", action: "abort" } } },
+    });
+    const out = await createExecutors(deps)["route"]?.(
+      { pattern: "/ads/", action: "abort" },
+      fakeContext(),
+    );
+    expect(calls[0]?.params).toEqual({ pattern: "/ads/", action: "abort" });
+    expect(out?.content).toBe("route abort /ads/");
+
+    const denied = await createExecutors(deps)["route"]?.(
+      { pattern: "/ads/" },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(denied).toBeInstanceOf(ToolError);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("route rejects oversized patterns before any RPC", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({ calls });
+    const error = await createExecutors(deps)["route"]?.(
+      { pattern: "p".repeat(513), action: "fulfill" },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).message).toContain("512 char limit");
+    expect(calls).toEqual([]);
+  });
+
   test("missing required params fail before any RPC", async () => {
     const calls: { method: string; params: Record<string, unknown> }[] = [];
     const deps = fakeDeps({ calls });
@@ -537,6 +618,202 @@ describe("interaction executors", () => {
   });
 });
 
+describe("stale-uid retry", () => {
+  const STALE_HINT =
+    "the page changed; re-run browse_snapshot and use a uid from the new tree";
+
+  function staleError(uid: string): Script {
+    return {
+      error: {
+        code: "UID_STALE",
+        message: `uid ${uid} belongs to a previous page generation`,
+        hint: STALE_HINT,
+      },
+    };
+  }
+
+  function snapshotResult(nodes: { uid: string; role: string; name: string }[]) {
+    return {
+      result: {
+        tab_id: "t1",
+        url: "https://a.example",
+        text: nodes.map((n) => `[${n.uid}] ${n.role} "${n.name}"`).join("\n"),
+        nodes,
+        truncated: false,
+      },
+    };
+  }
+
+  test("stale→recovered: one re-snapshot, retry with the role+name match", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      sequences: {
+        snapshot: [
+          snapshotResult([{ uid: "g7-1", role: "button", name: "Sign in" }]),
+          snapshotResult([{ uid: "g8-1", role: "button", name: "Sign in" }]),
+        ],
+        click: [staleError("g7-1"), { result: { ok: true, x: 5, y: 6 } }],
+      },
+    });
+    const executors = createExecutors(deps);
+    await executors["snapshot"]?.({}, fakeContext());
+    const out = await executors["click"]?.({ uid: "g7-1" }, fakeContext());
+    expect(out?.content).toBe("clicked g8-1");
+    expect(out?.metadata).toMatchObject({
+      recovered_from: "g7-1",
+      recovered_uid: "g8-1",
+    });
+    expect(
+      calls.filter((c) => c.method === "click").map((c) => c.params),
+    ).toEqual([{ uid: "g7-1" }, { uid: "g8-1" }]);
+    // Seed + exactly one recovery snapshot: never loops.
+    expect(calls.filter((c) => c.method === "snapshot")).toHaveLength(2);
+  });
+
+  test("stale→miss: no role+name match surfaces the original error", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      sequences: {
+        snapshot: [
+          snapshotResult([{ uid: "g7-1", role: "button", name: "Sign in" }]),
+          snapshotResult([{ uid: "g8-2", role: "link", name: "Elsewhere" }]),
+        ],
+      },
+      scripts: { click: staleError("g7-1") },
+    });
+    const executors = createExecutors(deps);
+    await executors["snapshot"]?.({}, fakeContext());
+    const error = await executors["click"]?.(
+      { uid: "g7-1" },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).metadata).toMatchObject({
+      code: "UID_STALE",
+      hint: STALE_HINT,
+    });
+    expect(calls.filter((c) => c.method === "click")).toHaveLength(1);
+    expect(calls.filter((c) => c.method === "snapshot")).toHaveLength(2);
+  });
+
+  test("stale without a cached snapshot surfaces the original error", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({ calls, scripts: { click: staleError("g7-3") } });
+    const error = await createExecutors(deps)["click"]?.(
+      { uid: "g7-3" },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).metadata).toMatchObject({
+      code: "UID_STALE",
+      hint: STALE_HINT,
+    });
+    expect(calls.map((c) => c.method)).toEqual(["click"]);
+  });
+
+  test("fresh→passthrough: success issues no extra snapshot call", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: { click: { result: { ok: true } } },
+    });
+    const out = await createExecutors(deps)["click"]?.(
+      { uid: "g7-1" },
+      fakeContext(),
+    );
+    expect(out?.content).toBe("clicked g7-1");
+    expect(calls.map((c) => c.method)).toEqual(["click"]);
+  });
+
+  test("non-stale errors never trigger a recovery snapshot", async () => {
+    for (const code of ["UID_NOT_FOUND", "TAB_FORBIDDEN", "ELEMENT_OCCLUDED"]) {
+      const calls: { method: string; params: Record<string, unknown> }[] = [];
+      const deps = fakeDeps({
+        calls,
+        scripts: {
+          click: {
+            error: { code, message: `${code} happened`, hint: "fix it" },
+          },
+        },
+      });
+      const error = await createExecutors(deps)["click"]?.(
+        { uid: "g7-1" },
+        fakeContext(),
+      ).catch((e) => e);
+      expect(error).toBeInstanceOf(ToolError);
+      expect((error as ToolError).metadata).toMatchObject({ code });
+      expect(calls.map((c) => c.method)).toEqual(["click"]);
+    }
+  });
+
+  test("text fallback: re-resolves from snapshot text when nodes are absent", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const textOnly = (text: string) => ({
+      result: { tab_id: "t1", url: "https://a.example", text, truncated: false },
+    });
+    const deps = fakeDeps({
+      calls,
+      sequences: {
+        snapshot: [
+          textOnly('[g7-2] textbox "Email"'),
+          textOnly('[g8-5] textbox "Email"'),
+        ],
+        fill: [staleError("g7-2"), { result: { ok: true } }],
+      },
+    });
+    const executors = createExecutors(deps);
+    await executors["snapshot"]?.({}, fakeContext());
+    const out = await executors["fill"]?.(
+      { uid: "g7-2", value: "a@b.c" },
+      fakeContext(),
+    );
+    expect(out?.content).toBe("filled g8-5");
+    expect(
+      calls.filter((c) => c.method === "fill").map((c) => c.params),
+    ).toEqual([
+      { uid: "g7-2", value: "a@b.c" },
+      { uid: "g8-5", value: "a@b.c" },
+    ]);
+  });
+
+  test("retry failure surfaces the fresh error, not the stale one", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      sequences: {
+        snapshot: [
+          snapshotResult([{ uid: "g7-1", role: "button", name: "Sign in" }]),
+          snapshotResult([{ uid: "g8-1", role: "button", name: "Sign in" }]),
+        ],
+        click: [
+          staleError("g7-1"),
+          {
+            error: {
+              code: "ELEMENT_OCCLUDED",
+              message: "click target is covered by div",
+              hint: "dismiss the covering element",
+            },
+          },
+        ],
+      },
+    });
+    const executors = createExecutors(deps);
+    await executors["snapshot"]?.({}, fakeContext());
+    const error = await executors["click"]?.(
+      { uid: "g7-1" },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).metadata).toMatchObject({
+      code: "ELEMENT_OCCLUDED",
+    });
+    expect(calls.filter((c) => c.method === "click")).toHaveLength(2);
+    expect(calls.filter((c) => c.method === "snapshot")).toHaveLength(2);
+  });
+});
+
 describe("formatters", () => {
   test("console/network tolerate stub shapes", () => {
     expect(formatConsole({})).toBe("(no console messages)");
@@ -562,5 +839,119 @@ describe("formatters", () => {
     expect(formatScroll({ scrollY: 900, at_bottom: true })).toBe(
       "scrolled to 0,900 (at bottom)",
     );
+  });
+
+  test("wait formatters tolerate stub shapes", () => {
+    expect(formatWaitForUid({})).toBe("uid not found");
+    expect(formatWaitForUid({ found: true, uid: "g7-3", elapsed_ms: 12 })).toBe(
+      "found uid g7-3 in 12ms",
+    );
+    expect(formatExpectText({})).toBe("text not matched");
+    expect(formatExpectText({ matched: true, elapsed_ms: 150 })).toBe(
+      "matched text in 150ms",
+    );
+  });
+});
+
+describe("wait executors", () => {
+  test("wait_for_uid forwards uid, tab id and timeout", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: {
+        wait_for_uid: {
+          result: { found: true, uid: "g7-3", elapsed_ms: 155, timeout_ms: 5000 },
+        },
+      },
+    });
+    const out = await createExecutors(deps)["wait_for_uid"]?.(
+      { uid: "g7-3", tab_id: "t2", timeout_ms: 5000 },
+      fakeContext(),
+    );
+    expect(calls[0]).toEqual({
+      method: "wait_for_uid",
+      params: { uid: "g7-3", tab_id: "t2", timeout_ms: 5000 },
+    });
+    expect(out?.content).toBe("found uid g7-3 in 155ms");
+    expect(out?.metadata).toMatchObject({
+      result: expect.objectContaining({ found: true }),
+    });
+  });
+
+  test("wait_for_uid timeout surfaces NAV_TIMEOUT with its hint", async () => {
+    const deps = fakeDeps({
+      scripts: {
+        wait_for_uid: {
+          error: {
+            code: "NAV_TIMEOUT",
+            message: "uid g7-9 did not appear within 100ms",
+            hint: "the page did not finish loading",
+          },
+        },
+      },
+    });
+    const error = await createExecutors(deps)["wait_for_uid"]?.(
+      { uid: "g7-9", timeout_ms: 100 },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).metadata).toMatchObject({ code: "NAV_TIMEOUT" });
+    expect((error as ToolError).message).toContain("did not appear");
+  });
+
+  test("expect_text forwards text and timeout, then formats the match", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({
+      calls,
+      scripts: {
+        expect_text: {
+          result: { matched: true, elapsed_ms: 310, timeout_ms: 5000 },
+        },
+      },
+    });
+    const out = await createExecutors(deps)["expect_text"]?.(
+      { text: "Sign in", timeout_ms: 5000 },
+      fakeContext(),
+    );
+    expect(calls[0]).toEqual({
+      method: "expect_text",
+      params: { text: "Sign in", timeout_ms: 5000 },
+    });
+    expect(out?.content).toBe("matched text in 310ms");
+  });
+
+  test("expect_text timeout surfaces NAV_TIMEOUT, not a silent miss", async () => {
+    const deps = fakeDeps({
+      scripts: {
+        expect_text: {
+          error: {
+            code: "NAV_TIMEOUT",
+            message: "text did not appear within 100ms",
+            hint: "retry with a larger timeout_ms",
+          },
+        },
+      },
+    });
+    const error = await createExecutors(deps)["expect_text"]?.(
+      { text: "Nope", timeout_ms: 100 },
+      fakeContext(),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolError);
+    expect((error as ToolError).metadata).toMatchObject({ code: "NAV_TIMEOUT" });
+  });
+
+  test("missing uid/text fails before any RPC", async () => {
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const deps = fakeDeps({ calls });
+    const executors = createExecutors(deps);
+    const missingUid = await executors["wait_for_uid"]?.({}, fakeContext()).catch(
+      (e) => e,
+    );
+    expect(missingUid).toBeInstanceOf(ToolError);
+    const missingText = await executors["expect_text"]?.({}, fakeContext()).catch(
+      (e) => e,
+    );
+    expect(missingText).toBeInstanceOf(ToolError);
+    expect(calls).toEqual([]);
   });
 });

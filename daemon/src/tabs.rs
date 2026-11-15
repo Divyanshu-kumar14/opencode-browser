@@ -12,9 +12,11 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused;
+use chromiumoxide::cdp::browser_protocol::fetch::HeaderEntry;
 use chromiumoxide::cdp::browser_protocol::log::EventEntryAdded;
 use chromiumoxide::cdp::browser_protocol::network::{
-    EventRequestWillBeSent, EventResponseReceived, GetResponseBodyParams, Headers,
+    ErrorReason, EventRequestWillBeSent, EventResponseReceived, GetResponseBodyParams, Headers,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
@@ -24,7 +26,7 @@ use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
 use chromiumoxide::cdp::IntoEventKind;
 use chromiumoxide::listeners::EventStream;
-use chromiumoxide::{Command, Page};
+use chromiumoxide::{Binary, Command, Page};
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
@@ -184,6 +186,52 @@ pub fn parse_uid(uid: &str) -> Option<(u64, u64)> {
     Some((generation.parse().ok()?, index.parse().ok()?))
 }
 
+// --- E lane: deterministic network mocks (trust boundary) -----------------
+// `route` records a literal pattern → fulfill/abort decision on the tab.
+// Matching is substring/prefix/host comparison ONLY: no regex crate is used
+// on untrusted input anywhere (no backtracking engine, no ReDoS). Every
+// bound below is enforced in `Tab::new_route` before any tab or CDP call
+// exists, so a bad pattern fails closed instead of installing a half-open
+// mock.
+
+/// Pattern bound: literal chars, counted in chars so multi-byte patterns
+/// cannot smuggle extra bytes past the limit.
+pub const MAX_ROUTE_PATTERN: usize = 512;
+/// Cap on mocked routes per tab: session-scoped, bounded memory, fail closed.
+pub const MAX_ROUTES_PER_TAB: usize = 20;
+/// Fulfilled fixture bodies reuse the `network_body` cap (256 KiB).
+pub const MAX_ROUTE_BODY_BYTES: usize = MAX_BODY_BYTES;
+/// `content-type` value bound: printable ASCII, no CR/LF (header injection).
+pub const MAX_ROUTE_CONTENT_TYPE: usize = 128;
+
+/// How a route pattern matches a request URL. All three are literal string
+/// operations — `*` and `?` in a pattern match themselves, never wildcards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    Substring,
+    Prefix,
+    Host,
+}
+
+/// What answering a paused request does: serve the fixture or fail it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteAction {
+    Fulfill,
+    Abort,
+}
+
+/// One validated mock. `status`/`body`/`content_type` apply to fulfill only;
+/// abort carries none so nothing can leak into a failure.
+#[derive(Debug, Clone)]
+pub struct MockRoute {
+    pub pattern: String,
+    pub kind: RouteKind,
+    pub action: RouteAction,
+    pub status: i64,
+    pub body: String,
+    pub content_type: String,
+}
+
 pub struct Tab {
     pub id: String,
     pub page: Page,
@@ -208,8 +256,9 @@ pub struct Tab {
     /// that lands, every op keeps taking this one lock.
     pub op_lock: AsyncMutex<()>,
     /// Queue-wait metric: total ms spent awaiting `op_lock` plus acquisition
-    /// count. Recorded by [`Tab::lock_op`]; read via [`Tab::op_wait_mean_ms`]
-    /// by status/bench guards. `u64` ms cannot wrap in practice.
+    /// count. Aggregated without any /proc walk by
+    /// [`TabRegistry::op_wait_mean_ms`] for `status` (verbose only).
+    /// `u64` ms cannot wrap in practice.
     pub op_wait_total_ms: AtomicU64,
     pub op_wait_count: AtomicU64,
     /// Correlations dropped by the network pump's overflow policy
@@ -225,6 +274,142 @@ pub struct Tab {
     dialog_manual: AtomicBool,
     listeners_started: AtomicBool,
     listeners_ready: AtomicBool,
+    /// Session-scoped URL mocks (`route`): literal pattern → fulfill/abort.
+    /// Cleared by [`Tab::mark_dead`], so `close_tab`, `remove_all` and
+    /// `sweep` all drop every mock — a fresh tab always starts unmocked.
+    routes: StdMutex<Vec<MockRoute>>,
+    /// Fetch-intercept arm state: `fetch_started` elects the single task that
+    /// runs `Fetch.enable` + spawns the intercept pump; `fetch_armed` gates
+    /// mock installation so a route is never stored unenforced.
+    fetch_started: AtomicBool,
+    fetch_armed: AtomicBool,
+}
+
+/// Actionability gate (B lane): what an action needs from its element.
+/// Mirrors Playwright's per-action check sets (reference only): click/hover
+/// need receives-events (hit test); fill needs editable; every action needs
+/// attached + visible + enabled + stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Click,
+    Hover,
+    Fill,
+    Select,
+    PressKey,
+}
+
+impl ActionKind {
+    /// Click/hover drive the mouse to the center point: the topmost element
+    /// at that point must be the target itself.
+    pub fn needs_hit_test(self) -> bool {
+        matches!(self, Self::Click | Self::Hover)
+    }
+
+    /// Fill replaces editable text: a readonly control can never accept input.
+    pub fn needs_editable(self) -> bool {
+        matches!(self, Self::Fill)
+    }
+}
+
+/// One poll result: ready to act, terminally failed, or worth retrying.
+pub enum ProbeOutcome {
+    Ready { x: f64, y: f64 },
+    Pending(String),
+    Failed(RpcError),
+}
+
+/// One-shot actionability probe shared by the wait loop and the final
+/// under-lock probe. Returns `{ok, x, y, cover, editable}` or
+/// `{ok: false, reason}` with reason `missing | hidden | disabled |
+/// unstable`. The uid travels JSON-escaped (P1-2); the scroll-into-view +
+/// `elementFromPoint` occlusion logic is the pre-existing probe, extended
+/// with visible (display/visibility/opacity/viewport), enabled (`disabled`
+/// + `aria-disabled`) and stable (same bounding box across two frames,
+///   2 px total drift tolerance) checks.
+pub fn actionability_js(uid: &str) -> String {
+    let want = serde_json::to_string(uid).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(async () => {{
+  const want = {want};
+  const el = document.querySelector('[data-oc-uid="' + want + '"]');
+  if (!el || !el.isConnected) return {{ ok: false, reason: 'missing' }};
+  const vw = window.innerWidth, vh = window.innerHeight;
+  let r = el.getBoundingClientRect();
+  if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) {{
+    el.scrollIntoView({{ block: 'center', inline: 'center' }});
+    await new Promise((f) => requestAnimationFrame(() => requestAnimationFrame(f)));
+    r = el.getBoundingClientRect();
+  }}
+  const cs = getComputedStyle(el);
+  if (r.width <= 0 || r.height <= 0 || cs.display === 'none'
+      || cs.visibility === 'hidden' || cs.visibility === 'collapse'
+      || Number(cs.opacity || '1') === 0) {{
+    return {{ ok: false, reason: 'hidden' }};
+  }}
+  if (el.disabled
+      || (typeof el.getAttribute === 'function' && el.getAttribute('aria-disabled') === 'true')) {{
+    return {{ ok: false, reason: 'disabled' }};
+  }}
+  const r1 = el.getBoundingClientRect();
+  await new Promise((f) => requestAnimationFrame(() => requestAnimationFrame(f)));
+  const r2 = el.getBoundingClientRect();
+  const drift = Math.abs(r1.x - r2.x) + Math.abs(r1.y - r2.y)
+    + Math.abs(r1.width - r2.width) + Math.abs(r1.height - r2.height);
+  if (drift > 2) return {{ ok: false, reason: 'unstable' }};
+  const x = r2.x + r2.width / 2, y = r2.y + r2.height / 2;
+  let cover = null;
+  const top = document.elementFromPoint(x, y);
+  if (top && top !== el && !el.contains(top)) {{
+    const label = ((top.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 60)
+      || top.getAttribute('aria-label') || '');
+    cover = (top.tagName || '?').toLowerCase() + (label ? ' "' + label + '"' : '');
+  }}
+  return {{ ok: true, x, y, cover, editable: !el.readOnly }};
+}})()"#
+    )
+}
+
+/// Map one probe round onto an outcome for `kind`. Pure: unit-tested.
+/// Order preserves the pre-existing contract: unknown uid →
+/// UID_NOT_FOUND, cover (click/hover only) → ELEMENT_OCCLUDED;
+/// hidden/disabled/unstable (and readonly for fill) are retryable, never
+/// instant failures.
+pub fn classify_probe(value: &Value, kind: ActionKind, uid: &str) -> ProbeOutcome {
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        let reason = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        return match reason {
+            "missing" => ProbeOutcome::Failed(RpcError::uid_not_found(uid)),
+            other => ProbeOutcome::Pending(other.to_string()),
+        };
+    }
+    if kind.needs_hit_test() {
+        if let Some(cover) = value.get("cover").and_then(Value::as_str) {
+            if !cover.is_empty() {
+                return ProbeOutcome::Failed(RpcError::element_occluded(cover));
+            }
+        }
+    }
+    if kind.needs_editable() && value.get("editable").and_then(Value::as_bool) == Some(false) {
+        return ProbeOutcome::Pending("readonly".to_string());
+    }
+    let x = value.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+    let y = value.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    ProbeOutcome::Ready { x, y }
+}
+
+/// Typed timeout for an element that never became actionable. The §2.5
+/// taxonomy has no dedicated action-timeout code and the shim only surfaces
+/// known codes, so this rides on NAV_TIMEOUT with an actionability-specific
+/// message and hint (same precedent as `eval_timeout` on EVAL_ERROR).
+pub fn actionability_timeout(uid: &str, state: &str, timeout_ms: u64) -> RpcError {
+    RpcError::new(
+        ErrorCode::NavTimeout,
+        format!("uid {uid} never became actionable: still {state} after {timeout_ms}ms"),
+        "the element stayed hidden, disabled or unstable; retry once — if it keeps failing, re-run browse_snapshot and use a fresh uid",
+    )
 }
 
 impl Tab {
@@ -252,6 +437,9 @@ impl Tab {
             dialog_manual: AtomicBool::new(false),
             listeners_started: AtomicBool::new(false),
             listeners_ready: AtomicBool::new(false),
+            routes: StdMutex::new(Vec::new()),
+            fetch_started: AtomicBool::new(false),
+            fetch_armed: AtomicBool::new(false),
         }
     }
 
@@ -280,15 +468,6 @@ impl Tab {
         self.op_wait_total_ms.fetch_add(wait_ms, Ordering::Relaxed);
         self.op_wait_count.fetch_add(1, Ordering::Relaxed);
         (guard, wait_ms)
-    }
-
-    /// Mean `op_lock` queue wait in ms, or `None` when never acquired.
-    // TODO(C1-followup): wire into `status` / bench guards (E lane) so the
-    // queue-wait metric is observable at runtime; allowed dead until then.
-    #[allow(dead_code)]
-    pub fn op_wait_mean_ms(&self) -> Option<u64> {
-        let n = self.op_wait_count.load(Ordering::Relaxed);
-        (n > 0).then(|| self.op_wait_total_ms.load(Ordering::Relaxed) / n)
     }
 
     pub fn owner(&self) -> Option<String> {
@@ -346,6 +525,12 @@ impl Tab {
         {
             let mut uids = lock(&self.uids);
             uids.clear();
+        }
+        // Session-scoped mocks die with the tab: close_tab, remove_all,
+        // sweep and eviction all funnel through here.
+        {
+            let mut routes = lock(&self.routes);
+            routes.clear();
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
@@ -469,6 +654,43 @@ impl Tab {
 }})()"#
         );
         self.eval_json(&js).await
+    }
+
+    /// Poll one actionability round until `kind` is satisfied or `timeout`
+    /// elapses. Takes NO lock: callers must invoke this BEFORE acquiring
+    /// `op_lock` (sleeps never happen under the lock), then re-check
+    /// ownership + generation after acquiring it. Every round re-runs
+    /// `check_uid`, so a navigation landing mid-wait surfaces UID_STALE
+    /// instead of acting on a superseded document. Eval failures propagate
+    /// immediately (fail loud); only defined pending states retry.
+    pub async fn wait_actionable(
+        &self,
+        uid: &str,
+        kind: ActionKind,
+        timeout: Duration,
+    ) -> Result<(f64, f64), RpcError> {
+        let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        let deadline = std::time::Instant::now() + timeout;
+        let poll = Duration::from_millis(crate::rpc::WAIT_POLL_MS);
+        let mut last_state: String;
+        loop {
+            self.check_uid(uid)?;
+            let value = self
+                .eval_json(&actionability_js(uid))
+                .await
+                .map_err(|err| RpcError::internal(format!("actionability probe failed: {err}")))?;
+            match classify_probe(&value, kind, uid) {
+                ProbeOutcome::Ready { x, y } => return Ok((x, y)),
+                ProbeOutcome::Failed(err) => return Err(err),
+                ProbeOutcome::Pending(state) => {
+                    last_state = state;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(actionability_timeout(uid, &last_state, timeout_ms));
+                    }
+                    tokio::time::sleep(poll).await;
+                }
+            }
+        }
     }
 
     /// Fire-and-forget listener setup for call sites that do not navigate
@@ -755,6 +977,288 @@ impl Tab {
         }
     }
 
+    // --- E lane: route construction, matching and interception ---------------
+    // All trust-boundary logic lives here, next to the network pump. Matching
+    // is literal string comparison only — no regex crate touches untrusted
+    // input anywhere in this file.
+
+    /// Build a validated [`MockRoute`] from raw client params. Every bound
+    /// fails closed here, before any tab lookup or CDP call exists.
+    pub fn new_route(
+        pattern: String,
+        kind: Option<String>,
+        action: &str,
+        status: Option<i64>,
+        body: Option<String>,
+        content_type: Option<String>,
+    ) -> Result<MockRoute, RpcError> {
+        if pattern.trim().is_empty() {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                "route needs a non-empty pattern",
+                "pass a URL substring, prefix, or host to match, e.g. {\"pattern\": \"/api/ping\"}",
+            ));
+        }
+        if pattern.chars().count() > MAX_ROUTE_PATTERN {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                format!(
+                    "route pattern is {} chars, over the {} char limit",
+                    pattern.chars().count(),
+                    MAX_ROUTE_PATTERN
+                ),
+                "use a shorter, distinctive substring instead of a whole URL",
+            ));
+        }
+        let kind = match kind.as_deref().unwrap_or("substring") {
+            "substring" => RouteKind::Substring,
+            "prefix" => RouteKind::Prefix,
+            "host" => RouteKind::Host,
+            other => {
+                return Err(RpcError::new(
+                    ErrorCode::Internal,
+                    format!("invalid route kind {other:?}: expected substring, prefix or host"),
+                    "omit kind for a substring match",
+                ));
+            }
+        };
+        if kind == RouteKind::Host && !Self::is_valid_host_pattern(&pattern) {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                format!("invalid route host pattern {pattern:?}"),
+                "pass a bare hostname without scheme, path or port, e.g. {\"kind\": \"host\", \"pattern\": \"example.com\"}",
+            ));
+        }
+        let action = match action {
+            "fulfill" => RouteAction::Fulfill,
+            "abort" => RouteAction::Abort,
+            other => {
+                return Err(RpcError::new(
+                    ErrorCode::Internal,
+                    format!("invalid route action {other:?}: expected fulfill or abort"),
+                    "fulfill serves a fixture body; abort fails the request",
+                ));
+            }
+        };
+        // Fulfill-only fields are rejected with abort, never silently dropped:
+        // a stored-but-unenforced option would be fail-open.
+        if action == RouteAction::Abort
+            && (status.is_some() || body.is_some() || content_type.is_some())
+        {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                "abort routes take no status, body or content_type",
+                "omit the fulfill-only fields, or use action fulfill",
+            ));
+        }
+        let status = status.unwrap_or(200);
+        if !(100..=599).contains(&status) {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                format!("route status {status} is outside 100-599"),
+                "use a valid HTTP status code, e.g. 200 or 404",
+            ));
+        }
+        let body = body.unwrap_or_default();
+        if body.len() > MAX_ROUTE_BODY_BYTES {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                format!(
+                    "route body is {} bytes, over the {} byte limit",
+                    body.len(),
+                    MAX_ROUTE_BODY_BYTES
+                ),
+                "serve a smaller fixture, or split the mock across routes",
+            ));
+        }
+        let content_type = content_type.unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
+        if content_type.len() > MAX_ROUTE_CONTENT_TYPE || !Self::is_safe_content_type(&content_type)
+        {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                "route content_type must be printable ASCII with a type/subtype, max 128 chars",
+                "pass a plain content type, e.g. \"application/json\"",
+            ));
+        }
+        Ok(MockRoute {
+            pattern,
+            kind,
+            action,
+            status,
+            body,
+            content_type,
+        })
+    }
+
+    /// Bare-hostname shape for `host` patterns: no scheme, path, port,
+    /// userinfo or whitespace, so `example.com` can never smuggle a URL.
+    fn is_valid_host_pattern(pattern: &str) -> bool {
+        !pattern.is_empty()
+            && !pattern.contains("://")
+            && !pattern
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@' | ':'))
+    }
+
+    /// `content-type` hygiene: printable ASCII only (no CR/LF to inject
+    /// headers through) with a `type/subtype` slash.
+    fn is_safe_content_type(value: &str) -> bool {
+        !value.is_empty()
+            && value.contains('/')
+            && value.bytes().all(|b| (0x20..=0x7E).contains(&b))
+    }
+
+    /// Literal match only: substring containment, prefix, or exact host
+    /// (case-insensitive DNS comparison). `*` and `?` match themselves.
+    fn route_matches(route: &MockRoute, url: &str) -> bool {
+        match route.kind {
+            RouteKind::Substring => url.contains(&route.pattern),
+            RouteKind::Prefix => url.starts_with(&route.pattern),
+            RouteKind::Host => {
+                Self::url_host(url).is_some_and(|host| host.eq_ignore_ascii_case(&route.pattern))
+            }
+        }
+    }
+
+    /// Authority host of an absolute URL, without userinfo or port. Returns
+    /// `None` for relative URLs and malformed authorities (fail closed: no
+    /// match rather than a guessed match).
+    fn url_host(url: &str) -> Option<&str> {
+        let rest = url.split("://").nth(1)?;
+        let authority = rest.split(['/', '?', '#']).next()?;
+        let host_port = authority.rsplit('@').next()?;
+        let host = if let Some(after_bracket) = host_port.strip_prefix('[') {
+            after_bracket.split(']').next()?
+        } else {
+            host_port.split(':').next()?
+        };
+        (!host.is_empty()).then_some(host)
+    }
+
+    /// The ONLY headers a fulfilled mock sends: exactly `content-type`.
+    /// Request headers — and their secrets — are never reflected into a mock.
+    fn fulfill_response_headers(content_type: &str) -> Vec<HeaderEntry> {
+        vec![HeaderEntry::new("content-type", content_type.to_string())]
+    }
+
+    /// First matching route wins (insertion order); `None` = passthrough.
+    pub fn match_route(&self, url: &str) -> Option<MockRoute> {
+        let routes = lock(&self.routes);
+        routes
+            .iter()
+            .find(|route| Self::route_matches(route, url))
+            .cloned()
+    }
+
+    /// Bounded insert shared by the handler; the per-tab table never grows
+    /// past `MAX_ROUTES_PER_TAB` (fail closed, never evict another mock).
+    fn push_route(routes: &mut Vec<MockRoute>, route: MockRoute) -> Result<usize, RpcError> {
+        if routes.len() >= MAX_ROUTES_PER_TAB {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                format!("route table full ({MAX_ROUTES_PER_TAB} per tab)"),
+                "close the tab to clear its mocks, then add routes on a fresh tab",
+            ));
+        }
+        routes.push(route);
+        Ok(routes.len())
+    }
+
+    /// Record a validated mock on this tab. The table is bounded; clearing
+    /// happens in [`Tab::mark_dead`] (close/remove_all/sweep funnel there).
+    pub fn add_route(&self, route: MockRoute) -> Result<usize, RpcError> {
+        let mut routes = lock(&self.routes);
+        Self::push_route(&mut routes, route)
+    }
+
+    /// Arm `Fetch.enable` (all URLs paused) and spawn the intercept pump, once
+    /// per tab. Idempotent: exactly one task enables + pumps; concurrent
+    /// callers wait briefly for `fetch_armed` instead of double-enabling.
+    pub async fn ensure_fetch_intercept(self: &Arc<Self>) -> Result<(), RpcError> {
+        if self.fetch_armed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self
+            .fetch_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            use chromiumoxide::cdp::browser_protocol::fetch::EnableParams;
+            let result = self
+                .exec_timeout(EnableParams::builder().build(), Duration::from_secs(10))
+                .await;
+            match result {
+                Ok(_) => {
+                    let tab = self.clone();
+                    tokio::spawn(async move { Self::pump_fetch(tab).await });
+                    self.fetch_armed.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                Err(err) => {
+                    self.fetch_started.store(false, Ordering::SeqCst);
+                    Err(err)
+                }
+            }
+        } else {
+            for _ in 0..50 {
+                if self.fetch_armed.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(RpcError::new(
+                ErrorCode::Internal,
+                "fetch intercept did not arm in time",
+                "retry the route call; report a daemon bug if it persists",
+            ))
+        }
+    }
+
+    /// Intercept pump: every paused request gets exactly one answer —
+    /// fulfill, fail, or continue — so the page can never wedge on an
+    /// unanswered pause. A dead tab has no routes (cleared in `mark_dead`),
+    /// so late pauses fall through to passthrough.
+    async fn pump_fetch(tab: Arc<Self>) {
+        use chromiumoxide::cdp::browser_protocol::fetch::{
+            ContinueRequestParams, FailRequestParams, FulfillRequestParams,
+        };
+        let Some(mut stream) = tab.subscribe::<EventRequestPaused>("fetch").await else {
+            tab.fetch_started.store(false, Ordering::SeqCst);
+            warn!(tab = %tab.id, "fetch listener subscription failed; routes unenforced");
+            return;
+        };
+        while let Some(event) = stream.next().await {
+            let decision = tab.match_route(&event.request.url);
+            let request_id = event.request_id.clone();
+            let answered = match decision {
+                None => tab
+                    .exec(ContinueRequestParams::new(request_id))
+                    .await
+                    .map(|_| ()),
+                Some(route) if route.action == RouteAction::Abort => tab
+                    .exec(FailRequestParams::new(
+                        request_id,
+                        ErrorReason::BlockedByClient,
+                    ))
+                    .await
+                    .map(|_| ()),
+                Some(route) => {
+                    let body = BASE64.encode(route.body.as_bytes());
+                    let mut params = FulfillRequestParams::new(request_id, route.status);
+                    params.response_headers =
+                        Some(Self::fulfill_response_headers(&route.content_type));
+                    params.body = Some(Binary::from(body));
+                    tab.exec(params).await.map(|_| ())
+                }
+            };
+            if let Err(err) = answered {
+                // The pause may have lapsed (navigation, double answer) — log
+                // and keep pumping: one missed answer must not kill mocks.
+                debug!(tab = %tab.id, error = %err.message, "fetch answer failed");
+            }
+        }
+    }
+
     fn push_console(&self, mut entry: ConsoleEntry) {
         entry.seq = self.console_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut buf = lock(&self.console);
@@ -1005,6 +1509,20 @@ impl TabRegistry {
 
     pub async fn session_count(&self) -> usize {
         self.inner.read().await.sessions.len()
+    }
+
+    /// Global mean `op_lock` queue wait in ms across live tabs, or `None`
+    /// when no op ever acquired the lock. Sums only — no /proc walk, no new
+    /// syscalls — so it is safe to expose in `status` (verbose only).
+    pub async fn op_wait_mean_ms(&self) -> Option<u64> {
+        let inner = self.inner.read().await;
+        let mut total = 0u64;
+        let mut count = 0u64;
+        for tab in inner.tabs.values() {
+            total = total.saturating_add(tab.op_wait_total_ms.load(Ordering::Relaxed));
+            count = count.saturating_add(tab.op_wait_count.load(Ordering::Relaxed));
+        }
+        (count > 0).then(|| total / count)
     }
 
     pub async fn current(&self, session: &str) -> Option<Arc<Tab>> {
@@ -1485,5 +2003,313 @@ mod tests {
     fn decode_body_reports_invalid_base64() {
         let err = decode_body("!!!not-base64!!!", true, 1024).expect_err("must fail");
         assert!(err.contains("invalid base64"), "{err}");
+    }
+
+    #[test]
+    fn action_kind_flags_match_playwright_check_sets() {
+        assert!(ActionKind::Click.needs_hit_test());
+        assert!(ActionKind::Hover.needs_hit_test());
+        assert!(!ActionKind::Fill.needs_hit_test());
+        assert!(!ActionKind::Select.needs_hit_test());
+        assert!(ActionKind::Fill.needs_editable());
+        assert!(!ActionKind::Click.needs_editable());
+        assert!(!ActionKind::Hover.needs_editable());
+        assert!(!ActionKind::Select.needs_editable());
+    }
+
+    #[test]
+    fn actionability_timeout_is_a_typed_timeout() {
+        let err = actionability_timeout("g7-3", "hidden", 10_000);
+        assert_eq!(err.code, ErrorCode::NavTimeout);
+        assert!(err.message.contains("g7-3"), "{err}");
+        assert!(err.message.contains("hidden"), "{err}");
+        assert!(err.message.contains("10000"), "{err}");
+        assert!(!err.hint.is_empty());
+    }
+
+    #[test]
+    fn actionability_js_escapes_uid_and_probes_all_checks() {
+        let js = actionability_js("g7-3");
+        assert!(
+            js.contains("[data-oc-uid="),
+            "queries the snapshot uid attribute"
+        );
+        assert!(
+            js.contains("\"g7-3\""),
+            "uid is a JSON string literal, never interpolated raw"
+        );
+        for fragment in [
+            "scrollIntoView",
+            "elementFromPoint",
+            "requestAnimationFrame",
+            "isConnected",
+            "aria-disabled",
+            "getComputedStyle",
+        ] {
+            assert!(js.contains(fragment), "probe covers {fragment}");
+        }
+    }
+
+    #[test]
+    fn classify_probe_maps_states_to_outcomes() {
+        let ready =
+            serde_json::json!({"ok": true, "x": 10.0, "y": 20.0, "cover": "", "editable": true});
+        assert!(matches!(
+            classify_probe(&ready, ActionKind::Click, "g7-3"),
+            ProbeOutcome::Ready { x, y } if x == 10.0 && y == 20.0
+        ));
+        // Cover blocks click/hover (receives-events) but not fill/select.
+        let covered = serde_json::json!({"ok": true, "x": 1.0, "y": 2.0, "cover": "div \"banner\"", "editable": true});
+        assert!(matches!(
+            classify_probe(&covered, ActionKind::Click, "g7-3"),
+            ProbeOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            classify_probe(&covered, ActionKind::Fill, "g7-3"),
+            ProbeOutcome::Ready { .. }
+        ));
+        // Readonly blocks fill only, as a retryable pending state.
+        let readonly =
+            serde_json::json!({"ok": true, "x": 1.0, "y": 2.0, "cover": "", "editable": false});
+        assert!(matches!(
+            classify_probe(&readonly, ActionKind::Fill, "g7-3"),
+            ProbeOutcome::Pending(_)
+        ));
+        assert!(matches!(
+            classify_probe(&readonly, ActionKind::Click, "g7-3"),
+            ProbeOutcome::Ready { .. }
+        ));
+        // Missing is terminal (today's instant UID_NOT_FOUND); hidden/disabled poll.
+        let missing = serde_json::json!({"ok": false, "reason": "missing"});
+        assert!(matches!(
+            classify_probe(&missing, ActionKind::Click, "g7-3"),
+            ProbeOutcome::Failed(_)
+        ));
+        for state in ["hidden", "disabled", "unstable"] {
+            let pending = serde_json::json!({"ok": false, "reason": state});
+            assert!(
+                matches!(
+                    classify_probe(&pending, ActionKind::Click, "g7-3"),
+                    ProbeOutcome::Pending(_)
+                ),
+                "{state} must poll, not fail"
+            );
+        }
+    }
+
+    // --- E lane: route trust boundary ------------------------------------
+
+    fn fulfill_route(pattern: &str) -> MockRoute {
+        Tab::new_route(
+            pattern.to_string(),
+            None,
+            "fulfill",
+            Some(200),
+            Some(r#"{"pong":"mock"}"#.to_string()),
+            Some("application/json".to_string()),
+        )
+        .expect("valid fulfill route")
+    }
+
+    #[test]
+    fn route_fulfill_matches_substring_and_passthrough_misses() {
+        let route = fulfill_route("/api/ping");
+        assert!(Tab::route_matches(
+            &route,
+            "https://example.com/api/ping?x=1"
+        ));
+        assert!(!Tab::route_matches(&route, "https://example.com/api/pong"));
+        assert!(!Tab::route_matches(&route, "https://example.com/"));
+    }
+
+    #[test]
+    fn route_abort_matches_and_carries_no_fixture() {
+        let route = Tab::new_route("/ads/".to_string(), None, "abort", None, None, None)
+            .expect("valid abort route");
+        assert_eq!(route.action, RouteAction::Abort);
+        assert!(Tab::route_matches(
+            &route,
+            "https://cdn.example/ads/banner.js"
+        ));
+        assert!(!Tab::route_matches(&route, "https://cdn.example/app.js"));
+    }
+
+    #[test]
+    fn route_prefix_matches_starts_only() {
+        let route = Tab::new_route(
+            "https://api.example/".to_string(),
+            Some("prefix".to_string()),
+            "fulfill",
+            None,
+            None,
+            None,
+        )
+        .expect("valid prefix route");
+        assert!(Tab::route_matches(&route, "https://api.example/v1/users"));
+        assert!(!Tab::route_matches(
+            &route,
+            "https://evil.example/?next=https://api.example/"
+        ));
+    }
+
+    #[test]
+    fn route_host_matches_exact_host_case_insensitively() {
+        let route = Tab::new_route(
+            "Example.COM".to_string(),
+            Some("host".to_string()),
+            "abort",
+            None,
+            None,
+            None,
+        )
+        .expect("valid host route");
+        assert!(Tab::route_matches(&route, "https://example.com:8080/a?b=1"));
+        assert!(Tab::route_matches(&route, "http://user@example.com/x"));
+        // Lookalikes must not match: no suffix/prefix confusion.
+        assert!(!Tab::route_matches(&route, "https://notexample.com/"));
+        assert!(!Tab::route_matches(&route, "https://example.com.evil.com/"));
+        assert!(!Tab::route_matches(&route, "/relative/path"));
+    }
+
+    #[test]
+    fn route_matching_is_literal_never_regex() {
+        // `.*` is four literal chars here, not "match anything".
+        let route = fulfill_route("api.*");
+        assert!(Tab::route_matches(&route, "https://x.example/api.*"));
+        assert!(!Tab::route_matches(&route, "https://x.example/apixyz"));
+        assert!(!Tab::route_matches(&route, "https://x.example/api/v1"));
+    }
+
+    #[test]
+    fn route_rejects_empty_and_oversized_patterns() {
+        for bad in ["", "   "] {
+            assert!(
+                Tab::new_route(bad.to_string(), None, "fulfill", None, None, None).is_err(),
+                "{bad:?} must fail closed"
+            );
+        }
+        let oversized = "p".repeat(MAX_ROUTE_PATTERN + 1);
+        let err = Tab::new_route(oversized, None, "fulfill", None, None, None)
+            .expect_err("513-char pattern must be rejected");
+        assert_eq!(err.code, ErrorCode::Internal);
+        // Boundary holds: exactly 512 chars is accepted.
+        Tab::new_route(
+            "p".repeat(MAX_ROUTE_PATTERN),
+            None,
+            "fulfill",
+            None,
+            None,
+            None,
+        )
+        .expect("512-char pattern is the documented bound");
+    }
+
+    #[test]
+    fn route_rejects_bad_kind_action_status_and_content_type() {
+        let base = || ("/api/".to_string(), Some(200), None, None);
+        let (p, s, b, c) = base();
+        assert!(Tab::new_route(
+            p.clone(),
+            Some("wildcard".to_string()),
+            "fulfill",
+            s,
+            b.clone(),
+            c.clone()
+        )
+        .is_err());
+        let (p, s, b, c) = base();
+        assert!(Tab::new_route(p, None, "drop", s, b, c).is_err());
+        // Abort rejects fulfill-only fields instead of silently dropping them.
+        assert!(Tab::new_route("/a/".to_string(), None, "abort", Some(404), None, None).is_err());
+        assert!(Tab::new_route(
+            "/a/".to_string(),
+            None,
+            "abort",
+            None,
+            Some("x".to_string()),
+            None
+        )
+        .is_err());
+        // Status outside 100-599, oversized body, header-injecting type.
+        assert!(Tab::new_route("/a/".to_string(), None, "fulfill", Some(99), None, None).is_err());
+        assert!(Tab::new_route("/a/".to_string(), None, "fulfill", Some(600), None, None).is_err());
+        assert!(Tab::new_route(
+            "/a/".to_string(),
+            None,
+            "fulfill",
+            None,
+            Some("x".repeat(MAX_ROUTE_BODY_BYTES + 1)),
+            None
+        )
+        .is_err());
+        assert!(Tab::new_route(
+            "/a/".to_string(),
+            None,
+            "fulfill",
+            None,
+            None,
+            Some("text/html\r\nX-Injected: 1".to_string())
+        )
+        .is_err());
+        assert!(Tab::new_route(
+            "/a/".to_string(),
+            None,
+            "fulfill",
+            None,
+            None,
+            Some("not-a-type".to_string())
+        )
+        .is_err());
+        // Host kind rejects URL-shaped patterns (fail closed, no smuggling).
+        for bad_host in [
+            "https://example.com",
+            "example.com/path",
+            "example.com:8080",
+            "a b.com",
+        ] {
+            assert!(
+                Tab::new_route(
+                    bad_host.to_string(),
+                    Some("host".to_string()),
+                    "abort",
+                    None,
+                    None,
+                    None
+                )
+                .is_err(),
+                "{bad_host:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn route_fulfill_headers_carry_no_secrets() {
+        // A fulfilled mock sends exactly one header. Request secrets
+        // (authorization/cookie/...) are never reflected into a mock.
+        let headers = Tab::fulfill_response_headers("application/json");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].name, "content-type");
+        assert_eq!(headers[0].value, "application/json");
+        let leaked = ["authorization", "cookie", "set-cookie", "x-api-key"];
+        assert!(
+            !headers
+                .iter()
+                .any(|h| leaked.iter().any(|s| h.name.eq_ignore_ascii_case(s))),
+            "fulfill headers must never carry secrets"
+        );
+    }
+
+    #[test]
+    fn route_table_is_bounded_per_tab() {
+        let mut routes = Vec::new();
+        for i in 0..MAX_ROUTES_PER_TAB {
+            let n = Tab::push_route(&mut routes, fulfill_route(&format!("/api/{i}")))
+                .expect("table has room");
+            assert_eq!(n, i + 1);
+        }
+        let err = Tab::push_route(&mut routes, fulfill_route("/api/full"))
+            .expect_err("21st route must fail closed");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(routes.len(), MAX_ROUTES_PER_TAB);
     }
 }

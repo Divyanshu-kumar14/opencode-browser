@@ -27,6 +27,12 @@
     "failures": "all other per-op errors"
   },
   "killRule": "If Rust shows <20% improvement in marginal memory per session AND <20% in warm-call p95 versus baseline A, do NOT ship the daemon as the default. Ship the JS driver instead.",
+  "guards": {
+    "nFloor": "Warm p50/p95 per method require n>=30 samples; bench.mjs flags smaller samples as interpolation noise in results.nFloors and the report.",
+    "marginalRSS": "Marginal RSS/session is the OLS slope of peak tree RSS over session counts with a two-sided 95% CI (t, df=n-2) and R² in results.rss; 2 session counts report the slope with no CI and a re-run note.",
+    "ciRegression": "CI guard: `node scripts/bench.mjs --mock --guard bench/results/baseline.json [--max-regression-pct 10]` exits 1 when any warm p95 (per method + aggregate) regresses more than the threshold vs the committed baseline. Same driver, same fixture, same machine class — otherwise do not run the guard.",
+    "procWalkOverhead": "The /proc tree walk (~3ms warm, ~8ms cold per sample, measured separately) runs in the bench harness sampler and the daemon bench probe only — never on status or per-request paths. Report its cost separately; do not fold it into op latencies."
+  },
   "notes": [
     "results.json is gitignored (bench/results/*.json): it is an artifact, not a claim.",
     "bench/results/report.md is the checked-in decision memo generated from the latest run.",

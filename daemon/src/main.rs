@@ -180,11 +180,18 @@ async fn bench_client(socket: Option<PathBuf>, sessions: usize, calls: usize) ->
 // ---------------------------------------------------------------------------
 
 async fn serve(cli: Cli) -> anyhow::Result<()> {
-    let binary = crate::paths::resolve_chrome(cli.chrome.as_deref()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no Chrome binary: set --chrome or CHROME_PATH, or install google-chrome/chromium"
-        )
-    })?;
+    let attach_endpoint = std::env::var("OPENCODE_BROWSER_ATTACH_URL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let binary = if attach_endpoint.is_some() {
+        PathBuf::new()
+    } else {
+        crate::paths::resolve_chrome(cli.chrome.as_deref()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no Chrome binary: set --chrome or CHROME_PATH, or install google-chrome/chromium"
+            )
+        })?
+    };
     info!(chrome = %binary.display(), "resolved chrome");
 
     let socket_path = cli.socket.clone().unwrap_or_else(paths::socket_path);
@@ -203,11 +210,14 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     paths::make_owner_only(&socket_path)?;
     info!(socket = %socket_path.display(), "listening");
 
-    let chrome = Arc::new(ChromeManager::new(
-        binary,
-        paths::profiles_dir(),
-        cli.no_sandbox_acknowledged_risk,
-    ));
+    let chrome = Arc::new(
+        ChromeManager::new(
+            binary,
+            paths::profiles_dir(),
+            cli.no_sandbox_acknowledged_risk,
+        )
+        .with_attach_endpoint(attach_endpoint),
+    );
     let tabs = Arc::new(TabRegistry::new(
         cli.max_tabs.max(1),
         Duration::from_secs(cli.ttl_s.max(60)),

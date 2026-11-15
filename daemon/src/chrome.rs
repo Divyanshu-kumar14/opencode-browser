@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::handler::HandlerConfig;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -20,6 +21,7 @@ pub struct ChromeInstance {
     pub version: String,
     pub profile: PathBuf,
     pub alive: Arc<AtomicBool>,
+    attach_pump: Option<tokio::task::AbortHandle>,
 }
 
 impl ChromeInstance {
@@ -56,6 +58,7 @@ pub struct ChromeStatus {
 /// Owns the single Chrome process and the supervision metadata around it.
 pub struct ChromeManager {
     binary: PathBuf,
+    attach_endpoint: Option<String>,
     profiles_root: PathBuf,
     /// Set only via `--no-sandbox-acknowledged-risk`. Never from the
     /// environment: a process that can set our env could silently strip the
@@ -80,6 +83,7 @@ impl ChromeManager {
         let (deaths, _) = broadcast::channel(8);
         Self {
             binary,
+            attach_endpoint: None,
             profiles_root,
             allow_no_sandbox,
             state: RwLock::new(None),
@@ -89,6 +93,15 @@ impl ChromeManager {
             auto_relaunches: Arc::new(AtomicU32::new(0)),
             launches: AtomicU32::new(0),
         }
+    }
+
+    pub fn with_attach_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.attach_endpoint = endpoint;
+        self
+    }
+
+    pub fn is_attach_mode(&self) -> bool {
+        self.attach_endpoint.is_some()
     }
 
     /// Death notifications carry the pid of the instance that died.
@@ -119,8 +132,58 @@ impl ChromeManager {
                 return Ok(instance.clone());
             }
         }
-        let instance = self.launch().await?;
+        let instance = if let Some(endpoint) = &self.attach_endpoint {
+            self.attach(endpoint).await?
+        } else {
+            self.launch().await?
+        };
         *self.state.write().await = Some(instance.clone());
+        Ok(instance)
+    }
+
+    async fn attach(&self, endpoint: &str) -> Result<Arc<ChromeInstance>, RpcError> {
+        validate_attach_endpoint(endpoint)?;
+        let config = HandlerConfig {
+            request_intercept: true,
+            ignore_https_errors: false,
+            viewport: None,
+            ..Default::default()
+        };
+        let (browser, handler) = tokio::time::timeout(
+            Duration::from_secs(3),
+            Browser::connect_with_config(endpoint, config),
+        )
+        .await
+        .map_err(|_| RpcError::chrome_dead("Chrome attach timed out"))?
+        .map_err(|err| RpcError::chrome_dead(format!("Chrome attach failed: {err}")))?;
+        // The event pump must run before the version command can resolve.
+        let pump = tokio::spawn(async move { handler.run().await });
+        let version = match tokio::time::timeout(Duration::from_secs(1), browser.version()).await {
+            Ok(Ok(version)) => version.product,
+            result => {
+                pump.abort();
+                return Err(RpcError::chrome_dead(format!(
+                    "Chrome attach readiness failed: {result:?}"
+                )));
+            }
+        };
+        let instance = Arc::new(ChromeInstance {
+            browser: Mutex::new(browser),
+            pid: 0, // External process: never signal it or claim its PID.
+            version,
+            profile: PathBuf::new(),
+            attach_pump: Some(pump.abort_handle()),
+            alive: Arc::new(AtomicBool::new(true)),
+        });
+        let watched = instance.clone();
+        let deaths = self.deaths.clone();
+        tokio::spawn(async move {
+            let _ = pump.await;
+            if watched.alive.swap(false, Ordering::SeqCst) {
+                let _ = deaths.send(watched.pid);
+            }
+        });
+        info!("attached to Chrome");
         Ok(instance)
     }
 
@@ -236,6 +299,7 @@ impl ChromeManager {
             pid,
             version,
             profile,
+            attach_pump: None,
             alive: Arc::new(AtomicBool::new(true)),
         });
         self.launches.fetch_add(1, Ordering::SeqCst);
@@ -284,7 +348,7 @@ impl ChromeManager {
         match state.as_ref() {
             Some(instance) => ChromeStatus {
                 alive: instance.alive.load(Ordering::SeqCst),
-                pid: Some(instance.pid),
+                pid: (instance.pid != 0).then_some(instance.pid),
                 version: Some(instance.version.clone()),
                 launches: self.launches.load(Ordering::SeqCst),
                 relaunches: self.auto_relaunches.load(Ordering::SeqCst),
@@ -307,6 +371,12 @@ impl ChromeManager {
             return;
         };
         instance.alive.store(false, Ordering::SeqCst);
+        // Attached Chrome belongs to the operator; never close or kill it,
+        // and never remove its profile. Owned tabs are cleaned up separately.
+        if let Some(pump) = &instance.attach_pump {
+            pump.abort();
+            return;
+        }
 
         {
             let mut browser = instance.browser.lock().await;
@@ -336,5 +406,57 @@ impl ChromeManager {
         } else {
             info!(profile = %instance.profile.display(), "removed chrome profile");
         }
+    }
+}
+
+fn validate_attach_endpoint(endpoint: &str) -> Result<(), RpcError> {
+    let url = url::Url::parse(endpoint)
+        .map_err(|_| RpcError::chrome_dead("invalid Chrome attach endpoint"))?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if !matches!(url.scheme(), "ws" | "wss") || !loopback {
+        return Err(RpcError::chrome_dead(
+            "Chrome attach endpoint must be a loopback WebSocket URL",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+
+    #[test]
+    fn attach_endpoint_is_loopback_websocket_only() {
+        for endpoint in [
+            "ws://localhost:9222/devtools/browser/a",
+            "ws://127.2.3.4:9222/a",
+            "ws://[::1]:9222/a",
+        ] {
+            assert!(validate_attach_endpoint(endpoint).is_ok());
+        }
+        for endpoint in [
+            "http://127.0.0.1:9222",
+            "ws://example.com/a",
+            "ws://[::2]:9222/a",
+            "garbage",
+        ] {
+            assert!(validate_attach_endpoint(endpoint).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_attach_fails_without_launching() {
+        let manager =
+            ChromeManager::new(PathBuf::from("/nonexistent/chrome"), PathBuf::new(), false)
+                .with_attach_endpoint(Some("ws://example.com/a".into()));
+        assert!(manager.ensure().await.is_err());
+        let status = manager.status().await;
+        assert!(!status.alive);
+        assert_eq!(status.launches, 0);
     }
 }

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>browserd smoke fixture</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; }
+  form { margin-bottom: 16px; }
+  label { display: block; margin: 8px 0; }
+  #overlay {
+    position: fixed; left: 90px; top: 300px; width: 220px; height: 60px;
+    background: rgba(0, 0, 0, 0.85); color: #fff; z-index: 9999;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #occluded { position: fixed; left: 120px; top: 312px; z-index: 1; }
+  #status { min-height: 1.5em; color: #064; font-weight: bold; }
+</style>
+</head>
+<body>
+  <h1>Smoke fixture</h1>
+
+  <form id="login" action="/login" method="post">
+    <label>Email <input id="email" name="email" type="email" placeholder="you@example.com"></label>
+    <label>Password <input id="password" name="password" type="password"></label>
+    <button id="submit" type="submit">Sign in</button>
+  </form>
+  <p id="status" aria-live="polite"></p>
+
+  <button id="append">Append text</button>
+  <div id="appended"></div>
+
+  <p><a id="plain-link" href="/about">A normal link</a></p>
+
+  <div id="overlay">covering overlay</div>
+  <button id="occluded" aria-label="Occluded button">You cannot click me</button>
+
+  <script>
+    console.log('smoke fixture loaded');
+    fetch('/api/ping').catch(() => {});
+    document.getElementById('login').addEventListener('submit', (event) => {
+      // Stay on the page so the smoke test keeps valid uids after clicking.
+      event.preventDefault();
+      document.getElementById('status').textContent = 'submitted';
+    });
+    document.getElementById('append').addEventListener('click', () => {
+      const p = document.createElement('p');
+      p.className = 'line';
+      p.textContent = 'appended line';
+      document.getElementById('appended').appendChild(p);
+    });
+  </script>
+</body>
+</html>

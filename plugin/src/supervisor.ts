@@ -57,20 +57,20 @@ function platformDir(): string {
 }
 
 /**
- * Candidate binaries, in order: explicit env override, installed package
- * layout (`<pkg>/prebuilds/<platform>/browserd`), repo checkout layout
+ * Candidate binaries. An explicit `OPENCODE_BROWSERD_BIN` is exclusive: a
+ * broken override must fail loudly instead of silently falling back to a
+ * different binary. Otherwise try the installed package layout
+ * (`<pkg>/prebuilds/<platform>/browserd`), then the repo checkout layout
  * (`<repo>/prebuilds/...`, one level above the plugin package).
  */
 export function binaryCandidates(): string[] {
   const override = process.env[BIN_ENV];
+  if (override !== undefined && override.length > 0) return [override];
   const rel = path.join("prebuilds", platformDir(), "browserd");
-  const candidates = [
+  return [
     path.join(packageRoot(), rel),
     path.resolve(packageRoot(), "..", rel),
   ];
-  return override !== undefined && override.length > 0
-    ? [override, ...candidates]
-    : candidates;
 }
 
 /** First candidate that exists and is executable, or null. */

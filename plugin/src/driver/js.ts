@@ -598,7 +598,7 @@ export class JsDriver implements BaselineDriver {
         } catch (e) { /* select() is best-effort on exotic inputs */ }
         return { found: true };
       })())`,
-      "fill target is gone; re-run browser_snapshot",
+      "fill target is gone; re-run browse_snapshot",
     );
     await tab.conn.send("Input.insertText", { text: value });
     if (submit) {
@@ -718,21 +718,21 @@ export class JsDriver implements BaselineDriver {
       throw new DriverError(
         "UID_NOT_FOUND",
         `uid ${uid} was never issued by a snapshot`,
-        "re-run browser_snapshot and use a uid from the new tree",
+        "re-run browse_snapshot and use a uid from the new tree",
       );
     }
     if (parsed.generation !== tab.generation) {
       throw new DriverError(
         "UID_STALE",
         `uid ${uid} belongs to a previous page generation`,
-        "the page changed; re-run browser_snapshot and use a uid from the new tree",
+        "the page changed; re-run browse_snapshot and use a uid from the new tree",
       );
     }
     if (!tab.uids.has(uid)) {
       throw new DriverError(
         "UID_NOT_FOUND",
         `uid ${uid} is not present in the current snapshot`,
-        "re-run browser_snapshot; uids are only valid until the next navigation or snapshot",
+        "re-run browse_snapshot; uids are only valid until the next navigation or snapshot",
       );
     }
     return parsed;
@@ -751,13 +751,13 @@ export class JsDriver implements BaselineDriver {
         const blocked = !!top && top !== el && !el.contains(top);
         return { found: true, x, y, blockedBy: blocked ? top.tagName.toLowerCase() : null };
       })())`,
-      "click target is gone; re-run browser_snapshot",
+      "click target is gone; re-run browse_snapshot",
     )) as { found?: boolean; x?: number; y?: number; blockedBy?: string | null } | null;
     if (!value || value.found !== true || typeof value.x !== "number") {
       throw new DriverError(
         "UID_NOT_FOUND",
         `uid ${uid} is not present in the current snapshot`,
-        "re-run browser_snapshot; uids are only valid until the next navigation or snapshot",
+        "re-run browse_snapshot; uids are only valid until the next navigation or snapshot",
       );
     }
     if (value.blockedBy) {
@@ -1018,21 +1018,21 @@ export class MockDriver implements BaselineDriver {
       throw new DriverError(
         "UID_NOT_FOUND",
         `uid ${uid} was never issued by a snapshot`,
-        "re-run browser_snapshot and use a uid from the new tree",
+        "re-run browse_snapshot and use a uid from the new tree",
       );
     }
     if (parsed.generation !== tab.generation) {
       throw new DriverError(
         "UID_STALE",
         `uid ${uid} belongs to a previous page generation`,
-        "the page changed; re-run browser_snapshot and use a uid from the new tree",
+        "the page changed; re-run browse_snapshot and use a uid from the new tree",
       );
     }
     if (!tab.uids.includes(uid)) {
       throw new DriverError(
         "UID_NOT_FOUND",
         `uid ${uid} is not present in the current snapshot`,
-        "re-run browser_snapshot; uids are only valid until the next navigation or snapshot",
+        "re-run browse_snapshot; uids are only valid until the next navigation or snapshot",
       );
     }
   }

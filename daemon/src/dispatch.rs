@@ -218,7 +218,7 @@ async fn handle_navigate(app: &App, params: Value, session: &str) -> Result<Valu
     }
 
     let tab = app.tabs.resolve_or_create(session, &app.chrome).await?;
-    tab.start_listeners();
+    tab.ensure_listeners().await;
     let _guard = tab.op_lock.lock().await;
 
     let nav = tab
@@ -530,7 +530,7 @@ async fn handle_eval(app: &App, params: Value, session: &str) -> Result<Value, R
         ));
     }
     let tab = app.tabs.resolve_or_create(session, &app.chrome).await?;
-    tab.start_listeners();
+    tab.ensure_listeners().await;
     let _guard = tab.op_lock.lock().await;
     let eval_params = chromiumoxide::cdp::js_protocol::runtime::EvaluateParams {
         expression: parsed.js.clone(),

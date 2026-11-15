@@ -10,8 +10,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use chromiumoxide::cdp::browser_protocol::log::EventEntryAdded;
+use chromiumoxide::cdp::browser_protocol::network::{
+    EventRequestWillBeSent, EventResponseReceived,
+};
 use chromiumoxide::cdp::browser_protocol::target::CloseTargetParams;
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
+use chromiumoxide::cdp::IntoEventKind;
+use chromiumoxide::listeners::EventStream;
 use chromiumoxide::{Command, Page};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -87,6 +94,7 @@ pub struct Tab {
     console: StdMutex<VecDeque<ConsoleEntry>>,
     network: StdMutex<VecDeque<NetworkEntry>>,
     listeners_started: AtomicBool,
+    listeners_ready: AtomicBool,
 }
 
 impl Tab {
@@ -106,6 +114,7 @@ impl Tab {
             console: StdMutex::new(VecDeque::new()),
             network: StdMutex::new(VecDeque::new()),
             listeners_started: AtomicBool::new(false),
+            listeners_ready: AtomicBool::new(false),
         }
     }
 
@@ -275,19 +284,54 @@ impl Tab {
         self.eval_json(&js).await
     }
 
-    /// Start console/log/network listeners once per tab (P1-6). Events are
-    /// appended to bounded ring buffers; the listener tasks end when the
-    /// tab's CDP session closes, so nothing outlives its tab.
+    /// Fire-and-forget listener setup for call sites that do not navigate
+    /// (snapshot, eval): capture starts as soon as setup completes.
+    /// Events are appended to bounded ring buffers; the listener tasks end
+    /// when the tab's CDP session closes, so nothing outlives its tab.
     pub fn start_listeners(self: &Arc<Self>) {
+        let tab = self.clone();
+        tokio::spawn(async move {
+            tab.ensure_listeners().await;
+        });
+    }
+
+    /// Complete listener setup, awaiting enables AND subscriptions so a
+    /// subsequent `Page.navigate` cannot outrun capture. Idempotent: only one
+    /// task performs setup; concurrent callers wait for `listeners_ready`.
+    pub async fn ensure_listeners(self: &Arc<Self>) {
+        if self.listeners_ready.load(Ordering::SeqCst) {
+            return;
+        }
         if self
             .listeners_started
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+            .is_ok()
         {
+            self.setup_listeners().await;
             return;
         }
-        let tab = self.clone();
-        tokio::spawn(async move {
+        for _ in 0..100 {
+            if self.listeners_ready.load(Ordering::SeqCst) {
+                return;
+            }
+            if !self.listeners_started.load(Ordering::SeqCst)
+                && self
+                    .listeners_started
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                // A previous setup attempt failed; take over.
+                self.setup_listeners().await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        debug!(tab = %self.id, "timed out waiting for listener setup");
+    }
+
+    /// Enables, subscriptions, then pump tasks. Runs once per tab.
+    async fn setup_listeners(self: &Arc<Self>) {
+        {
             use chromiumoxide::cdp::browser_protocol::log::EnableParams as LogEnable;
             use chromiumoxide::cdp::browser_protocol::network::EnableParams as NetEnable;
             use chromiumoxide::cdp::js_protocol::runtime::EnableParams as RtEnable;
@@ -295,169 +339,160 @@ impl Tab {
             // instead of leaving permanently-dead listeners behind.
             let mut enabled = false;
             for _ in 0..25 {
-                let rt = tab.exec(RtEnable {}).await.is_ok();
-                let log = tab.exec(LogEnable {}).await.is_ok();
-                let net = tab.exec(NetEnable::builder().build()).await.is_ok();
+                let rt = self.exec(RtEnable {}).await.is_ok();
+                let log = self.exec(LogEnable {}).await.is_ok();
+                let net = self.exec(NetEnable::builder().build()).await.is_ok();
                 if rt && log && net {
                     enabled = true;
                     break;
                 }
-                if tab.is_dead() {
+                if self.is_dead() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             if !enabled {
-                warn!(tab = %tab.id, "console/network enables never succeeded; listeners disabled for this tab");
-                tab.listeners_started.store(false, Ordering::SeqCst);
+                warn!(tab = %self.id, "console/network enables never succeeded; listeners disabled for this tab");
+                self.listeners_started.store(false, Ordering::SeqCst);
                 return;
             }
+        }
 
-            let console_tab = tab.clone();
-            tokio::spawn(async move {
-                use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
-                let mut stream = None;
-                for _ in 0..10 {
-                    match console_tab
-                        .page
-                        .event_listener::<EventConsoleApiCalled>()
-                        .await
+        use chromiumoxide::cdp::browser_protocol::log::EventEntryAdded;
+        use chromiumoxide::cdp::browser_protocol::network::{
+            EventRequestWillBeSent, EventResponseReceived,
+        };
+        use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
+
+        // Subscribe BEFORE any pump task exists: all four subscriptions must
+        // predate the navigation this setup was awaited for.
+        let Some(console_stream) = self.subscribe::<EventConsoleApiCalled>("console").await else {
+            self.listeners_started.store(false, Ordering::SeqCst);
+            return;
+        };
+        let Some(log_stream) = self.subscribe::<EventEntryAdded>("log").await else {
+            self.listeners_started.store(false, Ordering::SeqCst);
+            return;
+        };
+        let Some(will_be_sent) = self
+            .subscribe::<EventRequestWillBeSent>("network-request")
+            .await
+        else {
+            self.listeners_started.store(false, Ordering::SeqCst);
+            return;
+        };
+        let Some(responded) = self
+            .subscribe::<EventResponseReceived>("network-response")
+            .await
+        else {
+            self.listeners_started.store(false, Ordering::SeqCst);
+            return;
+        };
+
+        let tab = self.clone();
+        tokio::spawn(async move { Self::pump_console(tab, console_stream).await });
+        let tab = self.clone();
+        tokio::spawn(async move { Self::pump_log(tab, log_stream).await });
+        let tab = self.clone();
+        tokio::spawn(async move { Self::pump_network(tab, will_be_sent, responded).await });
+        self.listeners_ready.store(true, Ordering::SeqCst);
+    }
+
+    /// Subscribe to one CDP event kind with retries. `None` after ~2s means
+    /// the tab is too unsettled to capture from; the caller resets the setup
+    /// flag so a later call retries.
+    async fn subscribe<T>(&self, what: &str) -> Option<EventStream<T>>
+    where
+        T: IntoEventKind,
+    {
+        for _ in 0..10 {
+            match self.page.event_listener::<T>().await {
+                Ok(stream) => return Some(stream),
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+        warn!(tab = %self.id, "{what} listener subscription failed");
+        None
+    }
+
+    async fn pump_console(tab: Arc<Self>, mut stream: EventStream<EventConsoleApiCalled>) {
+        while let Some(event) = stream.next().await {
+            let mut parts = Vec::new();
+            for arg in &event.args {
+                parts.push(remote_text(arg));
+            }
+            tab.push_console(ConsoleEntry {
+                level: format!("{:?}", event.r#type).to_lowercase(),
+                text: truncate_chars(&parts.join(" "), 2000),
+                url: redact_url(&tab.url()),
+                ts: now_ms(),
+            });
+        }
+    }
+
+    async fn pump_log(tab: Arc<Self>, mut stream: EventStream<EventEntryAdded>) {
+        while let Some(event) = stream.next().await {
+            tab.push_console(ConsoleEntry {
+                level: event.entry.level.as_ref().to_string(),
+                text: truncate_chars(&event.entry.text, 2000),
+                url: event
+                    .entry
+                    .url
+                    .as_deref()
+                    .map(redact_url)
+                    .unwrap_or_default(),
+                ts: now_ms(),
+            });
+        }
+    }
+
+    async fn pump_network(
+        tab: Arc<Self>,
+        mut will_be_sent: EventStream<EventRequestWillBeSent>,
+        mut responded: EventStream<EventResponseReceived>,
+    ) {
+        let mut pending: HashMap<String, (String, String, String, f64)> = HashMap::new();
+        loop {
+            tokio::select! {
+                biased;
+                next = will_be_sent.next() => {
+                    let Some(event) = next else { break };
+                    if pending.len() > 1000 {
+                        pending.clear();
+                    }
+                    let kind = event
+                        .r#type
+                        .as_ref()
+                        .map(|kind| format!("{kind:?}").to_lowercase())
+                        .unwrap_or_else(|| "other".to_string());
+                    pending.insert(
+                        event.request_id.0.clone(),
+                        (
+                            event.request.method.clone(),
+                            redact_url(&event.request.url),
+                            kind,
+                            event.timestamp.0,
+                        ),
+                    );
+                }
+                next = responded.next() => {
+                    let Some(event) = next else { break };
+                    if let Some((method, url, kind, t0)) =
+                        pending.remove(&event.request_id.0)
                     {
-                        Ok(subscribed) => {
-                            stream = Some(subscribed);
-                            break;
-                        }
-                        Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                        let ms = (event.timestamp.0 - t0) * 1000.0;
+                        tab.push_network(NetworkEntry {
+                            method,
+                            url,
+                            status: event.response.status,
+                            ms: if ms.is_finite() && ms >= 0.0 { ms } else { 0.0 },
+                            kind,
+                            ts: now_ms(),
+                        });
                     }
                 }
-                let Some(mut stream) = stream else {
-                    warn!(tab = %console_tab.id, "console listener subscription failed");
-                    return;
-                };
-                while let Some(event) = stream.next().await {
-                    let mut parts = Vec::new();
-                    for arg in &event.args {
-                        parts.push(remote_text(arg));
-                    }
-                    console_tab.push_console(ConsoleEntry {
-                        level: format!("{:?}", event.r#type).to_lowercase(),
-                        text: truncate_chars(&parts.join(" "), 2000),
-                        url: redact_url(&console_tab.url()),
-                        ts: now_ms(),
-                    });
-                }
-            });
-
-            let log_tab = tab.clone();
-            tokio::spawn(async move {
-                use chromiumoxide::cdp::browser_protocol::log::EventEntryAdded;
-                let mut stream = None;
-                for _ in 0..10 {
-                    match log_tab.page.event_listener::<EventEntryAdded>().await {
-                        Ok(subscribed) => {
-                            stream = Some(subscribed);
-                            break;
-                        }
-                        Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
-                    }
-                }
-                let Some(mut stream) = stream else {
-                    warn!(tab = %log_tab.id, "log listener subscription failed");
-                    return;
-                };
-                while let Some(event) = stream.next().await {
-                    log_tab.push_console(ConsoleEntry {
-                        level: event.entry.level.as_ref().to_string(),
-                        text: truncate_chars(&event.entry.text, 2000),
-                        url: event
-                            .entry
-                            .url
-                            .as_deref()
-                            .map(redact_url)
-                            .unwrap_or_default(),
-                        ts: now_ms(),
-                    });
-                }
-            });
-
-            let net_tab = tab.clone();
-            tokio::spawn(async move {
-                use chromiumoxide::cdp::browser_protocol::network::{
-                    EventRequestWillBeSent, EventResponseReceived,
-                };
-                let mut will_be_sent = None;
-                for _ in 0..10 {
-                    match net_tab
-                        .page
-                        .event_listener::<EventRequestWillBeSent>()
-                        .await
-                    {
-                        Ok(subscribed) => {
-                            will_be_sent = Some(subscribed);
-                            break;
-                        }
-                        Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
-                    }
-                }
-                let mut responded = None;
-                for _ in 0..10 {
-                    match net_tab.page.event_listener::<EventResponseReceived>().await {
-                        Ok(subscribed) => {
-                            responded = Some(subscribed);
-                            break;
-                        }
-                        Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
-                    }
-                }
-                let (Some(mut will_be_sent), Some(mut responded)) = (will_be_sent, responded)
-                else {
-                    warn!(tab = %net_tab.id, "network listener subscription failed");
-                    return;
-                };
-                let mut pending: HashMap<String, (String, String, String, f64)> = HashMap::new();
-                loop {
-                    tokio::select! {
-                        biased;
-                        next = will_be_sent.next() => {
-                            let Some(event) = next else { break };
-                            if pending.len() > 1000 {
-                                pending.clear();
-                            }
-                            let kind = event
-                                .r#type
-                                .as_ref()
-                                .map(|kind| format!("{kind:?}").to_lowercase())
-                                .unwrap_or_else(|| "other".to_string());
-                            pending.insert(
-                                event.request_id.0.clone(),
-                                (
-                                    event.request.method.clone(),
-                                    redact_url(&event.request.url),
-                                    kind,
-                                    event.timestamp.0,
-                                ),
-                            );
-                        }
-                        next = responded.next() => {
-                            let Some(event) = next else { break };
-                            if let Some((method, url, kind, t0)) =
-                                pending.remove(&event.request_id.0)
-                            {
-                                let ms = (event.timestamp.0 - t0) * 1000.0;
-                                net_tab.push_network(NetworkEntry {
-                                    method,
-                                    url,
-                                    status: event.response.status,
-                                    ms: if ms.is_finite() && ms >= 0.0 { ms } else { 0.0 },
-                                    kind,
-                                    ts: now_ms(),
-                                });
-                            }
-                        }
-                    }
-                }
-            });
-        });
+            }
+        }
     }
 
     fn push_console(&self, entry: ConsoleEntry) {

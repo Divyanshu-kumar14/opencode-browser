@@ -14,10 +14,11 @@ use crate::error::{ErrorCode, RpcError};
 use crate::paths;
 use crate::policy::{check_navigate_url, redact_url};
 use crate::rpc::{
-    self, BenchParams, ClickParams, CloseTabParams, ConsoleParams, DialogParams, EvalParams,
-    ExpectTextParams, FillParams, HelloParams, HoverParams, NavigateParams, NetworkBodyParams,
-    NetworkParams, PressKeyParams, Request, Response, RouteParams, ScreenshotParams, ScrollParams,
-    SelectParams, ShutdownParams, SnapshotParams, StatusParams, UploadParams, WaitForUidParams,
+    self, BenchParams, ClickAtParams, ClickParams, CloseTabParams, ConsoleParams, DialogParams,
+    EvalParams, ExpectTextParams, FillParams, HelloParams, HoverParams, NavigateParams,
+    NetworkBodyParams, NetworkParams, PressKeyParams, Request, Response, RouteParams,
+    ScreenshotParams, ScrollParams, SelectParams, ShutdownParams, SnapshotParams, StatusParams,
+    UploadParams, WaitForUidParams,
 };
 use crate::snapshot::{self, DEFAULT_MAX_NODES};
 use crate::tabs::{
@@ -31,6 +32,7 @@ pub const METHODS: &[&str] = &[
     "navigate",
     "snapshot",
     "click",
+    "click_at",
     "fill",
     "hover",
     "select",
@@ -141,6 +143,7 @@ pub async fn dispatch(app: &App, req: Request, session: String) -> Response {
         "navigate" => handle_navigate(app, req.params, &session).await,
         "snapshot" => handle_snapshot(app, req.params, &session).await,
         "click" => handle_click(app, req.params, &session).await,
+        "click_at" => handle_click_at(app, req.params, &session).await,
         "fill" => handle_fill(app, req.params, &session).await,
         "hover" => handle_hover(app, req.params, &session).await,
         "select" => handle_select(app, req.params, &session).await,
@@ -280,6 +283,11 @@ async fn handle_navigate(app: &App, params: Value, session: &str) -> Result<Valu
     };
     tab.set_dialog_policy(dialog_manual);
     tab.ensure_listeners().await;
+    // Visible-browser loop: activate the tab so a headed browser shows the
+    // navigation. Best-effort and headless-harmless (`bring_to_front`
+    // swallows its result, so this can never fail the navigation), and
+    // BEFORE `op_lock` so activation never extends a lock hold.
+    tab.bring_to_front().await;
     let _guard = tab.op_lock.lock().await;
 
     let nav = tab
@@ -480,6 +488,115 @@ async fn handle_click(app: &App, params: Value, session: &str) -> Result<Value, 
         .await?;
 
     Ok(json!({"ok": true, "url": tab.url()}))
+}
+
+/// Sane-bounds cap for `click_at` coordinates (viewport CSS pixels). Mirrors
+/// the `scroll` amount cap (100 000 px): anything larger is a caller bug, not
+/// a viewport.
+pub const MAX_CLICK_AT_COORD: f64 = 100_000.0;
+
+/// Validate raw `click_at` coordinates before any tab or CDP call (fail
+/// closed). Both must be present, finite, and inside `[0, MAX_CLICK_AT_COORD]`.
+/// Pure: unit-tested without a browser.
+pub fn validate_click_at_coords(x: Option<f64>, y: Option<f64>) -> Result<(f64, f64), RpcError> {
+    fn one(name: &str, value: Option<f64>) -> Result<f64, RpcError> {
+        let value = value.ok_or_else(|| {
+            RpcError::new(
+                ErrorCode::Internal,
+                format!("click_at needs a numeric {name} coordinate"),
+                "pass viewport CSS pixels, e.g. {\"x\": 640.0, \"y\": 480.0}; aim with browse_screenshot",
+            )
+        })?;
+        if !value.is_finite() || value < 0.0 || value > MAX_CLICK_AT_COORD {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                format!(
+                    "click_at {name}={value} is out of bounds: expected a finite number in [0, {MAX_CLICK_AT_COORD}]"
+                ),
+                "pass viewport CSS pixels from browse_screenshot; coordinates outside the viewport cannot hit anything",
+            ));
+        }
+        Ok(value)
+    }
+    Ok((one("x", x)?, one("y", y)?))
+}
+
+/// Raw-coordinate click fallback for canvas/exotic widgets that never appear
+/// in the snapshot tree. Same permission as `click` (ownership enforced by
+/// `resolve` + `assert_owned_by`); `resolve` (never `resolve_or_create`) so a
+/// coordinate click can never mint a tab in someone else's session.
+///
+/// NO uid checks, NO occlusion/actionability probe — that is the documented
+/// tradeoff: there is no snapshot node to probe, so the caller aims with
+/// `browse_screenshot` and a covering element will simply receive the click
+/// instead of an ELEMENT_OCCLUDED error. Coordinates travel as CDP numbers
+/// (`DispatchMouseEventParams.x/y`), never interpolated into page JavaScript.
+///
+/// Lock discipline (F gate): `op_lock` is never held across the 20 ms
+/// inter-event pause (unlike `click`, whose sleep-under-lock is a known
+/// violation that is deliberately NOT copied here). The press phase and the
+/// release phase each take the lock separately; ownership is re-asserted
+/// after re-acquiring it.
+async fn handle_click_at(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+    };
+    let parsed: ClickAtParams = rpc::parse_params_owned("click_at", params)?;
+    // Validate everything before any tab or CDP call: coords first, then the
+    // button shape (same accepted set as `click`).
+    let (x, y) = validate_click_at_coords(parsed.x, parsed.y)?;
+    let button = match parsed.button.as_deref().unwrap_or("left") {
+        "left" => MouseButton::Left,
+        "middle" => MouseButton::Middle,
+        "right" => MouseButton::Right,
+        other => {
+            return Err(RpcError::new(
+                ErrorCode::Internal,
+                format!("invalid button {other:?}: expected left, middle or right"),
+                "omit button for a normal left click",
+            ));
+        }
+    };
+    let clicks = parsed.click_count.unwrap_or(1).clamp(1, 3) as i64;
+
+    let tab = app.tabs.resolve(session, parsed.tab_id.as_deref()).await?;
+    tab.assert_owned_by(session)?;
+
+    let mouse = |event: DispatchMouseEventType| {
+        DispatchMouseEventParams::builder()
+            .r#type(event)
+            .x(x)
+            .y(y)
+            .button(button.clone())
+            .click_count(clicks)
+            .build()
+    };
+    let moved = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MouseMoved)
+        .x(x)
+        .y(y)
+        .build()
+        .map_err(RpcError::internal)?;
+
+    // Press phase under the lock; the guard is dropped before any sleep.
+    {
+        let _guard = tab.op_lock.lock().await;
+        tab.assert_owned_by(session)?;
+        tab.exec(moved).await?;
+        tab.exec(mouse(DispatchMouseEventType::MousePressed).map_err(RpcError::internal)?)
+            .await?;
+    }
+    // Inter-event pause with NO lock held (F gate: never sleep under op_lock).
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // Release phase under a fresh lock; ownership re-checked after re-acquire.
+    {
+        let _guard = tab.op_lock.lock().await;
+        tab.assert_owned_by(session)?;
+        tab.exec(mouse(DispatchMouseEventType::MouseReleased).map_err(RpcError::internal)?)
+            .await?;
+    }
+
+    Ok(json!({"ok": true, "x": x, "y": y}))
 }
 
 async fn handle_fill(app: &App, params: Value, session: &str) -> Result<Value, RpcError> {
@@ -1342,6 +1459,58 @@ mod tests {
     }
 
     #[test]
+    fn click_at_coords_validate_before_any_tab_or_cdp() {
+        // Happy path: viewport pixels pass through untouched (CDP numbers,
+        // never interpolated into page JavaScript).
+        let (x, y) = validate_click_at_coords(Some(640.0), Some(480.0)).expect("valid");
+        assert_eq!((x, y), (640.0, 480.0));
+        // Boundary is inclusive on both ends.
+        let (x, y) =
+            validate_click_at_coords(Some(0.0), Some(MAX_CLICK_AT_COORD)).expect("boundary ok");
+        assert_eq!((x, y), (0.0, MAX_CLICK_AT_COORD));
+        // Missing, NaN, infinite, negative and huge all reject with INTERNAL
+        // (protocol v1 additive: no new error codes).
+        for (x, y) in [
+            (None, Some(0.0)),
+            (Some(0.0), None),
+            (None, None),
+            (Some(f64::NAN), Some(0.0)),
+            (Some(0.0), Some(f64::NAN)),
+            (Some(f64::INFINITY), Some(0.0)),
+            (Some(0.0), Some(f64::NEG_INFINITY)),
+            (Some(-1.0), Some(0.0)),
+            (Some(0.0), Some(-0.5)),
+            (Some(MAX_CLICK_AT_COORD + 1.0), Some(0.0)),
+            (Some(0.0), Some(1_000_001.0)),
+        ] {
+            let err = validate_click_at_coords(x, y).expect_err("must reject");
+            assert_eq!(err.code, ErrorCode::Internal);
+        }
+    }
+
+    #[test]
+    fn click_at_uses_the_default_outer_timeout() {
+        // No dedicated arm in `request_timeout_ms`: the default 30 s outer
+        // bound covers the two-shot CDP sequence (no poll loop to budget).
+        assert!(METHODS.contains(&"click_at"));
+        assert_eq!(request_timeout_ms("click_at", &json!({})), 30_000);
+    }
+
+    #[test]
+    fn coordinate_actions_enforce_session_ownership() {
+        // Contract for `handle_click_at` (same boundary as `click`): the
+        // handler resolves with `resolve` (never `resolve_or_create`, so a
+        // coordinate click can never mint a tab in another session) and
+        // enforces `assert_owned_by` before any CDP call. Unit level pins
+        // the error shape; the live resolve path runs against real tabs in
+        // the smoke suite.
+        let err = RpcError::tab_forbidden("tab t9 belongs to session ses_other");
+        assert_eq!(err.code, ErrorCode::TabForbidden);
+        let wire: Value = serde_json::to_value(&err).expect("json");
+        assert_eq!(wire["code"], "TAB_FORBIDDEN");
+    }
+
+    #[test]
     fn every_method_is_routed() {
         // The dispatch table must cover the §2.2 surface: no silent gaps.
         for method in METHODS {
@@ -1352,6 +1521,7 @@ mod tests {
                         | "navigate"
                         | "snapshot"
                         | "click"
+                        | "click_at"
                         | "fill"
                         | "hover"
                         | "select"

@@ -1,5 +1,5 @@
 /**
- * Browser tool surface (plan §Phase 2–3): 19 executors over the daemon RPC.
+ * Browser tool surface (plan §Phase 2–3): 21 executors over the daemon RPC.
  *
  * Effective names come from `options.namespace` (`browse_navigate`, … —
  * see docs/api-notes.md), declared names below are the short suffixes.
@@ -414,6 +414,33 @@ function optionalTabId(input: unknown): Record<string, unknown> {
   return tabId === undefined ? {} : { tab_id: tabId };
 }
 
+/** Upper bound for a raw click coordinate (CSS px). Beyond any real page. */
+export const MAX_CLICK_COORD = 16384;
+
+/** Viewport CSS pixels: finite, in range. Rejects NaN/huge/negative. */
+function coordParam(input: unknown, key: string): number {
+  const value = asRecord(input)[key];
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new ToolError({
+      message: `parameter "${key}" must be a finite number`,
+      metadata: {
+        code: "INTERNAL",
+        hint: `pass "${key}" as viewport CSS pixels, e.g. {"x": 320, "y": 240}, and retry`,
+      },
+    });
+  }
+  if (value < 0 || value > MAX_CLICK_COORD) {
+    throw new ToolError({
+      message: `parameter "${key}" is ${value}, outside 0–${MAX_CLICK_COORD}`,
+      metadata: {
+        code: "INTERNAL",
+        hint: "pass viewport CSS pixels inside the visible page and retry",
+      },
+    });
+  }
+  return value;
+}
+
 /** Upload paths: non-empty absolute strings, capped at the daemon's limit. */
 function pathsParam(input: unknown, key: string): string[] {
   const value = asRecord(input)[key];
@@ -467,7 +494,7 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
   // recovery re-snapshot below.
   const snapshotCache = new Map<string, SnapshotRefNode[]>();
   const cacheKey = (sessionID: string, tabId: string | undefined): string =>
-    `${sessionID} ${tabId ?? ""}`;
+    `${sessionID}\0${tabId ?? ""}`;
 
   const rememberSnapshot = (
     context: ToolContext,
@@ -596,6 +623,7 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
         path,
         ...(typeof width === "number" ? { width } : {}),
         ...(typeof height === "number" ? { height } : {}),
+        hint: `open file://${path} to view`,
       },
     };
   };
@@ -622,6 +650,93 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
         metadata: rawMetadata(result),
       })),
     );
+  };
+
+  /**
+   * Raw-coordinate click: no uid, so no stale-uid recovery applies — a plain
+   * `daemonCall`. Coordinates are validated here (finite, in range); the
+   * daemon performs the CDP mouse click with no occlusion or actionability
+   * checks, which the tool description discloses.
+   */
+  const clickAt: Executor = async (input, context) => {
+    const x = coordParam(input, "x");
+    const y = coordParam(input, "y");
+    const result = await daemonCall(deps, context, "click_at", {
+      x,
+      y,
+      ...optionalTabId(input),
+    });
+    return { content: `clicked ${x},${y}`, metadata: rawMetadata(result) };
+  };
+
+  /**
+   * Snapshot + screenshot in one call. Sequential on the same tab: snapshot
+   * first (also refreshes the stale-uid cache), then the screenshot.
+   * Partial-failure semantics: either half failing fails the whole call. A
+   * failed snapshot attempts no screenshot; a failed screenshot rethrows
+   * labeled with `look_phase` — the unpaired snapshot is never returned as a
+   * success.
+   */
+  const look: Executor = async (input, context) => {
+    const record = asRecord(input);
+    const tabId = stringParam(input, "tab_id");
+    const snap = await daemonCall(deps, context, "snapshot", {
+      ...(tabId === undefined ? {} : { tab_id: tabId }),
+      ...(typeof record["max_nodes"] === "number"
+        ? { max_nodes: record["max_nodes"] }
+        : {}),
+      ...(typeof record["include_ax"] === "boolean"
+        ? { include_ax: record["include_ax"] }
+        : {}),
+    });
+    rememberSnapshot(context, tabId, snap);
+    let shot: unknown;
+    try {
+      shot = await daemonCall(deps, context, "screenshot", {
+        ...(tabId === undefined ? {} : { tab_id: tabId }),
+        ...(typeof record["full_page"] === "boolean"
+          ? { full_page: record["full_page"] }
+          : {}),
+      });
+    } catch (error) {
+      if (error instanceof ToolError) {
+        throw new ToolError({
+          message: `look failed after a good snapshot (screenshot half failed): ${error.message}`,
+          metadata: {
+            ...asRecord(error.metadata),
+            look_phase: "screenshot",
+          },
+        });
+      }
+      throw error;
+    }
+    const path = textField(shot, "path");
+    if (path === undefined) {
+      throw new ToolError({
+        message: "INTERNAL: daemon screenshot returned no path",
+        metadata: {
+          code: "INTERNAL",
+          hint: "retry the look; report a daemon bug if it persists",
+        },
+      });
+    }
+    const width = asRecord(shot)["width"];
+    const height = asRecord(shot)["height"];
+    const hint = `open file://${path} to view`;
+    const formatted = formatSnapshot(snap);
+    return {
+      content: [
+        { type: "text", text: `${formatted.content}\n\n${hint}` },
+        { type: "file", uri: path, mime: "image/png" },
+      ],
+      metadata: {
+        ...formatted.metadata,
+        path,
+        ...(typeof width === "number" ? { width } : {}),
+        ...(typeof height === "number" ? { height } : {}),
+        hint,
+      },
+    };
   };
 
   const fill: Executor = async (input, context) => {
@@ -890,7 +1005,9 @@ export function createExecutors(deps: BrowserDeps): Record<string, Executor> {
     navigate,
     snapshot,
     screenshot,
+    look,
     click,
+    click_at: clickAt,
     fill,
     hover,
     select,
@@ -985,9 +1102,31 @@ export function registerBrowserTools(
     },
     {
       name: "screenshot",
-      description: "Capture the current page as a PNG image.",
+      description:
+        "Capture the current page as a PNG image. The result metadata names the file; open it via the file:// hint.",
       input: schema({
         tab_id: SCHEMA_TAB_ID,
+        full_page: {
+          type: "boolean",
+          description: "Capture the full scrollable page.",
+        },
+      }),
+      options: { ...baseOptions },
+    },
+    {
+      name: "look",
+      description:
+        "Read the page text with [uid] references and capture a screenshot in one call. Both halves must succeed; a failed screenshot fails the call instead of returning an unpaired snapshot.",
+      input: schema({
+        tab_id: SCHEMA_TAB_ID,
+        max_nodes: {
+          type: "number",
+          description: "Max nodes in the tree (default 300).",
+        },
+        include_ax: {
+          type: "boolean",
+          description: "Include the accessibility join.",
+        },
         full_page: {
           type: "boolean",
           description: "Capture the full scrollable page.",
@@ -1006,6 +1145,20 @@ export function registerBrowserTools(
           click_count: { type: "number", description: "1, 2 for double-click." },
         },
         ["uid"],
+      ),
+      options: { ...baseOptions },
+    },
+    {
+      name: "click_at",
+      description:
+        "Click at viewport CSS pixels {x, y} — coordinate fallback for canvas and exotic widgets with no [uid]. Raw coordinates: no occlusion or actionability checks, so prefer browse_click when a uid exists.",
+      input: schema(
+        {
+          x: { type: "number", description: "Horizontal CSS pixel." },
+          y: { type: "number", description: "Vertical CSS pixel." },
+          tab_id: SCHEMA_TAB_ID,
+        },
+        ["x", "y"],
       ),
       options: { ...baseOptions },
     },

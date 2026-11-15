@@ -656,6 +656,16 @@ impl Tab {
         self.eval_json(&js).await
     }
 
+    /// Best-effort tab activation for the visible-browser loop
+    /// (`Page.bringToFront` after navigate resolve). Headless-harmless: a
+    /// headless browser ignores it. Never fails: the result is swallowed so
+    /// activation can never turn a navigation into a NAV_FAILED. Callers
+    /// must invoke this BEFORE acquiring `op_lock` so activation never
+    /// extends a lock hold.
+    pub async fn bring_to_front(&self) {
+        let _ = self.page.bring_to_front().await;
+    }
+
     /// Poll one actionability round until `kind` is satisfied or `timeout`
     /// elapses. Takes NO lock: callers must invoke this BEFORE acquiring
     /// `op_lock` (sleeps never happen under the lock), then re-check

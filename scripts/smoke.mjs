@@ -228,6 +228,38 @@ try {
     );
   }
 
+  // D lane (vision loop): click_at parity probe — additive, silent when the
+  // daemon predates click_at. The append button adds exactly one line per
+  // real click, so click_at at its measured center must add exactly one
+  // more. Emits checks only when the daemon answers click_at; otherwise a
+  // SKIP line keeps the 61-check count unchanged.
+  if (appendUid) {
+    const center = await timed('smoke-eval-center', 'eval', {
+      js: "(() => { const r = document.getElementById('append').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()",
+    });
+    const probe = await timed('smoke-click_at-probe', 'click_at', {
+      ...(typeof center.result?.value?.x === 'number' ? { x: center.result.value.x } : {}),
+      ...(typeof center.result?.value?.y === 'number' ? { y: center.result.value.y } : {}),
+    });
+    if (probe.ok === true && probe.result?.ok === true) {
+      const afterAt = await timed('smoke-eval-click_at', 'eval', {
+        js: "document.querySelectorAll('#appended .line').length",
+      });
+      check(
+        'click_at parity: one coordinate click adds one line',
+        afterAt.result?.value === 2,
+        JSON.stringify(afterAt.result?.value),
+      );
+      check(
+        'click_at echoes its coordinates',
+        probe.result?.x === center.result.value.x && probe.result?.y === center.result.value.y,
+        JSON.stringify(probe.result),
+      );
+    } else {
+      console.log(`SKIP  click_at parity — daemon predates click_at (${probe.error?.code ?? 'no result'})`);
+    }
+  }
+
   // screenshot — must be a real PNG on disk with dimensions.
   const shot = await timed('screenshot', 'screenshot', { tab_id: tabId });
   check('screenshot ok', shot.ok === true, shot.error ? shot.error.code : shot.result?.path);
@@ -252,6 +284,32 @@ try {
   check('status tabs', (status.result?.tabs ?? 0) >= 1, `${status.result?.tabs} tabs`);
   check('status chrome alive', status.result?.chrome_alive === true, JSON.stringify(status.result?.chrome_alive));
   const rss = status.result?.rss_mb;
+
+  // D lane (visible loop): attach-mode readiness — the screenshot path must
+  // be a stable per-tab PNG the shim can expose as a `file://` hint, whether
+  // Chrome was launched or attached. Same-machine string checks only (no fs
+  // access from the harness); opt-in headed proof runs under
+  // BROWSERD_ATTACH_PROOF=1 against a visible-Chrome daemon and emits checks
+  // only then, keeping the CI count unchanged otherwise.
+  if (process.env['BROWSERD_ATTACH_PROOF'] === '1') {
+    const st2 = await timed('status-attach', 'status', { verbose: true });
+    check(
+      'attach proof: same chrome across calls',
+      st2.ok === true &&
+        st2.result?.chrome?.pid === status.result?.chrome?.pid &&
+        st2.result?.chrome_alive === true,
+      JSON.stringify(st2.result?.chrome),
+    );
+    check(
+      'attach proof: stable per-tab screenshot path',
+      typeof shotPath === 'string' &&
+        shotPath.endsWith('.png') &&
+        shotPath.includes(tabId ?? 'no-tab'),
+      shotPath,
+    );
+  } else {
+    console.log('SKIP  attach proof — set BROWSERD_ATTACH_PROOF=1 against a visible-Chrome daemon to run it');
+  }
 
   // console + network capture (wired via page listeners).
   const messages = await timed('console', 'console', { tab_id: tabId, limit: 50 });

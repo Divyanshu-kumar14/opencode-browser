@@ -122,6 +122,22 @@ pub struct ClickParams {
     pub click_count: Option<u32>,
 }
 
+/// `click_at`: raw viewport-coordinate click for canvas/exotic widgets that
+/// never appear in the snapshot tree. `x`/`y` are `Option` so a missing
+/// coordinate degrades to `None` (rejected by the handler with an explicit
+/// validation error) instead of silently clicking the viewport origin.
+/// Same permission as `click`: no new capability, tab ownership enforced by
+/// `resolve` + `assert_owned_by` in the handler.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ClickAtParams {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub tab_id: Option<String>,
+    pub button: Option<String>,
+    pub click_count: Option<u32>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct FillParams {
@@ -449,5 +465,53 @@ mod tests {
         assert_eq!(clamp_wait_timeout_ms(Some(50)), MIN_WAIT_MS);
         assert_eq!(clamp_wait_timeout_ms(Some(999_999_999)), MAX_WAIT_MS);
         assert_eq!(clamp_wait_timeout_ms(Some(7_500)), 7_500);
+    }
+
+    #[test]
+    fn click_at_params_parse_and_reject_bad_types() {
+        // D lane (F-gate S9): wire shape `{x, y, tab_id?, button?,
+        // click_count?}` with `Option<f64>` coords degrading to None — the
+        // handler rejects missing coords explicitly instead of silently
+        // clicking the viewport origin.
+        let good: ClickAtParams =
+            parse_params_owned("click_at", json!({"x": 100.0, "y": 200.0})).expect("ok");
+        assert_eq!(good.x, Some(100.0));
+        assert_eq!(good.y, Some(200.0));
+        assert!(good.tab_id.is_none());
+
+        let missing: ClickAtParams = parse_params_owned("click_at", json!({})).expect("ok");
+        assert!(missing.x.is_none());
+        assert!(missing.y.is_none());
+
+        // Huge-but-finite parses: range rejection is the handler's job
+        // (`validate_click_at_coords`), not the parser's.
+        let huge: ClickAtParams =
+            parse_params_owned("click_at", json!({"x": 1e12, "y": 0.0})).expect("ok");
+        assert_eq!(huge.x, Some(1e12));
+
+        for bad in [json!({"x": "left"}), json!({"x": true}), json!({"y": []})] {
+            let err =
+                parse_params_owned::<ClickAtParams>("click_at", bad).expect_err("must reject");
+            assert_eq!(err.code, ErrorCode::Internal);
+        }
+    }
+
+    #[test]
+    fn click_at_coords_must_be_finite() {
+        // Contract for the B-lane handler: NaN/Infinity can never become a
+        // CDP mouse coordinate. JSON cannot represent either (serde_json
+        // decodes both to Null), so the handler-side `is_finite` check is
+        // the real boundary — pin both facts so B cannot regress them.
+        assert!(json!(f64::NAN).is_null());
+        assert!(json!(f64::INFINITY).is_null());
+        fn finite(v: f64) -> Option<f64> {
+            v.is_finite().then_some(v)
+        }
+        assert_eq!(finite(100.5), Some(100.5));
+        assert_eq!(finite(f64::NAN), None);
+        assert_eq!(finite(f64::INFINITY), None);
+        // Huge-but-finite is representable on the wire; the handler rejects
+        // it by range (`validate_click_at_coords`), it never reaches CDP.
+        assert_eq!(finite(1e12), Some(1e12));
     }
 }

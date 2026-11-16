@@ -21,7 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { BrowserSessionManager } from "../src/core/session-manager.ts";
 import { execute as navigateExec } from "../src/tools/navigate.ts";
-import { execute as interactExec } from "../src/tools/interact.ts";
+import { execute as interactExec, schema as interactSchema } from "../src/tools/interact.ts";
 import { execute as snapshotExec } from "../src/tools/snapshot.ts";
 import { execute as inspectExec } from "../src/tools/inspect.ts";
 import { execute as viewportExec } from "../src/tools/viewport.ts";
@@ -173,8 +173,16 @@ describe("perception-action engine e2e", () => {
       console.warn(`SKIP: chromium did not launch: ${launchError}`);
       return;
     }
+    // Batch form intentionally: per-action zod validation used to strip
+    // toX/toY, silently breaking drag inside `actions[]`.
+    const parsed = interactSchema.parse({
+      actions: [{ type: "drag", x: 60, y: 120, toX: 260, toY: 220 }],
+    });
+    const first = parsed.actions?.[0];
+    expect(first?.toX).toBe(260);
+    expect(first?.toY).toBe(220);
     const res = await interactExec(
-      { type: "drag", x: 60, y: 120, toX: 260, toY: 220 },
+      { actions: [{ type: "drag", x: 60, y: 120, toX: 260, toY: 220 }] },
       { sessionManager: manager, screenshotDir: shotDir },
     );
     expect(res.metadata?.["stoppedAt"]).toBeNull();
@@ -218,6 +226,20 @@ describe("perception-action engine e2e", () => {
       return !!g["document"].getElementById("opencode-som-overlay");
     });
     expect(overlay).toBe(false);
+  });
+
+  test("plain snapshot still writes a screenshot", async () => {
+    if (!manager) {
+      console.warn(`SKIP: chromium did not launch: ${launchError}`);
+      return;
+    }
+    const res = await snapshotExec(
+      { annotate: false },
+      { sessionManager: manager, screenshotDir: shotDir },
+    );
+    const shot = res.metadata?.["screenshotPath"] as string | null;
+    expect(shot).toBeTruthy();
+    expect(fs.existsSync(shot!)).toBe(true);
   });
 
   test("viewport + inspect + eval round-trip", async () => {

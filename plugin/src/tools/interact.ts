@@ -35,6 +35,8 @@ const ActionSchema = z.object({
   pressEnter: z.boolean().optional().default(false).describe("Press Enter after typing"),
   scrollDirection: z.enum(["up", "down", "left", "right"]).optional(),
   scrollAmount: z.number().optional().describe("Scroll pixels"),
+  toX: z.number().optional().describe("Drag end x (viewport CSS px, required for drag)"),
+  toY: z.number().optional().describe("Drag end y (viewport CSS px, required for drag)"),
 });
 
 export type Input = z.infer<typeof schema>;

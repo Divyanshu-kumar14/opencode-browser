@@ -160,6 +160,10 @@ export async function execAction(page: Page, action: Action): Promise<void> {
       if (loc) {
         await loc.focus();
         await loc.pressSequentially(action.text ?? "");
+      } else {
+        // No explicit target: type into whatever already holds focus (canvas
+        // text editors, contenteditable regions, custom widgets).
+        await page.keyboard.type(action.text ?? "");
       }
       if (action.pressEnter) await page.keyboard.press("Enter");
       break;
@@ -287,15 +291,17 @@ export async function capturePerception(
   let width: number | null = null;
   let height: number | null = null;
 
+  // Always capture: annotate:false means a clean screenshot, not no screenshot.
+  // Screenshot hygiene: hide HUD, optionally render SoM badges, capture,
+  // remove the overlay, restore the HUD.
+  await page
+    .evaluate(() => {
+      const w = globalThis as unknown as Record<string, any>;
+      const h = w["__opencodeHud"];
+      if (h) h.hide();
+    })
+    .catch(() => undefined);
   if (opts.annotate !== false) {
-    // Screenshot hygiene: hide HUD, render SoM badges, capture, remove overlay, restore HUD.
-    await page
-      .evaluate(() => {
-        const w = globalThis as unknown as Record<string, any>;
-        const h = w["__opencodeHud"];
-        if (h) h.hide();
-      })
-      .catch(() => undefined);
     await page
       .evaluate(() => {
         const w = globalThis as unknown as Record<string, any>;
@@ -303,12 +309,14 @@ export async function capturePerception(
         if (s) s.renderSoMOverlay();
       })
       .catch(() => undefined);
+  }
 
-    const buffer = await page.screenshot({ fullPage: opts.fullPage ?? false });
-    const vp = page.viewportSize();
-    width = vp?.width ?? null;
-    height = vp?.height ?? null;
+  const buffer = await page.screenshot({ fullPage: opts.fullPage ?? false });
+  const vp = page.viewportSize();
+  width = vp?.width ?? null;
+  height = vp?.height ?? null;
 
+  if (opts.annotate !== false) {
     await page
       .evaluate(() => {
         const w = globalThis as unknown as Record<string, any>;
@@ -316,16 +324,16 @@ export async function capturePerception(
         if (s) s.removeSoMOverlay();
       })
       .catch(() => undefined);
-    await page
-      .evaluate(() => {
-        const w = globalThis as unknown as Record<string, any>;
-        const h = w["__opencodeHud"];
-        if (h) h.show();
-      })
-      .catch(() => undefined);
-
-    screenshotPath = await savePng(buffer, opts.screenshotDir);
   }
+  await page
+    .evaluate(() => {
+      const w = globalThis as unknown as Record<string, any>;
+      const h = w["__opencodeHud"];
+      if (h) h.show();
+    })
+    .catch(() => undefined);
+
+  screenshotPath = await savePng(buffer, opts.screenshotDir);
 
   // Delta drain: only telemetry generated since the last tool call.
   const drained = telemetry.drain();

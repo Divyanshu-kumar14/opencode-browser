@@ -168,6 +168,18 @@ describe("perception-action engine e2e", () => {
     expect(value).toBe("agent@work.com");
   });
 
+  test("interact drag completes a real mouse drag", async () => {
+    if (!manager) {
+      console.warn(`SKIP: chromium did not launch: ${launchError}`);
+      return;
+    }
+    const res = await interactExec(
+      { type: "drag", x: 60, y: 120, toX: 260, toY: 220 },
+      { sessionManager: manager, screenshotDir: shotDir },
+    );
+    expect(res.metadata?.["stoppedAt"]).toBeNull();
+  });
+
   test("telemetry delta captures console.error + failed fetch", async () => {
     if (!manager) {
       console.warn(`SKIP: chromium did not launch: ${launchError}`);

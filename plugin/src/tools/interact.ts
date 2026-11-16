@@ -24,7 +24,7 @@ import { buildPagePayload } from "../utils/formatter.ts";
 const ActionSchema = z.object({
   type: z.enum([
     "click", "double_click", "right_click", "type", "clear_and_type",
-    "press_key", "hover", "select_option", "scroll", "wait",
+    "press_key", "hover", "select_option", "scroll", "drag", "wait",
   ]),
   elementId: z.number().int().positive().optional().describe("[1..N] element id from the element map"),
   selector: z.string().optional().describe("CSS fallback selector"),
@@ -52,11 +52,14 @@ export const schema = z.object({
   pressEnter: ActionSchema.shape.pressEnter.optional(),
   scrollDirection: ActionSchema.shape.scrollDirection.optional(),
   scrollAmount: ActionSchema.shape.scrollAmount.optional(),
+  toX: z.number().optional().describe("Drag end x (viewport CSS px, required for drag)"),
+  toY: z.number().optional().describe("Drag end y (viewport CSS px, required for drag)"),
 });
 
 export const description =
   "Interact with the page by [1..N] elementId (preferred), CSS selector, or coordinates. " +
-  "Pass `actions` to batch fill+submit in a single turn. Stale-ID recovery stops a batch " +
+  "Pass `actions` to batch fill+submit in a single turn. Drag with type `drag` from the " +
+  "start point (elementId/selector/x/y) to toX/toY. Stale-ID recovery stops a batch " +
   "cleanly if a target detaches. Returns the refreshed element map, annotated screenshot, " +
   "and any new console/network errors.";
 
@@ -77,6 +80,8 @@ function toAction(input: Input): Action {
     pressEnter: input.pressEnter,
     scrollDirection: input.scrollDirection,
     scrollAmount: input.scrollAmount,
+    toX: input.toX,
+    toY: input.toY,
   };
   return action;
 }

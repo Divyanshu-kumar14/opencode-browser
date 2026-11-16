@@ -28,6 +28,7 @@ export type ActionType =
   | "hover"
   | "select_option"
   | "scroll"
+  | "drag"
   | "wait";
 
 export interface Action {
@@ -41,6 +42,9 @@ export interface Action {
   readonly pressEnter?: boolean;
   readonly scrollDirection?: "up" | "down" | "left" | "right";
   readonly scrollAmount?: number;
+  /** Drag end point (viewport CSS px). Required for type "drag". */
+  readonly toX?: number;
+  readonly toY?: number;
 }
 
 export interface BatchResult {
@@ -201,6 +205,19 @@ export async function execAction(page: Page, action: Action): Promise<void> {
       else if (dir === "right") dx = amount;
       if (center) await page.mouse.wheel(dx, dy);
       else await page.mouse.wheel(dx, dy);
+      break;
+    }
+    case "drag": {
+      if (center) await hudCursor(page, center.x, center.y);
+      const start = center ?? { x: 0, y: 0 };
+      if (action.toX === undefined || action.toY === undefined) {
+        throw new Error("browse_interact: `drag` requires `toX` and `toY` (viewport CSS px)");
+      }
+      await page.mouse.move(start.x, start.y);
+      await page.mouse.down();
+      await page.mouse.move(action.toX, action.toY, { steps: 12 });
+      await page.mouse.up();
+      await hudRipple(page, action.toX, action.toY);
       break;
     }
     case "wait": {

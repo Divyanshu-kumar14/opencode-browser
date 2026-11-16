@@ -76,7 +76,7 @@ const specs: {
           properties: {
             type: {
               type: "string",
-              description: "click | double_click | right_click | type | clear_and_type | press_key | hover | select_option | scroll | wait",
+              description: "click | double_click | right_click | type | clear_and_type | press_key | hover | select_option | scroll | drag | wait",
             },
             elementId: { type: "number", description: "[1..N] element id from the element map" },
             selector: { type: "string", description: "CSS fallback selector" },
@@ -87,6 +87,8 @@ const specs: {
             pressEnter: { type: "boolean", description: "Press Enter after typing" },
             scrollDirection: { type: "string", description: "up | down | left | right" },
             scrollAmount: { type: "number", description: "Scroll pixels" },
+            toX: { type: "number", description: "Drag end x (viewport CSS px)" },
+            toY: { type: "number", description: "Drag end y (viewport CSS px)" },
           },
           additionalProperties: false,
         },

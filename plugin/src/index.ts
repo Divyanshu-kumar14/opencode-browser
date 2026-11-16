@@ -26,15 +26,49 @@ import { registerBrowserTools } from "./tools/index.ts";
 
 const NAMESPACE = "browse";
 
+/**
+ * The host re-instantiates plugins many times per server process (292 loads
+ * observed in one afternoon, ~9/minute during active turns). A per-setup
+ * manager meant every disposal closed the shared Chromium — i.e. one browser
+ * open/close per agent step. The browser session therefore lives on
+ * `globalThis`, shared by every plugin instance, and only process teardown
+ * (SIGINT/SIGTERM) closes it.
+ */
+const MANAGER_KEY = Symbol.for("opencode.browser.session-manager");
+const TEARDOWN_KEY = Symbol.for("opencode.browser.teardown-armed");
+
+interface ManagerSlot {
+  [MANAGER_KEY]?: BrowserSessionManager;
+  [TEARDOWN_KEY]?: boolean;
+}
+
+function globalSlot(): ManagerSlot {
+  return globalThis as unknown as ManagerSlot;
+}
+
+function getSessionManager(): BrowserSessionManager {
+  const slot = globalSlot();
+  const existing = slot[MANAGER_KEY];
+  if (existing && typeof existing.ensureActivePage === "function") return existing;
+  const created = new BrowserSessionManager();
+  slot[MANAGER_KEY] = created;
+  return created;
+}
+
 export default Plugin.define({
   id: "browser",
 
   async setup(ctx) {
     const config = loadConfig();
-    const sessionManager = new BrowserSessionManager();
+    const sessionManager = getSessionManager();
 
-    // Graceful teardown: never leave zombie Chromium behind.
-    sessionManager.registerTeardown();
+    // Graceful teardown: never leave zombie Chromium behind. Arm the signal
+    // handlers once per process, not once per plugin instance.
+    const slot = globalSlot();
+    if (!slot[TEARDOWN_KEY]) {
+      sessionManager.registerTeardown();
+      slot[TEARDOWN_KEY] = true;
+    }
 
     const deps = {
       sessionManager,
@@ -59,7 +93,9 @@ export default Plugin.define({
 
     return () => {
       registration.dispose();
-      void sessionManager.close().catch(() => undefined);
+      // Intentionally do NOT close the browser: the next plugin instance (or
+      // the next turn) reuses the same process-global session. Closing here is
+      // what caused a fresh Chromium launch on every agent step.
     };
   },
 });

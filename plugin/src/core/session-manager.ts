@@ -61,6 +61,13 @@ export class BrowserSessionManager {
 
   /** Ensure a browser + context exist and return the active page (creating one if needed). */
   async ensureActivePage(): Promise<Page> {
+    // A manager that was closed (or whose plugin instance was disposed) can be
+    // reused: clear the terminal flag so relaunch, viewport sync and teardown
+    // all work again. The browser is process-global, not per plugin instance.
+    if (this.closed) {
+      this.closed = false;
+      this.deathWatchArmed = false;
+    }
     if (this.activePage && !this.activePage.isClosed()) {
       await this.maybeSyncViewport(this.activePage);
       return this.activePage;

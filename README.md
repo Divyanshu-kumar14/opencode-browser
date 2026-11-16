@@ -115,6 +115,15 @@ Every mutating tool runs the closed loop:
 drain telemetry → formatted payload`, and screenshots are saved under
 `.opencode/browser-screenshots/` (temp PNG + `{type:"file"}` attachment).
 
+**Browser lifetime is process-global, not plugin-instance-global.** The host
+re-instantiates plugins many times per server process (observed ~300 loads in an
+afternoon, roughly one per agent step), and dispose callbacks are not a safe
+place to close shared resources. `BrowserSessionManager` therefore lives on
+`globalThis` under a `Symbol.for` key: every plugin instance reuses the same
+browser/context/pages, tool registration is the only thing disposed on reload,
+and Chromium is closed only on `SIGINT`/`SIGTERM`/`beforeExit`. Consecutive
+`browse_*` calls share one tab, one profile, and one login state.
+
 | Tool | What it does | Returns |
 |---|---|---|
 | `browse_navigate` | goto / back / forward / reload, then settle + perceive | element map + screenshot + telemetry |

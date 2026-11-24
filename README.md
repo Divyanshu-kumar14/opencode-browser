@@ -19,7 +19,7 @@
 
 | 👁 Observe cheaply | 🖱 Act reliably | 🛡 Fail loudly |
 |---|---|---|
-| Compact `[1..N]` element maps — a page costs hundreds of tokens, not a DOM dump | Auto-wait, occlusion filtering, real input events, stale-id batch recovery | Deterministic settle, typed tool errors, and a CI gate that refuses to pass without Chromium |
+| Compact `[1..N]` element maps — a page costs hundreds of tokens, not a DOM dump | Auto-wait, occlusion filtering, real input events, stale-id batch recovery | Deterministic settle, typed tool errors, and a CI gate that runs against real Chromium |
 
 ## 🏗 Architecture
 
@@ -182,7 +182,7 @@ node scripts/smoke.mjs                    # daemon smoke against the fixture
 
 CI runs five jobs: Rust checks, the engine suite (with `OPENCODE_BROWSER_E2E=1`), the quarantined
 legacy suite, a pack-content/size smoke that installs and imports the packed entry, and the daemon
-fixture smoke. A browser test that cannot launch fails the engine job instead of reporting green.
+fixture smoke.
 
 ## 📦 Packaging
 
@@ -206,7 +206,7 @@ plugin no longer registers it. Both live in-tree for reference and benchmarking:
 | Symptom | Fix |
 |---|---|
 | `chromium did not launch` | Install Chromium or set `OPENCODE_BROWSER_EXECUTABLE_PATH`; run `google-chrome --headless=new about:blank` by hand |
-| In CI, tests skip instead of failing | Set `OPENCODE_BROWSER_E2E=1` |
+| In CI, tests skip unless the gate is open | Set `OPENCODE_BROWSER_E2E=1` |
 | Blank or stale element map | The page may be cross-origin or empty; take `browse_snapshot` and check the screenshot |
 | `INVALID_INPUT` | A parameter failed the advertised zod schema — read the message and retry |
 | Screenshot missing from the result | Check `OPENCODE_BROWSER_SCREENSHOT_DIR` is writable |

@@ -47,7 +47,7 @@ function fakeDeps(options: {
   scripts?: Record<string, Script>;
   sequences?: Record<string, Script[]>;
   calls?: { method: string; params: Record<string, unknown> }[];
-  assertResources?: string[][];
+  assertResources?: (readonly string[])[];
   denyPermission?: boolean;
 } = {}): BrowserDeps {
   const calls = options.calls ?? [];
@@ -86,7 +86,7 @@ function fakeDeps(options: {
       assert: async (input: {
         sessionID: string;
         action: string;
-        resources: string[];
+        resources: readonly string[];
       }) => {
         assertResources.push(input.resources);
         if (options.denyPermission === true) {
@@ -211,7 +211,7 @@ describe("executors", () => {
 
   test("eval asserts browser_eval with the tab URL, then evaluates", async () => {
     const calls: { method: string; params: Record<string, unknown> }[] = [];
-    const assertResources: string[][] = [];
+    const assertResources: (readonly string[])[] = [];
     const deps = fakeDeps({ calls, assertResources });
     const out = await createExecutors(deps)["eval"]?.(
       { js: "document.title", await_promise: true },
@@ -523,7 +523,7 @@ describe("interaction executors", () => {
 
   test("upload asserts browser_upload with the paths, then uploads", async () => {
     const calls: { method: string; params: Record<string, unknown> }[] = [];
-    const assertResources: string[][] = [];
+    const assertResources: (readonly string[])[] = [];
     const deps = fakeDeps({
       calls,
       assertResources,

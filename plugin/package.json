@@ -7,12 +7,12 @@
   },
   "files": [
     "src",
-    "prebuilds",
     "README.md"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test --path-ignore-patterns 'legacy/**'",
+    "test:legacy": "bun test legacy"
   },
   "dependencies": {
     "@opencode/plugin": "2.3.0",

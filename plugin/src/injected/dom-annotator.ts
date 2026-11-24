@@ -10,7 +10,7 @@
  * efficiency, and tags DOM nodes with `data-opencode-id` for fast lookup.
  */
 
-export const DOM_ANNOTATOR_SCRIPT = (() => {
+export function makeDomAnnotatorScript(maxElements = 100): string {
   const script = `
 (function(){
   if (window.__opencodeSom) return;
@@ -20,7 +20,7 @@ export const DOM_ANNOTATOR_SCRIPT = (() => {
   } catch {
     return;
   }
-  const MAX_ELEMENTS = 100;
+  const MAX_ELEMENTS = ${maxElements};
   const LABEL_MAX = 60;
   const SELECTOR =
     'a[href],button,input:not([type="hidden"]),textarea,select,summary,details,' +
@@ -295,4 +295,7 @@ export const DOM_ANNOTATOR_SCRIPT = (() => {
 })();
 `;
   return script;
-})();
+}
+
+/** Default annotator (100-element cap) for callers that do not override it. */
+export const DOM_ANNOTATOR_SCRIPT = makeDomAnnotatorScript();

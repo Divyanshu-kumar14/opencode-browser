@@ -1,5 +1,8 @@
 # API notes — Phase 0 (OpenCode V2 plugin conformance)
 
+> **Note (2026-11-24):** paths in this dated review reflect the code at review time. The Rust-daemon shim (rpc, supervisor, tools, driver) has since moved to `plugin/legacy/` and is no longer registered by the engine.
+
+
 **Date:** 2026-11-14/15 · **Installed server:** `opencode v2.2.7` (`opencode2` binary)
 · **SDK in `plugin/`:** `@opencode/plugin@2.3.0` (pinned exact) · **Model used for E2E:**
 `opencode/deepseek-v4.1-flash-free`, `opencode/beam-free` (free-tier; others hit quota)

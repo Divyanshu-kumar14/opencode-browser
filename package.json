@@ -1,25 +1,30 @@
 {
   "name": "opencode-browser",
   "version": "0.1.0",
-  "description": "Browser automation plugin for OpenCode: TypeScript shim + Rust CDP daemon (Linux x64)",
+  "description": "Browser automation for OpenCode: a Playwright perception-action engine (Set-of-Mark ids, annotated screenshots, deterministic settling)",
   "type": "module",
   "exports": {
     ".": "./plugin/src/index.ts"
   },
   "files": [
-    "plugin",
-    "prebuilds",
+    "plugin/src",
     "README.md"
   ],
   "scripts": {
     "build:native": "node scripts/build-native.mjs",
     "bench": "node scripts/bench.mjs",
     "bench:mock": "node scripts/bench.mjs --mock",
-    "test": "cargo test --manifest-path daemon/Cargo.toml && cd plugin && bun test",
+    "test": "cd plugin && bun run test",
+    "test:legacy": "cd plugin && bun run test:legacy",
+    "test:all": "cargo test --manifest-path daemon/Cargo.toml && cd plugin && bun run test && bun run test:legacy",
     "typecheck": "cd plugin && ./node_modules/.bin/tsc --noEmit"
   },
+  "dependencies": {
+    "@opencode/plugin": "2.3.0",
+    "playwright": "^1.65.1",
+    "zod": "^4.6.7"
+  },
   "engines": {
-    "node": ">=22",
     "bun": ">=1.4.4"
   },
   "os": [

@@ -1,5 +1,8 @@
 # Re-review Gate — plugin/ + daemon/ vs docs/review.md P0-1..P0-5 + P1-1..P1-7
 
+> **Note (2026-11-24):** paths in this dated review reflect the code at review time. The Rust-daemon shim (rpc, supervisor, tools, driver) has since moved to `plugin/legacy/` and is no longer registered by the engine.
+
+
 **Reviewer:** Agent-E2 (read-only) · **Date:** 2026-11-15
 **Scope:** `daemon/src/**`, `plugin/src/**` vs prior `docs/review.md` verdict (NOT READY)
 **Deltas since prior review:** `daemon/src/main.rs` + `dispatch.rs` + `snapshot.rs` + `policy.rs` implemented; listener race fixed (`tabs.rs::ensure_listeners` awaited in `navigate`/`eval`, subscribe-before-pump, `ready` flag) + `dispatch.rs`; orphans `server/`/`actions/`/`capture.rs` deleted (confirmed: no `mod actions|capture|server` refs; `daemon/src/` contains exactly `main, dispatch, policy, snapshot, tabs, chrome, frame, paths, rpc, error`).

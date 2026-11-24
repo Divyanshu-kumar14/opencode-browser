@@ -199,7 +199,7 @@ describe("attach auto-detect (D lane, C supervisor)", () => {
       return Response.json({ webSocketDebuggerUrl: WS_URL });
     }});
     const redirect = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
-      return Response.redirect(destination.url);
+      return Response.redirect(destination.url.toString());
     }});
     try {
       expect(await probeAttachTarget(redirect.url.toString())).toBeNull();

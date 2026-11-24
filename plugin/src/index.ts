@@ -20,7 +20,7 @@
  */
 
 import { Plugin } from "@opencode/plugin";
-import { loadConfig } from "./config.ts";
+import { PlaywrightBrowserSession } from "./core/browser-session.ts";
 import { BrowserSessionManager } from "./core/session-manager.ts";
 import { registerBrowserTools } from "./tools/index.ts";
 
@@ -35,11 +35,9 @@ const NAMESPACE = "browse";
  * (SIGINT/SIGTERM) closes it.
  */
 const MANAGER_KEY = Symbol.for("opencode.browser.session-manager");
-const TEARDOWN_KEY = Symbol.for("opencode.browser.teardown-armed");
 
 interface ManagerSlot {
   [MANAGER_KEY]?: BrowserSessionManager;
-  [TEARDOWN_KEY]?: boolean;
 }
 
 function globalSlot(): ManagerSlot {
@@ -59,20 +57,14 @@ export default Plugin.define({
   id: "browser",
 
   async setup(ctx) {
-    const config = loadConfig();
     const sessionManager = getSessionManager();
 
-    // Graceful teardown: never leave zombie Chromium behind. Arm the signal
-    // handlers once per process, not once per plugin instance.
-    const slot = globalSlot();
-    if (!slot[TEARDOWN_KEY]) {
-      sessionManager.registerTeardown();
-      slot[TEARDOWN_KEY] = true;
-    }
+    // Graceful teardown: never leave zombie Chromium behind. registerTeardown
+    // is idempotent, so every plugin instance can call it safely.
+    sessionManager.registerTeardown();
 
     const deps = {
-      sessionManager,
-      screenshotDir: config.screenshotDir,
+      session: new PlaywrightBrowserSession(sessionManager),
     };
 
     const registration = await ctx.tool.transform((editor) => {

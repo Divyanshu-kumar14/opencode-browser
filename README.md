@@ -2,59 +2,75 @@
 
 # 🌐 opencode-browser
 
-**Browser automation for OpenCode, built for agents** — one warm Chromium, token-cheap snapshots, safety by construction.
+**Browser automation for OpenCode, built for agents** — one warm Chromium, token-cheap perception, real mouse and keyboard.
 
 [![CI](https://github.com/Divyanshu-kumar14/opencode-browser/actions/workflows/ci.yml/badge.svg)](https://github.com/Divyanshu-kumar14/opencode-browser/actions/workflows/ci.yml)
 [![Linux x64](https://img.shields.io/badge/OS-Linux%20x64-blue)](https://github.com/Divyanshu-kumar14/opencode-browser)
 [![OpenCode V2](https://img.shields.io/badge/OpenCode-V2%20plugin-purple)](https://github.com/Divyanshu-kumar14/opencode-browser)
-[![Tools](https://img.shields.io/badge/tools-22-green)](https://github.com/Divyanshu-kumar14/opencode-browser#--tools)
+[![Tools](https://img.shields.io/badge/tools-6-green)](https://github.com/Divyanshu-kumar14/opencode-browser#-tools)
 
-[🚀 Quickstart](#-quickstart) · [🧰 Tools](#-tools) · [🔒 Security](#-security) · [🛠 Development](#-development)
+[🚀 Quickstart](#-quickstart) · [🧰 Tools](#-tools) · [🏗 Architecture](#-architecture) · [🛠 Development](#-development)
 
-**Status: v1 on Linux x64.** Full tool surface implemented, 61-check smoke suite green, CI green. macOS/Windows are post-v1.
+**Status: v1 on Linux x64.** Six engine tools, a real-Chromium e2e suite, and a quarantined legacy shim. macOS/Windows are post-v1.
 
 </div>
 
 ## 👀 At a glance
 
-<div align="center">
-
-| 👁 Observe cheaply | 🖱 Act reliably | 🛡 Stay safe |
+| 👁 Observe cheaply | 🖱 Act reliably | 🛡 Fail loudly |
 |---|---|---|
-| Compact snapshots with stable `[uid]` refs — pages cost hundreds of tokens, not DOM dumps | Auto-wait, occlusion checks, exactly-once stale-uid retry, typed timeouts | Session-owned tabs, permission-gated eval/upload, secrets redacted at capture |
+| Compact `[1..N]` element maps — a page costs hundreds of tokens, not a DOM dump | Auto-wait, occlusion filtering, real input events, stale-id batch recovery | Deterministic settle, typed tool errors, and a CI gate that refuses to pass without Chromium |
 
-</div>
-
-## 🏗 How it works
+## 🏗 Architecture
 
 ```mermaid
 flowchart LR
-    A["🤖 Agent\nOpenCode session"] -->|"browse_* tools"| B["Shim\nTypeScript plugin"]
-    B -->|"NDJSON · Unix socket\n0700 dir · 0600 socket"| C["browserd\nRust daemon"]
-    C -->|"CDP"| D[("One shared Chromium\ndaemon-owned profile")]
-    B -.->|"dies? respawn ≤2s"| C
+    A["🤖 Agent\nOpenCode session"] -->|"browse_* tools"| B["Plugin\nTypeScript + Playwright"]
+    B -->|"CDP"| C[("One shared Chromium\npersistent profile")]
 ```
 
-The shim translates tool calls into daemon RPCs. The daemon owns exactly one Chromium, multiplexes session tabs onto it (max 8, LRU, 10-minute leases), and survives OpenCode restarts.
+The plugin owns one browser per OpenCode process. Every tool call is a **turn** through one seam:
 
-A typical round-trip:
-
-```mermaid
-sequenceDiagram
-    participant Agent
-    participant Shim as Plugin shim
-    participant Daemon as browserd
-    participant Chrome as Chromium
-    Agent->>Shim: browse_snapshot
-    Shim->>Daemon: snapshot {tab}
-    Daemon->>Chrome: DOM + accessibility tree
-    Chrome-->>Daemon: nodes
-    Daemon-->>Shim: compact tree with [uids]
-    Shim-->>Agent: g7-1 Email · g7-3 Sign in…
-    Agent->>Shim: browse_click uid=g7-3
-    Shim->>Daemon: click (occlusion + actionability checked)
-    Daemon->>Chrome: real mouse click
+```text
+ensure active page → intent → settle (mutating turns) → perceive
+  → annotated screenshot → telemetry delta → format → attach file → clear HUD
 ```
+
+Tool handlers map input to a `TurnRequest`; `PlaywrightBrowserSession` executes it and formats
+the one payload shape every tool returns. Because the loop lives in one place, the same
+guarantees hold for navigate, interact, snapshot, inspect, viewport, and eval:
+
+- the element map is always re-indexed after the turn;
+- every screenshot is written once and attached to the result;
+- `Settled:` reflects the real settle result;
+- console/network deltas are drained exactly once per successful turn (a failed turn leaves
+  them for the next response);
+- the HUD is cleared on success **and** failure;
+- a tab switch is reported on the next response.
+
+**Browser lifetime is process-global, not plugin-instance-global.** OpenCode re-instantiates
+plugins many times per server process, so `BrowserSessionManager` lives on `globalThis` under a
+`Symbol.for` key. Every plugin instance reuses the same browser, context, and pages; Chromium is
+closed only on `SIGINT`/`SIGTERM`/`beforeExit`. Consecutive `browse_*` calls share one tab, one
+profile, and one login state.
+
+### Module map
+
+| Path | Responsibility |
+|---|---|
+| `plugin/src/index.ts` | Plugin entry; registers the six tools against a process-global manager |
+| `plugin/src/core/browser-session.ts` | The turn seam: Playwright adapter and the one closed loop |
+| `plugin/src/core/session-manager.ts` | Browser/context/tab lifetime, viewport sync, teardown |
+| `plugin/src/core/turn.ts` | `TurnRequest`, `TurnOutcome`, and the single result formatter |
+| `plugin/src/core/action-engine.ts` | Action batches, stale-id recovery, perception capture, HUD helpers |
+| `plugin/src/core/settle.ts` | Deterministic post-action settling |
+| `plugin/src/core/telemetry.ts` | Bounded ring buffer + delta cursor for console/network errors |
+| `plugin/src/core/inspect.ts` | Element diagnostics probe |
+| `plugin/src/core/viewport.ts` | Pure preset/fit/drift math |
+| `plugin/src/injected/` | Set-of-Mark annotator and live HUD scripts |
+| `plugin/src/tools/` | Six thin handlers: zod schema + `TurnRequest` mapping |
+| `plugin/src/tools/index.ts` | `defineTool` registry; JSON Schema derived from zod |
+| `plugin/legacy/` | Quarantined Rust-daemon shim (not registered, tested separately) |
 
 ## 🚀 Quickstart
 
@@ -70,186 +86,134 @@ opencode run "navigate to http://127.0.0.1:8787, snapshot, and tell me what you 
 What the agent sees:
 
 ```text
-page http://127.0.0.1:8787 (g7)
-  textbox "Email" [g7-1]
-  button "Sign in" [g7-3]
+URL: http://127.0.0.1:8787/ — Sign in
+[1] <input> "Email" (#email)
+[2] <button> "Sign in"
+[3] <div> "Select Environment" role=combobox
 ```
 
-…and clicks `g7-3` with a real mouse event. Uids encode the page generation, so a stale uid fails safe (`UID_STALE`) instead of clicking the wrong node.
+Then it acts by id: `browse_interact { "type": "click", "elementId": 2 }`. Ids are assigned in
+reading order on every turn, so after any mutation the next result carries a fresh map.
+
+## 🧰 Tools
+
+Six tools, all `codemode: true`, under the `browse` namespace (the host reserves `browser` for
+its built-in tools).
+
+| Tool | What it does | Returns |
+|---|---|---|
+| `browse_navigate` | goto / back / forward / reload, then settle + perceive | element map + screenshot + telemetry |
+| `browse_interact` | single action or batched `actions[]` (click, type, hover, scroll, press_key, select_option, drag, wait) by `elementId`, selector, or coordinates | element map + screenshot + telemetry |
+| `browse_snapshot` | re-index + fresh screenshot without mutating | element map + screenshot + telemetry |
+| `browse_inspect` | tag, attributes, bbox, visibility, computed styles for one element | inspect block + screenshot + telemetry |
+| `browse_viewport` | desktop/laptop/tablet/mobile preset, custom size, or bare resync | element map + screenshot + telemetry |
+| `browse_eval` | JavaScript in the page context (localStorage, globals, React state) | serialized value + screenshot + telemetry |
+
+`browse_eval` is **not a sandbox**: the expression runs with the page's privileges. Treat it as
+you would DevTools.
+
+### Input schemas
+
+Schemas are written once in zod and converted to JSON Schema at registration, so types, enums,
+defaults, array bounds, and strictness cannot drift. Cross-field rules (for example "goto needs a
+url" or "drag needs toX/toY") are zod refinements: they are enforced at runtime with
+`code: "INVALID_INPUT"`, but JSON Schema cannot express them, so they do not appear in the
+advertised schema. Objects are strict, so unknown fields are rejected rather than silently
+dropped.
 
 ## ⚙️ Configuration
 
 All options are optional; defaults shown.
 
-| Option | Values | Default | Notes |
-|---|---|---|---|
-| `driver` | `"rust"` \| `"js"` | `"rust"` | `"js"` is an in-process raw-CDP baseline (also the daemon fallback); needs no binary |
-| `mode` | `"launch"` \| `"attach"` | `"launch"` | `attach` connects to an existing debug-enabled Chrome; opt-in, never closes your tabs |
-| `attach_url` | URL | `http://127.0.0.1:9222` | only used in `attach` mode |
-| `profile` | `"fresh"` \| `"persistent"` \| `"<path>"` | `"fresh"` | `persistent` reuses cookies across runs (still isolated from your real Chrome) |
-| `max_tabs` | 1–32 | `8` | hard cap; LRU evicts unowned/idle tabs first, never an actively-owned tab |
-| `idle_timeout_s` | seconds | `1800` | daemon exits after 30 min with zero tabs |
-| `OPENCODE_BROWSER_ATTACH` (env) | `"1"` | unset | probe local `:9222` and attach to a debug-enabled Chrome instead of launching — explicit opt-in, localhost-only, fails closed |
-
-## 🧠 Perception-action engine (stateful, Antigravity-grade)
-
-`plugin/src/index.ts` now registers a stateful perception-action loop on top of
-Playwright (system Chromium), replacing guess-the-selector automation with:
-
-1. **Set-of-Mark visual + semantic perception** (`src/injected/dom-annotator.ts`) —
-   traverses DOM + open shadow roots, filters occluded/invisible nodes via
-   `elementFromPoint`, assigns deterministic `[1..N]` ids in reading order
-   (cap 100, labels truncated to 60 chars), tags nodes with `data-opencode-id`,
-   and draws numbered badges into a temporary overlay for screenshots only.
-2. **Live human-visible HUD** (`src/injected/agent-hud.ts`) — isolated Shadow DOM
-   status pill, smooth SVG virtual cursor, click ripple; hidden during capture.
-3. **Deterministic settling** (`src/core/settle.ts`) — 50 ms kickoff + network
-   quiet (fetch/xhr/document, 250 ms window, 2.5 s max) + double-rAF with a
-   MutationObserver quiet window.
-4. **Passive DevTools telemetry** (`src/core/telemetry.ts`) — bounded ring buffer
-   (200) for console errors/warnings, uncaught exceptions, HTTP ≥ 400, and
-   failed requests; every tool drains only the delta since the last call.
-
-Every mutating tool runs the closed loop:
-`HUD update → execute → waitForSettled → re-index + annotated screenshot →
-drain telemetry → formatted payload`, and screenshots are saved under
-`.opencode/browser-screenshots/` (temp PNG + `{type:"file"}` attachment).
-
-**Browser lifetime is process-global, not plugin-instance-global.** The host
-re-instantiates plugins many times per server process (observed ~300 loads in an
-afternoon, roughly one per agent step), and dispose callbacks are not a safe
-place to close shared resources. `BrowserSessionManager` therefore lives on
-`globalThis` under a `Symbol.for` key: every plugin instance reuses the same
-browser/context/pages, tool registration is the only thing disposed on reload,
-and Chromium is closed only on `SIGINT`/`SIGTERM`/`beforeExit`. Consecutive
-`browse_*` calls share one tab, one profile, and one login state.
-
-| Tool | What it does | Returns |
-|---|---|---|
-| `browse_navigate` | goto / back / forward / reload, then settle + perceive | element map + screenshot + telemetry |
-| `browse_interact` | single action or batched `actions[]` (type/click/hover/scroll/press_key/select_option/wait) by `elementId`, selector, or coords; stale-ID recovery stops the batch cleanly | element map + screenshot + telemetry |
-| `browse_snapshot` | re-index + fresh screenshot (annotated by default) without mutating | element map + screenshot + telemetry |
-| `browse_inspect` | deep diagnostics: tag, attrs, bbox, visibility, computed styles | inspect block + telemetry |
-| `browse_viewport` | resize to preset (desktop 1440x900, laptop 1280x800, tablet 768x1024, mobile 390x844) or custom | element map + screenshot + telemetry |
-| `browse_eval` | sandboxed JS in page context (localStorage, globals, React state) | serialized value + telemetry |
-
-Agent workflow (embedded in each tool description): prefer `elementId` from the
-`[id]` map over CSS selectors · batch fill+submit in one `browser_interact`
-turn · check the Telemetry section after every action · use `browser_inspect`
-for CSS/layout debugging.
-
-Legacy shim (Rust daemon RPC: `plugin/src/{tools,supervisor,rpc,driver}.ts`)
-remains in-tree and typechecks; the plugin entry now wires the stateful engine.
-
-### Engine environment
-
 | Variable | Default | Notes |
 |---|---|---|
-| `OPENCODE_BROWSER_HEADLESS` | unset (headful) | set `1`/`true` for headless (CI, servers) |
+| `OPENCODE_BROWSER_HEADLESS` | unset (headful) | `1`/`true` for headless (CI, servers) |
 | `OPENCODE_BROWSER_CDP_URL` | unset (persistent launch) | e.g. `http://127.0.0.1:9222` — attach to a running Chrome instead of launching |
-| `OPENCODE_BROWSER_PROFILE_DIR` | `.opencode/browser-profile` | persistent profile (cookies/localStorage survive runs) |
-| `OPENCODE_BROWSER_EXECUTABLE_PATH` | auto-detected (`/usr/bin/chromium`, …) or `CHROME_PATH` | override when Playwright has no bundled browser |
+| `OPENCODE_BROWSER_PROFILE_DIR` | `.opencode/browser-profile` | persistent profile; cookies/localStorage survive runs |
+| `OPENCODE_BROWSER_EXECUTABLE_PATH` | auto-detected (`/usr/bin/chromium`, `google-chrome`, …) or `CHROME_PATH` | override when Playwright has no bundled browser |
 | `OPENCODE_BROWSER_SCREENSHOT_DIR` | `.opencode/browser-screenshots` | annotated PNG output |
 | `OPENCODE_BROWSER_MAX_ELEMENTS` | `100` | SoM index cap |
-| `OPENCODE_BROWSER_MAX_TELEMETRY` | `200` | ring-buffer bound |
-| `OPENCODE_BROWSER_SETTLE_MAX_TIMEOUT_MS` / `OPENCODE_BROWSER_SETTLE_QUIET_WINDOW_MS` | `2500` / `250` | settle budget |
+| `OPENCODE_BROWSER_MAX_TELEMETRY` | `200` | telemetry ring-buffer bound |
+| `OPENCODE_BROWSER_SETTLE_MAX_TIMEOUT_MS` | `2500` | settle hard deadline |
+| `OPENCODE_BROWSER_SETTLE_QUIET_WINDOW_MS` | `250` | network quiet window |
+| `OPENCODE_BROWSER_NAVIGATION_TIMEOUT_MS` | `30000` | `goto` timeout |
+| `OPENCODE_BROWSER_NO_SANDBOX` | unset (auto for root) | `1` only where Chromium cannot sandbox (containers, CI) |
 
 Attach to an existing Chrome:
-`chromium --remote-debugging-port=9222` (or Chrome with the same flag), then
-`OPENCODE_BROWSER_CDP_URL=http://127.0.0.1:9222`.
 
-## 🧰 Tools (legacy daemon shim)
+```sh
+chromium --remote-debugging-port=9222
+OPENCODE_BROWSER_CDP_URL=http://127.0.0.1:9222 opencode
+```
 
-<div align="center">
+## 🔒 Security
 
-22 tools · all `codemode: true` · `browse_` prefix (the host reserves `browser` for its built-in tools, where a colliding id is silently dropped)
-
-</div>
-
-| Tool | What it does | Returns |
-|---|---|---|
-| `browse_navigate` | go to a URL in your session tab | `{tab_id, url, title, status}` |
-| `browse_snapshot` | compact accessibility snapshot with `[uid]` refs | text tree, `max_nodes` default 300 |
-| `browse_click` | real mouse click at the element center (occlusion-checked, auto-waits) | `{ok}` |
-| `browse_click_at` | click at viewport CSS pixels `{x, y}` — canvas/exotic-widget fallback (no occlusion/actionability checks) | `{ok, x, y}` |
-| `browse_fill` | focus + real key events (works with React/Vue) | `{ok}` |
-| `browse_hover` | move the mouse over a uid (menu/hover states) | `{ok, x, y}` |
-| `browse_select` | pick a `<select>` option by value, label or index | `{value, label, index}` |
-| `browse_upload` | attach local files to a file input (**permission-gated**) | `{files}` |
-| `browse_dialog` | accept/dismiss a JS dialog (after `dialog_policy: manual`) | `{action, dialog}` |
-| `browse_scroll` | scroll up/down/left/right/top/bottom | `{scrollX, scrollY, at_bottom}` |
-| `browse_press_key` | key press, optionally into a uid | `{ok}` |
-| `browse_eval` | run JS in the page (**permission-gated**, see below) | `{value}` |
-| `browse_screenshot` | PNG capture | file attachment + `{path}` |
-| `browse_look` | snapshot + screenshot in one call (both halves must succeed) | text + file attachment, `{path, hint}` |
-| `browse_console` | recent console messages (ring buffer, 500/tab) | `{messages, next_since}` |
-| `browse_network` | recent requests (ring buffer, 500/tab) | `{requests, next_since}` |
-| `browse_network_body` | one response body by `request_id` | `{body, bytes, truncated}` |
-| `browse_route` | mock a URL pattern: fulfill with a fixture or abort it | `{pattern, action, routes}` |
-| `browse_wait_for_uid` | wait for a `[uid]` to appear (bounded poll) | `{found, elapsed_ms}` or `NAV_TIMEOUT` |
-| `browse_expect_text` | wait for a page-text substring (bounded poll, plain match) | `{matched, elapsed_ms}` or `NAV_TIMEOUT` |
-| `browse_list_tabs` / `browse_close_tab` | inspect / close tabs (yours only) | `{tabs}` / `{closed}` |
-
-**📜 Logs without gaps.** `browse_console` / `browse_network` accept `since` (the previous response's `next_since`) and return only newer entries, so polling loops can't skip rows. Headers are included only with `include_headers: true` (already redacted). Bodies default to 16 KiB (cap 256 KiB) and report `BODY_UNAVAILABLE` once Chrome evicts them.
-
-**🎭 Deterministic mocks.** `browse_route` binds one literal URL pattern (`substring`, `prefix`, or bare `host`) to `fulfill` or `abort` on your session tab. Patterns are capped at 512 chars and matched literally — never a regex. Fulfilled mocks answer with exactly one header (`content-type`); secrets are never reflected. Mocks die with the tab; unmatched requests pass through untouched.
-
-**⏳ Bounded waits.** Both wait tools poll every 150 ms (`timeout_ms` default 5 s, clamp 100 ms–30 s) without holding the per-tab lock, so a long wait can't wedge the tab. Success reports elapsed time; a blown deadline is a typed `NAV_TIMEOUT`.
-
-**🪪 Identity rules.** Stale uids fail safe (`UID_STALE`) — and the shim retries once automatically (re-snapshot, re-resolve by role+name, retry exactly once). Other sessions' tabs answer `TAB_FORBIDDEN`. `browse_eval` is gated per page (`action: "browser_eval"`, UI prompt, no hook bypass); `browse_upload` the same with file paths as resources. Dialogs auto-dismiss by default (`dialog_policy: "auto"`); pass `"manual"` + `browse_dialog` to drive one.
-
-## 🔒 Security (summary)
-
-- **Socket:** `$XDG_RUNTIME_DIR/opencode-browser/v1/` (`0700`), `daemon.sock` (`0600`), `SO_PEERCRED` uid check — another local user cannot connect.
-- **Navigation allowlist:** `http`, `https`, `about`; `file:` only with explicit opt-in; `javascript:` rejected, re-checked after redirects.
-- **Eval:** permission-gated per session; attach mode is opt-in and tags only daemon-owned targets.
-- **Upload:** permission-gated; the daemon re-validates every path (absolute, regular file, no `..`, no symlinks, ≤8 files / 100 MiB).
-- **Logs:** query strings/fragments redacted; credential-bearing headers redacted at capture; upload errors name basenames only.
-- **Not protected:** a page you navigate to can still attack the browser itself (standard CDP caveat); web content is not sandboxed.
-
-Full notes: [`docs/security.md`](docs/security.md), [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md).
+- **Profile:** a persistent Chromium profile under `.opencode/browser-profile` is reused across
+  runs. Anything you log into stays logged in until that directory is removed.
+- **Screenshots:** annotated PNGs are written to `.opencode/browser-screenshots` and attached to
+  tool results; they stay on disk.
+- **Eval:** arbitrary page-context JavaScript, with the page's privileges. It is not a sandbox
+  and is not permission-gated.
+- **Sandbox:** Chromium sandboxing stays on unless `OPENCODE_BROWSER_NO_SANDBOX=1` or the
+  process runs as root, where the sandbox cannot work.
+- **Page content** can still attack the browser itself (standard CDP caveat).
 
 ## 🛠 Development
 
 ```sh
-cargo test --manifest-path daemon/Cargo.toml   # Rust unit tests
+# Engine: unit + registry + real-Chromium e2e (Chromium required for e2e)
+cd plugin && bun install
+cd plugin && ./node_modules/.bin/tsc --noEmit
+cd plugin && bun run test                 # legacy files excluded
+
+# Fail instead of skipping when Chromium cannot launch
+cd plugin && OPENCODE_BROWSER_E2E=1 bun test test/e2e.test.ts
+
+# Quarantined shim (Rust-daemon RPC): still green, never part of the default run
+cd plugin && bun run test:legacy
+
+# Daemon (kept in-repo as an experimental baseline)
+cargo test --manifest-path daemon/Cargo.toml
 cargo fmt --check --manifest-path daemon/Cargo.toml
 cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
-cd plugin && ./node_modules/.bin/tsc --noEmit && bun test   # shim
-node scripts/smoke.mjs                          # 61-check end-to-end vs real Chrome (+2 click_at parity when the daemon supports it)
-node scripts/click-proof.mjs                    # click_at vs click parity on the fixture
+node scripts/smoke.mjs                    # daemon smoke against the fixture
 ```
 
-CI runs all of the above plus a pack-size budget and the smoke suite as e2e. The merge bar is green trio + smoke (61 baseline, 63 with `click_at` parity) + `click-proof.mjs` PASS; performance claims require same-conditions before/after numbers, never estimates.
-
-## 📊 Benchmarks
-
-Baselines on the same machine/Chrome/fixture: **A** = raw-CDP JS driver in-process, **B** = Rust daemon. Workload: 1/4/8 sessions × 20 calls, 3 runs. Metrics: cold first call, warm p50/p95 per method, idle/marginal/total-tree RSS, collisions.
-
-> **Pre-registered kill rule:** if Rust shows **<20% improvement** in marginal memory per session **and** **<20%** in warm-call p95 vs baseline A, the daemon does **not** become the default — the JS driver ships instead.
-
-Run it: `node scripts/bench.mjs --mock` (no Chrome) or `node scripts/bench.mjs --driver js` (real Chrome); `--compare <other-results.json>` evaluates the rule. Decision memo: [`bench/results/report.md`](bench/results/report.md).
+CI runs five jobs: Rust checks, the engine suite (with `OPENCODE_BROWSER_E2E=1`), the quarantined
+legacy suite, a pack-content/size smoke that installs and imports the packed entry, and the daemon
+fixture smoke. A browser test that cannot launch fails the engine job instead of reporting green.
 
 ## 📦 Packaging
 
-`node scripts/build-native.mjs` builds `browserd --release`, strips it, and stages `prebuilds/linux-x64/browserd` (`755`). The npm tarball ships `plugin/ + prebuilds/ + README.md` **inside** the package (no postinstall download for v1). **Size budget: ≤20 MB compressed**, enforced by CI.
+The published package ships `plugin/src` plus this README and declares `@opencode/plugin`,
+`playwright`, and `zod` as dependencies. The Rust daemon and the legacy shim are **not** shipped.
+Tarball size budget: ≤20 MB compressed, enforced by CI.
 
-## 🆘 Troubleshooting
+## 🧪 Legacy shim and daemon
+
+The earlier design used a TypeScript shim speaking NDJSON to a Rust CDP daemon (`browserd`). The
+plugin no longer registers it. Both live in-tree for reference and benchmarking:
+
+- `plugin/legacy/src/` — shim, RPC client, supervisor, raw-CDP JS driver;
+- `plugin/legacy/test/` — its 80 tests (run with `bun run test:legacy`);
+- `daemon/` — Rust daemon with its own unit tests and fixture smoke suite.
+
+`node scripts/bench.mjs --driver js` measures that baseline; `--mock` needs no Chrome.
+
+## ⚠️ Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `DAEMON_UNAVAILABLE` / empty reply | Is it running? `ss -x \| grep opencode-browser`. If dead, the shim respawns it on next call (≤2 s backoff) |
-| `PROTOCOL_MISMATCH` | Shim/daemon version skew. The socket path embeds the protocol major (`.../v1/`), so kill the stale daemon (below) and retry |
-| `CHROME_DEAD` | Chrome crashed; the daemon relaunches once automatically — just retry. Persistent? Run `google-chrome --headless=new about:blank` by hand |
-| `UID_STALE` / `UID_NOT_FOUND` | Page changed since the snapshot. The shim already retried once; re-run `browse_snapshot` and use the new uids |
-| `NAV_TIMEOUT` | Condition not met within budget. Retry with a larger `timeout_ms`, or snapshot what rendered |
-| `TAB_FORBIDDEN` | That tab belongs to another session. Navigate in your own session instead |
-| Need the socket path | `${XDG_RUNTIME_DIR:-/tmp/opencode-browser-$UID}/opencode-browser/v1/daemon.sock` (see `daemon/src/paths.rs`) |
-| Kill the daemon | `pkill -x browserd`, or send `{"id":1,"method":"shutdown","params":{}}` on the socket. Tabs die with it; Chrome's profile dir is removed |
+| `chromium did not launch` | Install Chromium or set `OPENCODE_BROWSER_EXECUTABLE_PATH`; run `google-chrome --headless=new about:blank` by hand |
+| In CI, tests skip instead of failing | Set `OPENCODE_BROWSER_E2E=1` |
+| Blank or stale element map | The page may be cross-origin or empty; take `browse_snapshot` and check the screenshot |
+| `INVALID_INPUT` | A parameter failed the advertised zod schema — read the message and retry |
+| Screenshot missing from the result | Check `OPENCODE_BROWSER_SCREENSHOT_DIR` is writable |
+| Chromium leaves a stale profile lock | Kill leftover Chromium, then remove `.opencode/browser-profile/SingletonLock` |
 
 ## ✅ Compatibility
 
-- OS/CPU: `linux` / `x64` (v1). macOS/Windows are post-v1.
-- Runtimes: Node ≥22 or Bun ≥1 (shim + bench scripts).
+- OS/CPU: Linux x64 for v1; the engine itself is Playwright-based and portable.
+- Runtimes: Bun ≥1.4.4 for the plugin and its tests (the package exports TypeScript). Node ≥22
+  is only needed for the repository scripts (`smoke.mjs`, `bench.mjs`, `build-native.mjs`).
 - OpenCode: V2 plugin API (`@opencode/plugin` 2.x).
-- Protocol: major version in the socket path (`v1/`); mismatched shims refuse to talk to old daemons instead of misbehaving.

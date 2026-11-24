@@ -32,6 +32,7 @@ export class Telemetry {
   /** Last console text, for dedup of identical consecutive messages. */
   private lastConsoleText: string | null = null;
   private repeatCount = 0;
+  private readonly attached = new WeakSet<import("playwright").Page>();
 
   constructor(max = 200) {
     this.max = max;
@@ -39,6 +40,8 @@ export class Telemetry {
 
   /** Attach persistent listeners to a Playwright Page. Idempotent per page. */
   attach(page: import("playwright").Page): void {
+    if (this.attached.has(page)) return;
+    this.attached.add(page);
     page.on("console", (msg) => {
       const type = msg.type();
       if (type !== "error" && type !== "warning") return;
@@ -85,29 +88,25 @@ export class Telemetry {
   }
 
   /** Record a console message, deduplicating identical consecutive spam. */
+  /**
+   * Record a console message, collapsing consecutive duplicates *inside the
+   * current undrained delta*. Once a message has been drained, an identical
+   * one starts a fresh event: the next tool call must still see that the error
+   * happened again, instead of reporting "Errors: none".
+   */
   private addConsole(text: string): void {
-    if (text === this.lastConsoleText) {
+    const last = this.events[this.events.length - 1];
+    const undrained = this.events.length > this.cursor;
+    if (undrained && text === this.lastConsoleText && last?.type === "console") {
       this.repeatCount += 1;
-      // Update the most recent event in place with the repeat counter.
-      const last = this.events[this.events.length - 1];
-      if (last && last.type === "console") {
-        const base = text.includes(" (x") ? text.split(" (x")[0] ?? text : text;
-        if (last.text.startsWith(base)) {
-          last.text = `${text} (x${this.repeatCount})`;
-          last.repeat = ` (x${this.repeatCount})`;
-          last.timestamp = Date.now();
-        }
-      }
+      last.text = `${text} (x${this.repeatCount})`;
+      last.repeat = ` (x${this.repeatCount})`;
+      last.timestamp = Date.now();
       return;
     }
     this.lastConsoleText = text;
     this.repeatCount = 1;
-    this.add({
-      type: "console",
-      text,
-      source: "(console)",
-      timestamp: Date.now(),
-    });
+    this.add({ type: "console", text, source: "(console)", timestamp: Date.now() });
   }
 
   private add(event: TelemetryEvent): void {

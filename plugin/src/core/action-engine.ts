@@ -16,7 +16,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Page, Locator } from "playwright";
 import { waitForSettled } from "./settle.ts";
+import { somSelector } from "./som.ts";
 import { Telemetry } from "./telemetry.ts";
+import type { ElementLine } from "../utils/formatter.ts";
 
 export type ActionType =
   | "click"
@@ -97,7 +99,7 @@ export function hudRipple(page: Page, x: number, y: number): Promise<unknown> {
 /** Resolve an action's target to a Playwright Locator, or null. */
 export function resolveLocator(page: Page, action: Action): Locator | null {
   if (action.elementId !== undefined) {
-    return page.locator('[data-opencode-id="' + action.elementId + '"]');
+    return page.locator(somSelector(action.elementId));
   }
   if (action.selector) return page.locator(action.selector);
   return null;
@@ -105,9 +107,7 @@ export function resolveLocator(page: Page, action: Action): Locator | null {
 
 /** Re-verify that an elementId target still exists in the live DOM. */
 export async function elementExists(page: Page, elementId: number): Promise<boolean> {
-  const count = await page
-    .locator('[data-opencode-id="' + elementId + '"]')
-    .count();
+  const count = await page.locator(somSelector(elementId)).count();
   return count > 0;
 }
 
@@ -129,6 +129,11 @@ export async function targetCenter(
 export async function execAction(page: Page, action: Action): Promise<void> {
   const center = await targetCenter(page, action);
   const loc = resolveLocator(page, action);
+  const label =
+    action.elementId !== undefined
+      ? `[${action.elementId}]`
+      : action.selector ?? (center ? `${center.x},${center.y}` : null);
+  if (label) await hudUpdate(page, `Acting on ${label}`);
 
   switch (action.type) {
     case "click": {
@@ -259,7 +264,7 @@ export async function execBatch(
 }
 
 export interface PerceptionResult {
-  readonly elements: unknown[];
+  readonly elements: readonly ElementLine[];
   readonly screenshotPath: string | null;
   readonly width: number | null;
   readonly height: number | null;
@@ -283,9 +288,7 @@ export async function capturePerception(
     return s.indexPage();
   });
   const rec = indexed as { elements?: unknown } | null;
-  const elements: unknown[] = Array.isArray(rec?.elements)
-    ? (rec?.elements as unknown[])
-    : [];
+  const elements = Array.isArray(rec?.elements) ? (rec.elements as ElementLine[]) : [];
 
   let screenshotPath: string | null = null;
   let width: number | null = null;
@@ -293,7 +296,8 @@ export async function capturePerception(
 
   // Always capture: annotate:false means a clean screenshot, not no screenshot.
   // Screenshot hygiene: hide HUD, optionally render SoM badges, capture,
-  // remove the overlay, restore the HUD.
+  // remove the overlay, restore the HUD. The restore is a finally: a failed or
+  // timed-out screenshot must never leave the HUD hidden or badges painted.
   await page
     .evaluate(() => {
       const w = globalThis as unknown as Record<string, any>;
@@ -301,37 +305,41 @@ export async function capturePerception(
       if (h) h.hide();
     })
     .catch(() => undefined);
-  if (opts.annotate !== false) {
+
+  let buffer: Buffer;
+  try {
+    if (opts.annotate !== false) {
+      await page
+        .evaluate(() => {
+          const w = globalThis as unknown as Record<string, any>;
+          const s = w["__opencodeSom"];
+          if (s) s.renderSoMOverlay();
+        })
+        .catch(() => undefined);
+    }
+
+    buffer = await page.screenshot({ fullPage: opts.fullPage ?? false });
+    const vp = page.viewportSize();
+    width = vp?.width ?? null;
+    height = vp?.height ?? null;
+  } finally {
+    if (opts.annotate !== false) {
+      await page
+        .evaluate(() => {
+          const w = globalThis as unknown as Record<string, any>;
+          const s = w["__opencodeSom"];
+          if (s) s.removeSoMOverlay();
+        })
+        .catch(() => undefined);
+    }
     await page
       .evaluate(() => {
         const w = globalThis as unknown as Record<string, any>;
-        const s = w["__opencodeSom"];
-        if (s) s.renderSoMOverlay();
+        const h = w["__opencodeHud"];
+        if (h) h.show();
       })
       .catch(() => undefined);
   }
-
-  const buffer = await page.screenshot({ fullPage: opts.fullPage ?? false });
-  const vp = page.viewportSize();
-  width = vp?.width ?? null;
-  height = vp?.height ?? null;
-
-  if (opts.annotate !== false) {
-    await page
-      .evaluate(() => {
-        const w = globalThis as unknown as Record<string, any>;
-        const s = w["__opencodeSom"];
-        if (s) s.removeSoMOverlay();
-      })
-      .catch(() => undefined);
-  }
-  await page
-    .evaluate(() => {
-      const w = globalThis as unknown as Record<string, any>;
-      const h = w["__opencodeHud"];
-      if (h) h.show();
-    })
-    .catch(() => undefined);
 
   screenshotPath = await savePng(buffer, opts.screenshotDir);
 

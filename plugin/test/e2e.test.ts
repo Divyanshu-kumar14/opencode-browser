@@ -12,47 +12,33 @@
  *   4. annotated screenshot is written and the SoM overlay is removed afterwards
  *
  * Requires system Chromium (OPENCODE_BROWSER_EXECUTABLE_PATH or autodetect).
- * Skipped gracefully when Chromium cannot launch.
+ * Skips when Chromium cannot launch, unless OPENCODE_BROWSER_E2E=1, in which
+ * case the launch failure fails the suite.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import { BrowserSessionManager } from "../src/core/session-manager.ts";
+import type { BrowserSessionManager } from "../src/core/session-manager.ts";
+import type { PlaywrightBrowserSession } from "../src/core/browser-session.ts";
 import { execute as navigateExec } from "../src/tools/navigate.ts";
 import { execute as interactExec, schema as interactSchema } from "../src/tools/interact.ts";
 import { execute as snapshotExec } from "../src/tools/snapshot.ts";
 import { execute as inspectExec } from "../src/tools/inspect.ts";
 import { execute as viewportExec } from "../src/tools/viewport.ts";
 import { execute as evalExec } from "../src/tools/evaluate.ts";
+import {
+  startBrowser,
+  startFixtureServer,
+  skipReason,
+  type BrowserHandle,
+  type FixtureServer,
+} from "./harness.ts";
 
-const FIXTURE = `<!doctype html><html><head><title>Fixture</title>
-<style>
-#modal{position:fixed;left:32px;top:292px;width:220px;height:64px;z-index:9999;background:rgba(0,0,0,.5);}
-#occluded{position:fixed;left:40px;top:300px;z-index:1;}
-button,input,[role=combobox]{font-size:16px;margin:8px;}
-</style></head><body>
-<h1>Hello fixture</h1>
-<input id="email" type="email" placeholder="name@work.com">
-<button id="submit">Sign In</button>
-<div id="env" role="combobox" aria-label="Select Environment" tabindex="0">Production</div>
-<button id="occluded">Covered button</button>
-<div id="modal"></div>
-<button id="boom">Trigger error</button>
-<script>
-document.getElementById("boom").addEventListener("click", () => {
-  console.error("Test runtime error");
-  fetch("/api/missing").catch(() => {});
-});
-</script>
-</body></html>`;
-
-let server: ReturnType<typeof Bun.serve> | null = null;
+let server: FixtureServer | null = null;
+let env: BrowserHandle | null = null;
 let baseUrl = "";
 let manager: BrowserSessionManager | null = null;
-let shotDir = "";
-let profileDir = "";
+let session: PlaywrightBrowserSession | null = null;
 let launchError: string | null = null;
 
 interface SomEl {
@@ -77,56 +63,45 @@ function firstContent(result: { content: unknown }): string {
   return c.find((e) => e.type === "text")?.text ?? "";
 }
 
-beforeAll(async () => {
-  server = Bun.serve({
-    port: 0,
-    hostname: "127.0.0.1",
-    fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname === "/api/missing") {
-        return new Response("nope", { status: 404 });
-      }
-      return new Response(FIXTURE, { headers: { "content-type": "text/html" } });
-    },
-  });
-  baseUrl = `http://127.0.0.1:${server.port}/`;
+/** Skip when allowed, fail when OPENCODE_BROWSER_E2E=1. */
+function browserReady(): boolean {
+  if (manager && session) return true;
+  console.warn(`SKIP: ${skipReason(launchError)}`);
+  return false;
+}
 
-  shotDir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-shots-"));
-  profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-prof-"));
-  manager = new BrowserSessionManager({
-    headless: true,
-    profileDir,
-    screenshotDir: shotDir,
-  } as never);
+beforeAll(async () => {
+  server = startFixtureServer();
+  baseUrl = server.url;
   try {
-    await manager.ensureActivePage();
-  } catch (e) {
-    launchError = e instanceof Error ? e.message : String(e);
+    env = await startBrowser();
+    manager = env.manager;
+    session = env.session;
+  } catch (error) {
+    launchError = error instanceof Error ? error.message : String(error);
     manager = null;
+    session = null;
   }
 });
 
 afterAll(async () => {
-  await manager?.close().catch(() => undefined);
-  server?.stop(true);
-  fs.rmSync(shotDir, { recursive: true, force: true });
-  fs.rmSync(profileDir, { recursive: true, force: true });
+  await env?.close();
+  server?.stop();
 });
 
 describe("perception-action engine e2e", () => {
   test("navigate indexes visible elements, skips the occluded button", async () => {
-    if (!manager) {
-      console.warn(`SKIP: chromium did not launch: ${launchError}`);
-      return;
-    }
+    if (!browserReady()) return;
     const res = await navigateExec(
       { action: "goto", url: baseUrl },
-      { sessionManager: manager, screenshotDir: shotDir },
+      { session: session! },
     );
     const text = firstContent(res);
     expect(text).toContain("Sign In");
     expect(text).toContain("Select Environment");
     expect(text).not.toContain("Covered button");
+    // The settle result is real, not a hardcoded `settled: true`.
+    expect(text).toContain("Settled: yes");
 
     const els = await somElements();
     const labels = els.map((e) => e.label);
@@ -140,10 +115,7 @@ describe("perception-action engine e2e", () => {
   });
 
   test("interact batches type + click by elementId", async () => {
-    if (!manager) {
-      console.warn(`SKIP: chromium did not launch: ${launchError}`);
-      return;
-    }
+    if (!browserReady()) return;
     const els = await somElements();
     const email = els.find((e) => e.tag === "input");
     const submit = els.find((e) => e.label.includes("Sign In"));
@@ -152,14 +124,14 @@ describe("perception-action engine e2e", () => {
     const res = await interactExec(
       {
         actions: [
-          { type: "clear_and_type", elementId: email!.id, text: "agent@work.com" },
-          { type: "click", elementId: submit!.id },
+          { type: "clear_and_type", elementId: email!.id, text: "agent@work.com", pressEnter: false },
+          { type: "click", elementId: submit!.id, pressEnter: false },
         ],
       },
-      { sessionManager: manager, screenshotDir: shotDir },
+      { session: session! },
     );
     expect(res.metadata?.["stoppedAt"]).toBeNull();
-    const page = manager.getActivePage()!;
+    const page = manager!.getActivePage()!;
     const value = await page.evaluate(() => {
       const g = globalThis as unknown as Record<string, any>;
       const doc = g["document"];
@@ -169,10 +141,7 @@ describe("perception-action engine e2e", () => {
   });
 
   test("interact drag completes a real mouse drag", async () => {
-    if (!manager) {
-      console.warn(`SKIP: chromium did not launch: ${launchError}`);
-      return;
-    }
+    if (!browserReady()) return;
     // Batch form intentionally: per-action zod validation used to strip
     // toX/toY, silently breaking drag inside `actions[]`.
     const parsed = interactSchema.parse({
@@ -182,25 +151,22 @@ describe("perception-action engine e2e", () => {
     expect(first?.toX).toBe(260);
     expect(first?.toY).toBe(220);
     const res = await interactExec(
-      { actions: [{ type: "drag", x: 60, y: 120, toX: 260, toY: 220 }] },
-      { sessionManager: manager, screenshotDir: shotDir },
+      { actions: [{ type: "drag", x: 60, y: 120, toX: 260, toY: 220, pressEnter: false }] },
+      { session: session! },
     );
     expect(res.metadata?.["stoppedAt"]).toBeNull();
   });
 
   test("telemetry delta captures console.error + failed fetch", async () => {
-    if (!manager) {
-      console.warn(`SKIP: chromium did not launch: ${launchError}`);
-      return;
-    }
+    if (!browserReady()) return;
     const els = await somElements();
     const boom = els.find((e) => e.label.includes("Trigger error"));
     expect(boom).toBeDefined();
     // drain anything pending so this turn's delta is exactly the boom click
-    await snapshotExec({}, { sessionManager: manager, screenshotDir: shotDir });
+    await snapshotExec({ annotate: true, fullPage: false }, { session: session! });
     const res = await interactExec(
-      { type: "click", elementId: boom!.id },
-      { sessionManager: manager, screenshotDir: shotDir },
+      { type: "click", elementId: boom!.id, pressEnter: false },
+      { session: session! },
     );
     const text = firstContent(res);
     expect(text).toContain("Test runtime error");
@@ -208,19 +174,16 @@ describe("perception-action engine e2e", () => {
   });
 
   test("screenshot is written and the SoM overlay is removed", async () => {
-    if (!manager) {
-      console.warn(`SKIP: chromium did not launch: ${launchError}`);
-      return;
-    }
+    if (!browserReady()) return;
     const res = await snapshotExec(
-      { annotate: true },
-      { sessionManager: manager, screenshotDir: shotDir },
+      { annotate: true, fullPage: false },
+      { session: session! },
     );
     const shot = res.metadata?.["screenshotPath"] as string | null;
     expect(shot).toBeTruthy();
     expect(fs.existsSync(shot!)).toBe(true);
     expect(fs.statSync(shot!).size).toBeGreaterThan(1000);
-    const page = manager.getActivePage()!;
+    const page = manager!.getActivePage()!;
     const overlay = await page.evaluate(() => {
       const g = globalThis as unknown as Record<string, any>;
       return !!g["document"].getElementById("opencode-som-overlay");
@@ -229,13 +192,10 @@ describe("perception-action engine e2e", () => {
   });
 
   test("plain snapshot still writes a screenshot", async () => {
-    if (!manager) {
-      console.warn(`SKIP: chromium did not launch: ${launchError}`);
-      return;
-    }
+    if (!browserReady()) return;
     const res = await snapshotExec(
-      { annotate: false },
-      { sessionManager: manager, screenshotDir: shotDir },
+      { annotate: false, fullPage: false },
+      { session: session! },
     );
     const shot = res.metadata?.["screenshotPath"] as string | null;
     expect(shot).toBeTruthy();
@@ -243,13 +203,10 @@ describe("perception-action engine e2e", () => {
   });
 
   test("viewport + inspect + eval round-trip", async () => {
-    if (!manager) {
-      console.warn(`SKIP: chromium did not launch: ${launchError}`);
-      return;
-    }
+    if (!browserReady()) return;
     const vres = await viewportExec(
       { preset: "mobile" },
-      { sessionManager: manager, screenshotDir: shotDir },
+      { session: session! },
     );
     expect(vres.metadata?.["viewport"]).toMatchObject({ width: 390, height: 844 });
 
@@ -258,14 +215,59 @@ describe("perception-action engine e2e", () => {
     expect(email).toBeDefined();
     const ires = await inspectExec(
       { elementId: email!.id },
-      { sessionManager: manager, screenshotDir: shotDir },
+      { session: session! },
     );
     expect(firstContent(ires)).toContain("bbox:");
+    const inspectShot = ires.metadata?.["screenshotPath"] as string | null;
+    expect(inspectShot).toBeTruthy();
 
     const eres = await evalExec(
       { expression: "document.title" },
-      { sessionManager: manager, screenshotDir: shotDir },
+      { session: session! },
     );
     expect(firstContent(eres)).toContain("Fixture");
+    // Regression: eval used to write an orphan screenshot and drop it.
+    const evalShot = eres.metadata?.["screenshotPath"] as string | null;
+    expect(evalShot).toBeTruthy();
+    expect(fs.existsSync(evalShot!)).toBe(true);
+    expect(eres.content).toHaveLength(2);
+    expect(eres.content[1]).toMatchObject({ type: "file", mime: "image/png" });
+  });
+
+  test("settle waits for a request started by the click", async () => {
+    if (!browserReady()) return;
+    // Drain anything pending so this turn's delta is exactly the slow fetch.
+    await snapshotExec({ annotate: false, fullPage: false }, { session: session! });
+    const els = await somElements();
+    const slow = els.find((e) => e.label.includes("Trigger slow error"));
+    expect(slow).toBeDefined();
+    const res = await interactExec(
+      { type: "click", elementId: slow!.id, pressEnter: false },
+      { session: session! },
+    );
+    const text = firstContent(res);
+    expect(text).toContain("Settled: yes");
+    expect(text).toContain("[HTTP 404]");
+  });
+
+  test("tab switch is reported with the loaded URL", async () => {
+    if (!browserReady()) return;
+    const els = await somElements();
+    const popup = els.find((e) => e.label.includes("Open popup"));
+    expect(popup).toBeDefined();
+    try {
+      const res = await interactExec(
+        { type: "click", elementId: popup!.id, pressEnter: false },
+        { session: session! },
+      );
+      const text = firstContent(res);
+      expect(text).toContain("Switched to new tab");
+      expect(text).toContain("/second");
+      expect(text).not.toContain("Switched to new tab: about:blank");
+    } finally {
+      // Close the popup and let the manager re-point to the fixture tab.
+      const active = manager!.getActivePage();
+      if (active && active.url().includes("/second")) await active.close();
+    }
   });
 });

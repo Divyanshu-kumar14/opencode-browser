@@ -15,12 +15,26 @@ export interface ElementLine {
   readonly disabled?: boolean;
 }
 
+/**
+ * Flatten page-controlled text. A newline or control character in a label,
+ * title, or console message must not be able to forge extra perception lines.
+ */
+export function sanitizePageText(s: string): string {
+  return s
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 export function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return sanitizePageText(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 export function escapeQuote(s: string): string {
-  return s.replace(/"/g, '\\"');
+  return sanitizePageText(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 export function formatElementMap(elements: readonly ElementLine[]): string {
@@ -44,7 +58,7 @@ export interface TelemetrySection {
 
 export function formatTelemetryDelta(events: readonly { readonly type: string; readonly text: string }[]): string {
   if (events.length === 0) return "Errors: none";
-  const lines = events.map((e) => `  - [${e.type}] ${e.text}`);
+  const lines = events.map((e) => `  - [${sanitizePageText(e.type)}] ${sanitizePageText(e.text)}`);
   return ["### New Console & Network Errors", ...lines, ""].join("\n");
 }
 
@@ -64,8 +78,10 @@ export interface PagePayloadOptions {
 export function buildPagePayload(options: PagePayloadOptions): string {
   const parts: string[] = [];
 
-  parts.push(`URL: ${options.url}${options.title ? ` — ${options.title}` : ""}`);
-  if (options.tabSwitch) parts.push(`Tab: ${options.tabSwitch}`);
+  const url = sanitizePageText(options.url);
+  const title = options.title ? sanitizePageText(options.title) : "";
+  parts.push(`URL: ${url}${title ? ` — ${title}` : ""}`);
+  if (options.tabSwitch) parts.push(`Tab: ${sanitizePageText(options.tabSwitch)}`);
   if (options.settled !== undefined) {
     parts.push(`Settled: ${options.settled ? "yes" : "no"}${options.durationMs !== undefined ? ` (${options.durationMs}ms)` : ""}`);
   }

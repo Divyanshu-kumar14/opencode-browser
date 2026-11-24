@@ -19,8 +19,15 @@ import { loadConfig } from "../config.ts";
 import { Telemetry } from "./telemetry.ts";
 import {
   AGENT_HUD_SCRIPT,
-  DOM_ANNOTATOR_SCRIPT,
+  makeDomAnnotatorScript,
 } from "../injected/index.ts";
+import {
+  RATIO_PROBE,
+  calibratedRatio,
+  fittedWidth,
+  viewportDrifted,
+  type ViewportGeometry,
+} from "./viewport.ts";
 
 let nextPageSeq = 0;
 function pageId(): string {
@@ -33,7 +40,8 @@ function pageId(): string {
  */
 export class BrowserSessionManager {
   private readonly config: ResolvedConfig;
-  private readonly telemetry = new Telemetry();
+  private readonly telemetry: Telemetry;
+  private readonly annotatorScript: string;
 
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
@@ -42,21 +50,37 @@ export class BrowserSessionManager {
   private readonly perceptionInstalled = new Set<Page>();
   private closed = false;
   private deathWatchArmed = false;
+  private teardownArmed = false;
   /** True after an explicit browser_viewport call — disables auto-fill. */
   private viewportPinned = false;
   /** Requested→CSS pixel ratio, calibrated at launch (headful only). */
   private viewportRatio: number | null = null;
 
-  /** Pending "[Switched to new tab: <url>]" notification for the next tool response. */
-  private pendingTabSwitch: string | null = null;
+  /**
+   * Pending tab switch for the next tool response. The page is stored, not its
+   * URL: at the `page` event the URL is still about:blank.
+   */
+  private pendingTabSwitch: Page | null = null;
 
   constructor(config?: Partial<ResolvedConfig>) {
     this.config = { ...loadConfig(), ...(config ?? {}) };
+    this.telemetry = new Telemetry(this.config.maxTelemetry);
+    this.annotatorScript = makeDomAnnotatorScript(this.config.maxElements);
+  }
+
+  /** The resolved config this manager was created with (single source). */
+  getConfig(): ResolvedConfig {
+    return this.config;
   }
 
   /** Telemetry shared across all tracked pages (delta cursor is global). */
   getTelemetry(): Telemetry {
     return this.telemetry;
+  }
+
+  /** Stable id for a page; the one place page identity is assigned. */
+  pageIdFor(page: Page): string {
+    return pageIdOf(page);
   }
 
   /** Ensure a browser + context exist and return the active page (creating one if needed). */
@@ -77,6 +101,7 @@ export class BrowserSessionManager {
     const existing = ctx.pages().find((p) => !p.isClosed());
     if (existing) {
       this.setActive(existing);
+      await this.maybeSyncViewport(existing);
       return existing;
     }
     const page = await ctx.newPage();
@@ -129,39 +154,43 @@ export class BrowserSessionManager {
    */
   private async maybeSyncViewport(page: Page): Promise<void> {
     if (this.viewportPinned || page.isClosed()) return;
-    const geom = await page
-      .evaluate((): { outerW: number; innerW: number } => {
-        const g = globalThis as unknown as Record<string, any>;
-        const w = g["window"] as { outerWidth: number; innerWidth: number };
-        return { outerW: w.outerWidth, innerW: w.innerWidth };
-      })
-      .catch(() => null);
-    if (!geom || Math.abs(geom.innerW - (geom.outerW - 16)) <= 20) return;
+    const geom = await readWindowGeometry(page);
+    if (geom) await this.syncViewport(page, geom).catch(() => undefined);
+  }
+
+  /** One fit path for both the pre-call check and the 1 s watcher. */
+  private async syncViewport(page: Page, geom: ViewportGeometry): Promise<void> {
+    if (!viewportDrifted(geom)) return;
+    const before = page.viewportSize();
     let ratio = this.viewportRatio;
     if (ratio === null) {
-      await page.setViewportSize({ width: 800, height: 600 });
+      await page.setViewportSize(RATIO_PROBE);
       const probe = await page
         .evaluate((): number => {
           const g = globalThis as unknown as Record<string, any>;
           return (g["window"] as { innerWidth: number }).innerWidth;
         })
         .catch(() => 0);
-      if (!probe) return;
-      ratio = 800 / probe;
+      ratio = calibratedRatio(probe);
+      if (ratio === null) {
+        // Do not leave the calibration probe size on screen.
+        if (before) await page.setViewportSize(before).catch(() => undefined);
+        return;
+      }
       this.viewportRatio = ratio;
     }
-    const vs = page.viewportSize();
     await page.setViewportSize({
-      width: Math.max(320, Math.round((geom.outerW - 16) * ratio)),
-      height: vs?.height ?? 1000,
+      width: fittedWidth(geom.outerW, ratio),
+      height: before?.height ?? 1000,
     });
   }
 
   /** Consume and return any pending tab-switch notification. */
   takeTabSwitchNotification(): string | null {
-    const notification = this.pendingTabSwitch;
+    const page = this.pendingTabSwitch;
     this.pendingTabSwitch = null;
-    return notification;
+    if (!page || page.isClosed()) return null;
+    return `Switched to new tab: ${page.url()}`;
   }
 
   /** Close the browser / context and clear all state. */
@@ -188,12 +217,19 @@ export class BrowserSessionManager {
 
   /** Register signal / process teardown so managed Chromium never zombies. */
   registerTeardown(): void {
-    const teardown = (): void => {
+    if (this.teardownArmed) return;
+    this.teardownArmed = true;
+    // Installing a signal handler replaces Node's default termination, so the
+    // handler must exit after closing. `beforeExit` must not call exit.
+    const closeAndExit = (): void => {
+      void this.close().finally(() => process.exit(0));
+    };
+    const closeOnly = (): void => {
       void this.close();
     };
-    process.on("SIGINT", teardown);
-    process.on("SIGTERM", teardown);
-    process.on("beforeExit", teardown);
+    process.once("SIGINT", closeAndExit);
+    process.once("SIGTERM", closeAndExit);
+    process.on("beforeExit", closeOnly);
   }
 
   /**
@@ -205,18 +241,21 @@ export class BrowserSessionManager {
   private async syncViewportToWindow(context: BrowserContext): Promise<void> {
     const probe = context.pages().find((p) => !p.isClosed()) ?? await context.newPage();
     const outerW = await this.settledOuterWidth(probe);
-    const PROBE_W = 800;
-    const PROBE_H = 600;
-    await probe.setViewportSize({ width: PROBE_W, height: PROBE_H });
+    const before = probe.viewportSize();
+    await probe.setViewportSize(RATIO_PROBE);
     const innerW = await probe.evaluate((): number => {
       const g = globalThis as unknown as Record<string, any>;
       return (g["window"] as { innerWidth: number }).innerWidth;
     });
-    if (innerW <= 0 || outerW <= 0) return;
-    this.viewportRatio = PROBE_W / innerW;
+    const ratio = calibratedRatio(innerW);
+    if (ratio === null || outerW <= 0) {
+      // Do not leave the calibration probe size on screen.
+      if (before) await probe.setViewportSize(before).catch(() => undefined);
+      return;
+    }
+    this.viewportRatio = ratio;
     this.viewportPinned = false;
-    const targetW = Math.max(800, Math.round((outerW - 16) * this.viewportRatio));
-    await probe.setViewportSize({ width: targetW, height: 1000 });
+    await probe.setViewportSize({ width: fittedWidth(outerW, ratio), height: 1000 });
   }
 
   /** outerWidth once --start-maximized stops resizing (stable 2x100ms, ≤3s). */
@@ -259,37 +298,8 @@ export class BrowserSessionManager {
     if (this.closed || this.viewportPinned) return;
     const page = this.activePage;
     if (!page || page.isClosed()) return;
-    let geom: { outerW: number; innerW: number } | null = null;
-    try {
-      geom = await page.evaluate((): { outerW: number; innerW: number } => {
-        const g = globalThis as unknown as Record<string, any>;
-        const w = g["window"] as { outerWidth: number; innerWidth: number };
-        return { outerW: w.outerWidth, innerW: w.innerWidth };
-      });
-    } catch {
-      return;
-    }
-    if (!geom || geom.outerW <= 0 || Math.abs(geom.innerW - (geom.outerW - 16)) <= 20) return;
-    let ratio = this.viewportRatio;
-    if (ratio === null) {
-      await page.setViewportSize({ width: 800, height: 600 });
-      const probe = await page
-        .evaluate((): number => {
-          const g = globalThis as unknown as Record<string, any>;
-          return (g["window"] as { innerWidth: number }).innerWidth;
-        })
-        .catch(() => 0);
-      if (!probe) return;
-      ratio = 800 / probe;
-      this.viewportRatio = ratio;
-    }
-    const vs = page.viewportSize();
-    await page
-      .setViewportSize({
-        width: Math.max(320, Math.round((geom.outerW - 16) * ratio)),
-        height: vs?.height ?? 1000,
-      })
-      .catch(() => undefined);
+    const geom = await readWindowGeometry(page);
+    if (geom) await this.syncViewport(page, geom).catch(() => undefined);
   }
 
   // ------------------------------------------------------------------
@@ -314,7 +324,7 @@ export class BrowserSessionManager {
       this.context = await chromium.launchPersistentContext(this.config.profileDir, {
         headless: this.config.headless,
         executablePath: this.config.executablePath,
-        chromiumSandbox: true,
+        chromiumSandbox: !this.config.noSandbox,
         args: [
           ...(this.config.noSandbox ? ["--no-sandbox"] : []),
           "--disable-dev-shm-usage",
@@ -350,7 +360,7 @@ export class BrowserSessionManager {
     // Init scripts run on EVERY document (including after navigations), so the
     // SoM indexer and HUD survive page loads. registerPage() below also
     // evaluates them once for pages that already exist.
-    await this.context.addInitScript(DOM_ANNOTATOR_SCRIPT);
+    await this.context.addInitScript(this.annotatorScript);
     await this.context.addInitScript(AGENT_HUD_SCRIPT);
 
     this.registerContextTracking(this.context!);
@@ -361,7 +371,7 @@ export class BrowserSessionManager {
       this.registerPage(page);
       // Auto-switch active pointer to newly opened tabs (target=_blank, popups).
       this.setActive(page);
-      this.pendingTabSwitch = `Switched to new tab: ${page.url()}`;
+      this.pendingTabSwitch = page;
     });
     for (const page of context.pages()) {
       this.registerPage(page);
@@ -394,7 +404,7 @@ export class BrowserSessionManager {
   private installPerception(page: Page): void {
     if (this.perceptionInstalled.has(page)) return;
     void page
-      .evaluate(DOM_ANNOTATOR_SCRIPT)
+      .evaluate(this.annotatorScript)
       .catch(() => {
         // Perception install is best-effort; the page still works without it.
       });
@@ -411,11 +421,25 @@ export class BrowserSessionManager {
   }
 }
 
+async function readWindowGeometry(page: Page): Promise<ViewportGeometry | null> {
+  const geom = await page
+    .evaluate((): ViewportGeometry => {
+      const g = globalThis as unknown as Record<string, any>;
+      const w = g["window"] as { outerWidth: number; innerWidth: number };
+      return { outerW: w.outerWidth, innerW: w.innerWidth };
+    })
+    .catch(() => null);
+  if (!geom || geom.outerW <= 0) return null;
+  return geom;
+}
+
+/** Page identity lives off-object, so nothing can collide with Playwright's Page. */
+const pageIds = new WeakMap<Page, string>();
+
 function pageIdOf(page: Page): string {
-  const obj = page as unknown as { __opencodePageId?: string };
-  const id = obj.__opencodePageId;
-  if (id) return id;
+  const existing = pageIds.get(page);
+  if (existing) return existing;
   const generated = pageId();
-  obj.__opencodePageId = generated;
+  pageIds.set(page, generated);
   return generated;
 }

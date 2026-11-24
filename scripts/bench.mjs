@@ -11,7 +11,7 @@
  * collisions, optional 30-min soak drift (--soak-minutes).
  *
  * Drivers: --driver mock (default-safe, no Chrome; exit condition for Agent D)
- *   or --driver js (real Baseline A via plugin/src/driver/js.ts, needs Chrome).
+ *   or --driver js (real Baseline A via plugin/legacy/src/driver/js.ts, needs Chrome).
  *   Comparing against the Rust daemon (Baseline B) uses --compare to evaluate
  *   the pre-registered kill rule: <20% win on BOTH marginal-RSS/session AND
  *   warm-call p95 => ship the JS driver, do not default the daemon.
@@ -618,7 +618,7 @@ function buildReport(results, comparison, guard) {
 
 async function loadDriver(opts) {
   if (opts.driver === "mock") return createMockDriver();
-  const modulePath = join(ROOT, "plugin", "src", "driver", "js.ts");
+  const modulePath = join(ROOT, "plugin", "legacy", "src", "driver", "js.ts");
   let mod;
   try {
     mod = await import(modulePath);

@@ -131,7 +131,7 @@ All options are optional; defaults shown.
 | `OPENCODE_BROWSER_CDP_URL` | unset (persistent launch) | e.g. `http://127.0.0.1:9222` — attach to a running Chrome instead of launching |
 | `OPENCODE_BROWSER_PROFILE_DIR` | `.opencode/browser-profile` | persistent profile; cookies/localStorage survive runs |
 | `OPENCODE_BROWSER_EXECUTABLE_PATH` | auto-detected (`/usr/bin/chromium`, `google-chrome`, …) or `CHROME_PATH` | override when Playwright has no bundled browser |
-| `OPENCODE_BROWSER_SCREENSHOT_DIR` | `.opencode/browser-screenshots` | annotated PNG output |
+| `OPENCODE_BROWSER_SCREENSHOT_DIR` | `$TMPDIR/opencode/browser-screenshots` | annotated PNG output |
 | `OPENCODE_BROWSER_MAX_ELEMENTS` | `100` | SoM index cap |
 | `OPENCODE_BROWSER_MAX_TELEMETRY` | `200` | telemetry ring-buffer bound |
 | `OPENCODE_BROWSER_SETTLE_MAX_TIMEOUT_MS` | `2500` | settle hard deadline |
@@ -150,7 +150,8 @@ OPENCODE_BROWSER_CDP_URL=http://127.0.0.1:9222 opencode
 
 - **Profile:** a persistent Chromium profile under `.opencode/browser-profile` is reused across
   runs. Anything you log into stays logged in until that directory is removed.
-- **Screenshots:** annotated PNGs are written to `.opencode/browser-screenshots` and attached to
+- **Screenshots:** annotated PNGs are written to `$TMPDIR/opencode/browser-screenshots` (temporary;
+  cleared on reboot) and attached to
   tool results; they stay on disk.
 - **Eval:** arbitrary page-context JavaScript, with the page's privileges. It is not a sandbox
   and is not permission-gated.

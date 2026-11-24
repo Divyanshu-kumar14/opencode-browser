@@ -6,6 +6,7 @@
  * with a 250 ms quiet window.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 export interface ResolvedConfig {
@@ -94,8 +95,10 @@ export function loadConfig(): ResolvedConfig {
     settleMaxTimeoutMs: envNum("OPENCODE_BROWSER_SETTLE_MAX_TIMEOUT_MS", 2500),
     settleQuietWindowMs: envNum("OPENCODE_BROWSER_SETTLE_QUIET_WINDOW_MS", 250),
     navigationTimeoutMs: envNum("OPENCODE_BROWSER_NAVIGATION_TIMEOUT_MS", 30000),
+    // Temporary by default: screenshots are per-turn artifacts, not state.
+    // The OS clears the temp directory on reboot.
     screenshotDir:
       process.env["OPENCODE_BROWSER_SCREENSHOT_DIR"] ??
-      path.resolve(".opencode/browser-screenshots"),
+      path.join(os.tmpdir(), "opencode", "browser-screenshots"),
   };
 }

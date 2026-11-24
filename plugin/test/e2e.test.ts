@@ -70,19 +70,24 @@ function browserReady(): boolean {
   return false;
 }
 
-beforeAll(async () => {
-  server = startFixtureServer();
-  baseUrl = server.url;
-  try {
-    env = await startBrowser();
-    manager = env.manager;
-    session = env.session;
-  } catch (error) {
-    launchError = error instanceof Error ? error.message : String(error);
-    manager = null;
-    session = null;
-  }
-});
+// Launching real Chromium can exceed bun's default 5 s hook timeout on a
+// cold CI runner; give it a generous budget instead of failing the suite.
+beforeAll(
+  async () => {
+    server = startFixtureServer();
+    baseUrl = server.url;
+    try {
+      env = await startBrowser();
+      manager = env.manager;
+      session = env.session;
+    } catch (error) {
+      launchError = error instanceof Error ? error.message : String(error);
+      manager = null;
+      session = null;
+    }
+  },
+  { timeout: 60_000 },
+);
 
 afterAll(async () => {
   await env?.close();

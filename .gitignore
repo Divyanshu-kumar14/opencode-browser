@@ -12,3 +12,4 @@ bench/results/*.json
 .kiro/
 .orchestrator/
 .serena/
+PRD Rust-Native Browser Automation Plugin for OpenCode (v2).md

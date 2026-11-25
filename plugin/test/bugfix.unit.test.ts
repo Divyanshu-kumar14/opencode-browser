@@ -537,6 +537,46 @@ describe("Group 5: session lifecycle (unit)", () => {
       slot[key] = saved;
     }
   });
+
+  test("3.14 a cached manager from an older plugin build is replaced, not reused", async () => {
+    // Regression: a plugin hot reload can run newer code against a manager
+    // created by an older build. The old guard only checked ensureActivePage,
+    // so a manager missing runExclusive survived and every tool turn failed
+    // with "this.manager.runExclusive is not a function".
+    const slot = globalThis as unknown as Record<symbol, unknown>;
+    const key = Symbol.for("opencode.browser.session-manager");
+    const saved = slot[key];
+    let closed = 0;
+    const stale = {
+      ensureActivePage: async () => {
+        throw new Error("stale manager must not be used");
+      },
+      close: async () => {
+        closed += 1;
+      },
+    };
+    slot[key] = stale;
+    const ctx = {
+      tool: {
+        transform: async (cb: (editor: unknown) => void) => {
+          cb({ namespace: () => undefined, add: () => undefined });
+          return { dispose: async () => undefined };
+        },
+        list: async () => [],
+      },
+      permission: { assert: async () => undefined, hook: async () => ({ dispose: async () => undefined }) },
+    };
+    try {
+      await plugin.setup(ctx as never);
+      const manager = slot[key] as BrowserSessionManager;
+      expect(manager).not.toBe(stale as unknown);
+      expect(manager).toBeInstanceOf(BrowserSessionManager);
+      expect(closed).toBe(1);
+      expect(manager.getActivePage()).toBeNull();
+    } finally {
+      slot[key] = saved;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

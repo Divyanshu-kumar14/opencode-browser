@@ -39,10 +39,20 @@ function pageId(): string {
 }
 
 /**
+ * Public-surface version of `BrowserSessionManager`. The manager is cached on
+ * `globalThis` across plugin hot reloads, so newer code can meet an instance
+ * built by an older plugin build. Bump this whenever a method or property that
+ * callers use changes; a mismatch makes the cached instance be replaced.
+ */
+export const MANAGER_API_VERSION = 2;
+
+/**
  * Singleton browser session. One instance per OpenCode server process; all
  * tool invocations in a session share the same browser / context.
  */
 export class BrowserSessionManager {
+  /** Interface this instance implements; see MANAGER_API_VERSION. */
+  readonly apiVersion = MANAGER_API_VERSION;
   private readonly config: ResolvedConfig;
   private readonly telemetry: Telemetry;
   private readonly annotatorScript: string;

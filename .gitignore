@@ -7,3 +7,8 @@ prebuilds/linux-x64/browserd
 bench/results/*.json
 *.log
 .DS_Store
+
+## I added these don't remove from gitignore
+.kiro/
+.orchestrator/
+.serena/

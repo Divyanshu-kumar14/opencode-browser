@@ -1,6 +1,22 @@
+import type { PermissionDomain } from "@opencode/plugin/promise/permission";
 import type { BrowserSession } from "../core/browser-session.ts";
 
-/** What every tool handler is given. One dependency, one seam. */
+/** What every tool handler is given. */
 export interface ToolDeps {
   readonly session: BrowserSession;
+  /**
+   * Host permission domain. Required for browse_eval; `undefined` is allowed
+   * only in tests that never exercise eval.
+   */
+  readonly permission?: Pick<PermissionDomain, "assert">;
+  /** Whether the plugin upgrades browse_eval's permission to a prompt. */
+  readonly evalPrompt?: boolean;
+}
+
+/** The per-call context the host passes to a tool executor. */
+export interface ToolCallContext {
+  readonly sessionID: string;
+  readonly agent?: string;
+  readonly messageID: string;
+  readonly id: string;
 }

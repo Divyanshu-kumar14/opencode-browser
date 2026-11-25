@@ -21,12 +21,15 @@ interface RegisteredTool {
   description: string;
   input: Record<string, unknown>;
   options: { codemode: boolean; namespace: string };
-  execute: (input: unknown) => Promise<{ content: unknown; metadata?: unknown }>;
+  execute: (input: unknown, context: unknown) => Promise<{ content: unknown; metadata?: unknown }>;
 }
+
+const FAKE_CONTEXT = { sessionID: "ses_test", agent: "build", messageID: "msg_test", id: "call_test" };
+const FAKE_PERMISSION = { assert: async () => undefined };
 
 function register(session = new FakeBrowserSession()): {
   session: FakeBrowserSession;
-  tools: Map<string, RegisteredTool>;
+  tools: Map<string, { execute: (input: unknown) => Promise<{ content: unknown; metadata?: unknown }> } & Omit<RegisteredTool, "execute">>;
 } {
   const tools = new Map<string, RegisteredTool>();
   const editor = {
@@ -34,8 +37,14 @@ function register(session = new FakeBrowserSession()): {
       tools.set(tool.name, tool);
     },
   } as unknown as ToolEditor;
-  registerBrowserTools(editor, { session }, "browse");
-  return { session, tools };
+  registerBrowserTools(editor, { session, permission: FAKE_PERMISSION }, "browse");
+  const bound = new Map(
+    [...tools].map(([name, tool]) => [
+      name,
+      { ...tool, execute: (input: unknown) => tool.execute(input, FAKE_CONTEXT) },
+    ]),
+  );
+  return { session, tools: bound };
 }
 
 async function toolError(promise: Promise<unknown>): Promise<ToolError> {
@@ -228,7 +237,9 @@ describe("handler -> TurnRequest mapping", () => {
   test("eval forwards the expression", async () => {
     const { session, tools } = register();
     await tools.get("eval")!.execute({ expression: "document.title" });
-    expect(session.requests).toEqual([{ kind: "evaluate", expression: "document.title" }]);
+    expect(session.requests).toEqual([
+      { kind: "evaluate", expression: "document.title", approvedUrl: "about:blank" },
+    ]);
   });
 });
 

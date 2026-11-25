@@ -23,6 +23,7 @@ import { Plugin } from "@opencode/plugin";
 import { PlaywrightBrowserSession } from "./core/browser-session.ts";
 import { BrowserSessionManager } from "./core/session-manager.ts";
 import { registerBrowserTools } from "./tools/index.ts";
+import { registerEvalPrompt } from "./tools/evaluate.ts";
 
 const NAMESPACE = "browse";
 
@@ -63,9 +64,15 @@ export default Plugin.define({
     // is idempotent, so every plugin instance can call it safely.
     sessionManager.registerTeardown();
 
+    const config = sessionManager.getConfig();
     const deps = {
       session: new PlaywrightBrowserSession(sessionManager),
+      permission: ctx.permission,
+      evalPrompt: config.evalPrompt,
     };
+
+    // browse_eval runs arbitrary page JS: prompt even when no rule exists.
+    const evalPrompt = await registerEvalPrompt(ctx.permission, config.evalPrompt);
 
     const registration = await ctx.tool.transform((editor) => {
       editor.namespace({
@@ -83,8 +90,8 @@ export default Plugin.define({
       `[browse] registered ${ours.length}: ${ours.map((tool) => tool.id).join(", ")}`,
     );
 
-    return () => {
-      registration.dispose();
+    return async () => {
+      await Promise.all([registration.dispose(), evalPrompt?.dispose()]);
       // Intentionally do NOT close the browser: the next plugin instance (or
       // the next turn) reuses the same process-global session. Closing here is
       // what caused a fresh Chromium launch on every agent step.

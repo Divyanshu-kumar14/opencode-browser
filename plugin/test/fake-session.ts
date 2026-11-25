@@ -28,6 +28,12 @@ export class FakeBrowserSession implements BrowserSession {
     return this;
   }
 
+  url = "about:blank";
+
+  activeUrl(): string {
+    return this.url;
+  }
+
   async turn(request: TurnRequest): Promise<ToolResult> {
     this.requests.push(request);
     if (this.failure) throw this.failure;

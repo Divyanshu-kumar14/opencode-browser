@@ -87,10 +87,14 @@ What the agent sees:
 
 ```text
 URL: http://127.0.0.1:8787/ — Sign in
-[1] <input> "Email" (#email)
+[1] <input> "Email"
 [2] <button> "Sign in"
-[3] <div> "Select Environment" role=combobox
+[3] <div role="combobox"> "Select Environment"
 ```
+
+A role is printed only when it adds something over the tag, and disabled
+controls print as `<button disabled>`. Password, card-number, card-code, and
+one-time-code fields show `value="[redacted]"`.
 
 Then it acts by id: `browse_interact { "type": "click", "elementId": 2 }`. Ids are assigned in
 reading order on every turn, so after any mutation the next result carries a fresh map.
@@ -110,7 +114,8 @@ its built-in tools).
 | `browse_eval` | JavaScript in the page context (localStorage, globals, React state) | serialized value + screenshot + telemetry |
 
 `browse_eval` is **not a sandbox**: the expression runs with the page's privileges. Treat it as
-you would DevTools.
+you would DevTools. Each call asks for the `browser_eval` permission first (see
+[Security](#-security)).
 
 ### Input schemas
 
@@ -138,6 +143,9 @@ All options are optional; defaults shown.
 | `OPENCODE_BROWSER_SETTLE_QUIET_WINDOW_MS` | `250` | network quiet window |
 | `OPENCODE_BROWSER_NAVIGATION_TIMEOUT_MS` | `30000` | `goto` timeout |
 | `OPENCODE_BROWSER_NO_SANDBOX` | unset (auto for root) | `1` only where Chromium cannot sandbox (containers, CI) |
+| `OPENCODE_BROWSER_ALLOW_FILE_URLS` | unset (blocked) | `1` lets `browse_navigate` open `file:` URLs |
+| `OPENCODE_BROWSER_EVAL_PROMPT` | `1` (prompt) | `0` stops upgrading `browser_eval` from allow to ask; your permission rules then decide |
+| `OPENCODE_BROWSER_EVAL_TIMEOUT_MS` | `30000` | `browse_eval` deadline; a blocking script is terminated |
 
 Attach to an existing Chrome:
 
@@ -150,14 +158,24 @@ OPENCODE_BROWSER_CDP_URL=http://127.0.0.1:9222 opencode
 
 - **Profile:** a persistent Chromium profile under `.opencode/browser-profile` is reused across
   runs. Anything you log into stays logged in until that directory is removed.
+- **Navigation:** `browse_navigate goto` opens only `http:`, `https:`, and `about:` URLs. Other
+  schemes fail with `INVALID_INPUT`; `file:` needs `OPENCODE_BROWSER_ALLOW_FILE_URLS=1`.
+  Redirects and links the page follows are not re-checked.
 - **Screenshots:** annotated PNGs are written to `$TMPDIR/opencode/browser-screenshots` (temporary;
-  cleared on reboot) and attached to
-  tool results; they stay on disk.
-- **Eval:** arbitrary page-context JavaScript, with the page's privileges. It is not a sandbox
-  and is not permission-gated.
+  cleared on reboot) and attached to tool results; they stay on disk. The directory is `0700`
+  and each file is `0600`.
+- **Eval:** arbitrary page-context JavaScript, with the page's privileges. It is not a sandbox.
+  Every call asserts the `browser_eval` permission for the page URL, and the plugin turns the
+  default allow into a prompt; set `OPENCODE_BROWSER_EVAL_PROMPT=0` to leave the decision to your
+  permission rules. Each eval times out after `OPENCODE_BROWSER_EVAL_TIMEOUT_MS`. Whether an
+  "always" reply sticks has not been verified in the interactive TUI yet.
+- **Redaction:** password, card-number, card-code, and one-time-code values never appear in the
+  element map, and URLs in telemetry lose their query string, fragment, and userinfo.
 - **Sandbox:** Chromium sandboxing stays on unless `OPENCODE_BROWSER_NO_SANDBOX=1` or the
   process runs as root, where the sandbox cannot work.
 - **Page content** can still attack the browser itself (standard CDP caveat).
+
+[`docs/security.md`](docs/security.md) has the full model, including what is not protected.
 
 ## 🛠 Development
 
@@ -208,7 +226,7 @@ plugin no longer registers it. Both live in-tree for reference and benchmarking:
 | `chromium did not launch` | Install Chromium or set `OPENCODE_BROWSER_EXECUTABLE_PATH`; run `google-chrome --headless=new about:blank` by hand |
 | In CI, tests skip unless the gate is open | Set `OPENCODE_BROWSER_E2E=1` |
 | Blank or stale element map | The page may be cross-origin or empty; take `browse_snapshot` and check the screenshot |
-| `INVALID_INPUT` | A parameter failed the advertised zod schema — read the message and retry |
+| `INVALID_INPUT` | A parameter failed validation (schema, URL scheme, selector, or `select_option` label) — read the message and retry |
 | Screenshot missing from the result | Check `OPENCODE_BROWSER_SCREENSHOT_DIR` is writable |
 | Chromium leaves a stale profile lock | Kill leftover Chromium, then remove `.opencode/browser-profile/SingletonLock` |
 

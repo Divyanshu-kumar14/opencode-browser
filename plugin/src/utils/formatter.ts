@@ -4,6 +4,8 @@
  * and screenshot info into a compact single text block.
  */
 
+import { IMPLICIT_ROLE_BY_TAG } from "../core/som.ts";
+
 export interface ElementLine {
   readonly id: number;
   readonly tag: string;
@@ -37,16 +39,21 @@ export function escapeQuote(s: string): string {
   return sanitizePageText(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+/** True when `role` adds nothing over the tag (empty, the tag, or its implicit role). */
+function redundantRole(tag: string, role: string): boolean {
+  return role === "" || role === tag || role === IMPLICIT_ROLE_BY_TAG[tag];
+}
+
 export function formatElementMap(elements: readonly ElementLine[]): string {
   if (elements.length === 0) return "(no interactive elements in viewport)";
   const lines = elements.map((el) => {
-    const disabled = el.disabled ? " disabled" : "";
-    const tag = `<${el.tag}${el.role ? ` role="${escapeHtml(el.role)}"` : ""}${disabled}>`;
     const label = el.label ? ` "${escapeQuote(el.label)}"` : "";
     const value = el.value ? ` value="${escapeHtml(el.value)}"` : "";
     const href = el.tag === "a" && el.href ? ` href="${escapeHtml(el.href)}"` : "";
     const attrs = el.tag === "a" ? href : value;
-    return `[${el.id}] <${el.tag}${attrs}>${label}`;
+    const role = redundantRole(el.tag, el.role) ? "" : ` role="${escapeHtml(el.role)}"`;
+    const disabled = el.disabled ? " disabled" : "";
+    return `[${el.id}] <${el.tag}${attrs}${role}${disabled}>${label}`;
   });
   return lines.join("\n");
 }

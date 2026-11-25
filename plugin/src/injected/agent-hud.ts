@@ -39,11 +39,11 @@ export const AGENT_HUD_SCRIPT = (() => {
 
   const css = [
     ":host { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 2147483647; pointer-events: none; }",
-    ".pill { position: fixed; bottom: 24px; right: 24px; display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: rgba(20, 20, 20, 0.75); color: #fff; border: 1px solid rgba(255,255,255,0.35); backdrop-filter: blur(8px); font: 600 12px/1.2 system-ui, sans-serif; box-shadow: 0 4px 12px rgba(0,0,0,0.35); pointer-events: auto; opacity: 0; transition: opacity 120ms ease, transform 120ms ease; transform: translate3d(0, 10px, 0); }",
+    ".pill { position: fixed; bottom: 24px; right: 24px; display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: rgba(20, 20, 20, 0.75); color: #fff; border: 1px solid rgba(255,255,255,0.35); backdrop-filter: blur(8px); font: 600 12px/1.2 system-ui, sans-serif; box-shadow: 0 4px 12px rgba(0,0,0,0.35); pointer-events: none; opacity: 0; transition: opacity 120ms ease, transform 120ms ease; transform: translate3d(0, 10px, 0); }",
     ".pill.visible { opacity: 1; transform: translate3d(0, 0, 0); }",
     ".pill .dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 6px #22c55e; animation: ocPulse 1.2s infinite; }",
     "@keyframes ocPulse { 0%,100%{opacity:1} 50%{opacity:0.45} }",
-    ".cursor { position: fixed; z-index: 2147483647; pointer-events: none; width: 20px; height: 20px; transform-origin: 4px 6px; transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1); will-change: transform; }",
+    ".cursor { position: fixed; left: 0; top: 0; z-index: 2147483647; pointer-events: none; width: 20px; height: 20px; transform-origin: 4px 6px; transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1); will-change: transform; }",
     ".cursor svg { width: 100%; height: 100%; display: block; }",
     ".ripple { position: fixed; z-index: 2147483647; pointer-events: none; border: 2px solid rgba(59, 130, 246, 0.6); border-radius: 50%; transform: translate3d(-50%, -50%, 0) scale(0); opacity: 0; animation: ocRipple 500ms ease-out forwards; }",
     "@keyframes ocRipple { to { transform: translate3d(-50%, -50%, 0) scale(2.6); opacity: 0; } }",
@@ -94,8 +94,8 @@ export const AGENT_HUD_SCRIPT = (() => {
       pill.classList.add("visible"); visible = true;
     },
     moveCursor(x, y){
-      cursor.style.left = x + "px";
-      cursor.style.top = y + "px";
+      // The cursor sits at (0, 0); the transform alone places it, so the
+      // offset is applied once and the transition animates it.
       cursor.style.transform = "translate3d(" + x + "px, " + y + "px, 0)";
     },
     showClickRipple(x, y){

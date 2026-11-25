@@ -18,26 +18,34 @@ export type ViewportPreset = "desktop" | "laptop" | "tablet" | "mobile";
 
 export type TurnRequest =
   | {
-      readonly kind: "navigate";
-      readonly action: NavigationAction;
-      readonly url?: string;
-      readonly waitUntil?: WaitUntil;
-    }
+    readonly kind: "navigate";
+    readonly action: NavigationAction;
+    readonly url?: string;
+    readonly waitUntil?: WaitUntil;
+  }
   | { readonly kind: "act"; readonly actions: readonly Action[] }
   | { readonly kind: "observe"; readonly annotate?: boolean; readonly fullPage?: boolean }
   | {
-      readonly kind: "inspect";
-      readonly elementId?: number;
-      readonly selector?: string;
-      readonly cssProperties?: readonly string[];
-    }
+    readonly kind: "inspect";
+    readonly elementId?: number;
+    readonly selector?: string;
+    readonly cssProperties?: readonly string[];
+  }
   | {
-      readonly kind: "viewport";
-      readonly preset?: ViewportPreset;
-      readonly width?: number;
-      readonly height?: number;
-    }
-  | { readonly kind: "evaluate"; readonly expression: string };
+    readonly kind: "viewport";
+    readonly preset?: ViewportPreset;
+    readonly width?: number;
+    readonly height?: number;
+  }
+  | {
+    readonly kind: "evaluate";
+    readonly expression: string;
+    /**
+     * Redacted URL the user approved the eval for. The turn refuses to run
+     * the expression on any other page.
+     */
+    readonly approvedUrl?: string;
+  };
 
 export type ToolContentPart =
   | { readonly type: "text"; readonly text: string }
@@ -73,19 +81,19 @@ export interface TurnSnapshot {
 export type TurnOutcome =
   | { readonly kind: "page"; readonly snapshot: TurnSnapshot; readonly metadata?: Record<string, unknown> }
   | {
-      readonly kind: "inspect";
-      readonly snapshot: TurnSnapshot;
-      readonly lines: readonly string[];
-      readonly found: boolean;
-      readonly metadata?: Record<string, unknown>;
-    }
+    readonly kind: "inspect";
+    readonly snapshot: TurnSnapshot;
+    readonly lines: readonly string[];
+    readonly found: boolean;
+    readonly metadata?: Record<string, unknown>;
+  }
   | {
-      readonly kind: "evaluate";
-      readonly snapshot: TurnSnapshot;
-      readonly rendered: string;
-      readonly threw: boolean;
-      readonly metadata?: Record<string, unknown>;
-    };
+    readonly kind: "evaluate";
+    readonly snapshot: TurnSnapshot;
+    readonly rendered: string;
+    readonly threw: boolean;
+    readonly metadata?: Record<string, unknown>;
+  };
 
 /** Format any turn into the one payload shape every tool returns. */
 export function formatTurn(outcome: TurnOutcome): ToolResult {

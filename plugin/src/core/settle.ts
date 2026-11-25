@@ -8,6 +8,8 @@
  *      for quietWindowMs (default 250 ms) or until maxTimeoutMs (default 2500 ms),
  *   3. 2 consecutive requestAnimationFrame ticks + a MutationObserver quiet
  *      window (default 250 ms) so React / Next.js re-renders finish painting.
+ *      This step is bounded at quietWindowMs + 500 ms even when the page never
+ *      fires an animation frame.
  *
  * Requests start *during the action*, before `waitForSettled` is called. To see
  * them, create the activity tracker before executing the action and pass it in:
@@ -133,13 +135,31 @@ export async function waitForSettled(
     // 3) In-page: 2 consecutive rAFs, then a MutationObserver quiet window.
     // A navigation can destroy the context mid-evaluate; that only means the
     // render state is unknown, never that the completed action failed.
-    const renderQuiet = await page
+    // The page-side hard timer is armed before the first rAF, so a page whose
+    // rAF never fires (background tab, stubbed rAF) still resolves false. The
+    // host-side race bounds the evaluate itself.
+    const renderCheck = page
       .evaluate<boolean, number>((quietMs: number) => {
         const w = globalThis as unknown as Record<string, any>;
         return new Promise<boolean>((resolve) => {
+          let quietTimer: ReturnType<typeof setTimeout> | null = null;
+          let observer: { disconnect(): void } | null = null;
+          let done = false;
+          const finish = (value: boolean): void => {
+            if (done) return;
+            done = true;
+            observer?.disconnect();
+            if (quietTimer !== null) clearTimeout(quietTimer);
+            clearTimeout(hardTimer);
+            resolve(value);
+          };
+          // Hard fallback so a continuously-mutating page (or one with no
+          // animation frames) cannot wedge settle.
+          const hardTimer = setTimeout(() => finish(false), quietMs + 300);
           let rafs = 0;
           const nextRAF = (): void => {
             w.requestAnimationFrame(() => {
+              if (done) return;
               rafs += 1;
               if (rafs < 2) {
                 nextRAF();
@@ -147,35 +167,27 @@ export async function waitForSettled(
               }
               // MutationObserver quiet window after 2 rAFs. The timer starts
               // armed: a page that never mutates is settled, not timed out.
-              let quietTimer: ReturnType<typeof setTimeout> | null = null;
-              let hardTimer: ReturnType<typeof setTimeout> | null = null;
-              let done = false;
-              const finish = (value: boolean): void => {
-                if (done) return;
-                done = true;
-                observer.disconnect();
-                if (quietTimer !== null) clearTimeout(quietTimer);
-                if (hardTimer !== null) clearTimeout(hardTimer);
-                resolve(value);
-              };
-              const observer = new w.MutationObserver(() => {
+              const mo = new w.MutationObserver(() => {
                 if (quietTimer !== null) clearTimeout(quietTimer);
                 quietTimer = setTimeout(() => finish(true), quietMs);
               });
-              observer.observe(w.document.documentElement, {
+              observer = mo;
+              mo.observe(w.document.documentElement, {
                 childList: true,
                 subtree: true,
                 attributes: true,
               });
               quietTimer = setTimeout(() => finish(true), quietMs);
-              // Hard fallback so a continuously-mutating page cannot wedge settle.
-              hardTimer = setTimeout(() => finish(false), quietMs + 300);
             });
           };
           nextRAF();
         });
       }, quietWindowMs)
       .catch(() => false);
+    const renderQuiet = await Promise.race([
+      renderCheck,
+      sleep(quietWindowMs + 300 + 200).then(() => false),
+    ]);
 
     const durationMs = Date.now() - start;
     return {

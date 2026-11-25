@@ -32,6 +32,17 @@ export interface ResolvedConfig {
   readonly navigationTimeoutMs: number;
   /** Directory for saved screenshot PNGs. */
   readonly screenshotDir: string;
+  /** Allow `file:` URLs in browse_navigate (OPENCODE_BROWSER_ALLOW_FILE_URLS, default false). */
+  readonly allowFileUrls: boolean;
+  /**
+   * Upgrade browse_eval's permission effect from allow to ask, so the user is
+   * prompted even with no rules (OPENCODE_BROWSER_EVAL_PROMPT, default true).
+   */
+  readonly evalPrompt: boolean;
+  /** browse_eval deadline (OPENCODE_BROWSER_EVAL_TIMEOUT_MS, default 30000 ms). */
+  readonly evalTimeoutMs: number;
+  /** Perception budget per turn (no env var, default 15000 ms). */
+  readonly perceptionTimeoutMs: number;
 }
 
 function envBool(name: string, def: boolean): boolean {
@@ -100,5 +111,9 @@ export function loadConfig(): ResolvedConfig {
     screenshotDir:
       process.env["OPENCODE_BROWSER_SCREENSHOT_DIR"] ??
       path.join(os.tmpdir(), "opencode", "browser-screenshots"),
+    allowFileUrls: envBool("OPENCODE_BROWSER_ALLOW_FILE_URLS", false),
+    evalPrompt: envBool("OPENCODE_BROWSER_EVAL_PROMPT", true),
+    evalTimeoutMs: envNum("OPENCODE_BROWSER_EVAL_TIMEOUT_MS", 30000),
+    perceptionTimeoutMs: 15000,
   };
 }

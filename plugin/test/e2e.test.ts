@@ -228,7 +228,8 @@ describe("perception-action engine e2e", () => {
 
     const eres = await evalExec(
       { expression: "document.title" },
-      { session: session! },
+      { session: session!, permission: { assert: async () => undefined } },
+      { sessionID: "ses_e2e", messageID: "msg_e2e", id: "call_e2e" },
     );
     expect(firstContent(eres)).toContain("Fixture");
     // Regression: eval used to write an orphan screenshot and drop it.

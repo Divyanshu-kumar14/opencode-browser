@@ -10,6 +10,8 @@
  * efficiency, and tags DOM nodes with `data-opencode-id` for fast lookup.
  */
 
+import { IMPLICIT_ROLE_BY_TAG } from "../core/som.ts";
+
 export function makeDomAnnotatorScript(maxElements = 100): string {
   const script = `
 (function(){
@@ -25,13 +27,23 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
   const SELECTOR =
     'a[href],button,input:not([type="hidden"]),textarea,select,summary,details,' +
     '[role],[contenteditable="true"],[onclick],[tabindex]';
-  const ROLE_BY_TAG = {
-    a: "link", button: "button", input: "textbox", select: "listbox",
-    textarea: "textbox", summary: "button", details: "button"
-  };
+  const ROLE_BY_TAG = ${JSON.stringify(IMPLICIT_ROLE_BY_TAG)};
 
   let indexed = []; // { id, tag, role, label, value, selectorFallback, bbox }
   const byId = new Map(); // id -> element
+
+  // Fields whose value must never leave the page: passwords, card numbers,
+  // card security codes, and one-time codes.
+  const SENSITIVE_AUTOCOMPLETE = ["cc-number", "cc-csc", "one-time-code"];
+  function isSensitive(el){
+    if (!el || !el.getAttribute) return false;
+    if (el.tagName === "INPUT" && String(el.type).toLowerCase() === "password") return true;
+    const ac = (el.getAttribute("autocomplete") || "").toLowerCase().split(/\\s+/);
+    for (const token of ac){
+      if (SENSITIVE_AUTOCOMPLETE.indexOf(token) !== -1) return true;
+    }
+    return false;
+  }
 
   function textOf(el){
     if (!el) return "";
@@ -39,8 +51,21 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     if (ariaLabel) return ariaLabel.trim();
     const labelledBy = el.getAttribute("aria-labelledby");
     if (labelledBy){
-      const ref = document.getElementById(labelledBy);
-      if (ref) return (ref.textContent || "").trim();
+      // A space-separated id list; ids resolve in the element's own (shadow)
+      // root first, then the document.
+      const root = el.getRootNode ? el.getRootNode() : document;
+      const parts = [];
+      for (const id of labelledBy.split(/\\s+/)){
+        if (!id) continue;
+        let ref = null;
+        if (root && root !== document && typeof root.getElementById === "function") ref = root.getElementById(id);
+        if (!ref) ref = document.getElementById(id);
+        if (!ref) continue;
+        const t = (ref.textContent || "").trim();
+        if (t) parts.push(t);
+      }
+      const joined = parts.join(" ");
+      if (joined) return joined;
     }
     // associated label for inputs / custom controls
     const idAttr = el.getAttribute("id");
@@ -55,7 +80,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     }
     const placeholder = el.getAttribute("placeholder");
     if (placeholder) return placeholder.trim();
-    const value = el.value;
+    const value = isSensitive(el) ? undefined : el.value;
     if (value !== undefined && value !== "") return value.trim();
     const title = el.getAttribute("title");
     if (title) return title.trim();
@@ -110,12 +135,49 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
               rect.x > vw + buffer || rect.y > vh + buffer);
   }
 
+  // Hit-test through open shadow roots; document.elementFromPoint stops at
+  // the shadow host.
+  function deepElementFromPoint(x, y){
+    let hit = document.elementFromPoint(x, y);
+    while (hit && hit.shadowRoot){
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    return hit;
+  }
+
+  // Node.contains across shadow boundaries (walks ShadowRoot.host).
+  function composedContains(a, b){
+    let n = b;
+    while (n){
+      if (n === a) return true;
+      if (n.parentNode) n = n.parentNode;
+      else if (n.host) n = n.host;
+      else return false;
+    }
+    return false;
+  }
+
+  // Our own HUD and badge overlay never count as covering the page.
+  function isAgentChrome(node){
+    let n = node;
+    while (n){
+      if (n.tagName === "OPENCODE-AGENT-HUD" || n.id === "opencode-som-overlay") return true;
+      if (n.parentNode) n = n.parentNode;
+      else if (n.host) n = n.host;
+      else return false;
+    }
+    return false;
+  }
+
   function isOccluded(el, rect){
     const cx = Math.round(rect.centerX), cy = Math.round(rect.centerY);
-    const top = document.elementFromPoint(cx, cy);
+    const top = deepElementFromPoint(cx, cy);
     if (!top) return false;
     if (top === el) return false;
-    if (el.contains(top)) return false;
+    if (composedContains(el, top)) return false;
+    if (isAgentChrome(top)) return false;
     // ancestor <label> covering the input is OK
     let anc = top;
     while (anc && anc !== document.documentElement){
@@ -140,8 +202,9 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     return false;
   }
 
-  function collectFromRoot(root, out, visited){
+  function collectFromRoot(root, out, visited, roots){
     if (!root || !root.querySelectorAll) return;
+    if (roots) roots.add(root);
     try {
       const nodes = root.querySelectorAll(SELECTOR);
       for (const el of nodes){
@@ -157,18 +220,24 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
       const all = root.querySelectorAll("*");
       for (const el of all){
         if (el instanceof HTMLElement && el.shadowRoot && !visited.has(el)){
-          collectFromRoot(el.shadowRoot, out, visited);
+          collectFromRoot(el.shadowRoot, out, visited, roots);
         }
       }
     } catch {}
   }
 
   function indexPage(){
+    // Drop the ids from the previous indexing first: an element that leaves
+    // the index must not keep an id that is about to be reused.
+    for (const old of byId.values()){
+      try { old.removeAttribute("data-opencode-id"); } catch {}
+    }
     indexed = [];
     byId.clear();
     const visited = new Set();
     const candidates = [];
-    collectFromRoot(document, candidates, visited);
+    const searchedRoots = new Set();
+    collectFromRoot(document, candidates, visited, searchedRoots);
     // include document.body-level shadow hosts missed above (defensive)
     const roots = [document];
     const seenRoots = new Set([document]);
@@ -178,7 +247,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
       if (!node || !node.shadowRoot) continue;
       if (!seenRoots.has(node.shadowRoot)){
         seenRoots.add(node.shadowRoot);
-        collectFromRoot(node.shadowRoot, candidates, visited);
+        collectFromRoot(node.shadowRoot, candidates, visited, searchedRoots);
         roots.push(node.shadowRoot);
       }
       for (let i = node.children.length - 1; i >= 0; i--){
@@ -203,6 +272,13 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
       return Math.round(a.rect.x) - Math.round(b.rect.x);
     });
 
+    // Sweep ids that survived a lost byId (e.g. a re-installed script).
+    for (const root of searchedRoots){
+      try {
+        for (const stale of root.querySelectorAll("[data-opencode-id]")) stale.removeAttribute("data-opencode-id");
+      } catch {}
+    }
+
     const out = [];
     let n = 0;
     for (const { el, rect } of rects){
@@ -213,8 +289,11 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
       el.setAttribute("data-opencode-id", String(id));
       const entry = {
         id, tag, role: roleOf(el), label: labelOf(el),
-        value: el.value !== undefined ? String(el.value) : "",
+        value: el.value === undefined ? ""
+          : isSensitive(el) ? (el.value ? "[redacted]" : "")
+          : String(el.value),
         href: el.getAttribute("href") || "",
+        disabled: el.disabled === true || el.getAttribute("aria-disabled") === "true",
         selectorFallback: cssSelector(el),
         bbox: { x: Math.round(rect.x), y: Math.round(rect.y),
                 width: Math.round(rect.width), height: Math.round(rect.height),

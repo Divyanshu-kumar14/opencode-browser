@@ -4,8 +4,9 @@
  * Each tool module exports `description`, `schema` (zod, the single source of
  * truth) and `execute(input, deps)`. `defineTool` links the two, and the
  * registry derives the advertised JSON Schema from zod so the two can never
- * drift. The wrapper converts validation failures to `INVALID_INPUT` and
- * execution failures to `INTERNAL`, both as `Tool.Error`.
+ * drift. The wrapper converts validation failures and `InvalidInputError` to
+ * `INVALID_INPUT` and other execution failures to `INTERNAL`, both as
+ * `Tool.Error`. Permission rejections pass through by identity.
  */
 
 import { Error as ToolError } from "@opencode/plugin/promise/tool";
@@ -18,13 +19,17 @@ import * as snapshotTool from "./snapshot.ts";
 import * as inspectTool from "./inspect.ts";
 import * as viewportTool from "./viewport.ts";
 import * as evaluateTool from "./evaluate.ts";
-import type { ToolDeps } from "./types.ts";
+import type { ToolCallContext, ToolDeps } from "./types.ts";
+import { isPassthrough } from "./passthrough.ts";
+import { isInvalidInputError } from "../core/errors.ts";
 
 interface AnyTool {
   readonly name: string;
   readonly description: string;
   readonly schema: z.ZodTypeAny;
-  readonly execute: (input: unknown, deps: ToolDeps) => Promise<ToolResult>;
+  /** Host permission name advertised in the tool options (browse_eval). */
+  readonly permission?: string;
+  readonly execute: (input: unknown, deps: ToolDeps, context: ToolCallContext) => Promise<ToolResult>;
 }
 
 /** Link a zod schema to its handler; the schema stays the only declaration. */
@@ -32,13 +37,19 @@ function defineTool<S extends z.ZodTypeAny>(definition: {
   readonly name: string;
   readonly description: string;
   readonly schema: S;
-  readonly execute: (input: z.infer<S>, deps: ToolDeps) => Promise<ToolResult>;
+  readonly permission?: string;
+  readonly execute: (
+    input: z.infer<S>,
+    deps: ToolDeps,
+    context: ToolCallContext,
+  ) => Promise<ToolResult>;
 }): AnyTool {
   return {
     name: definition.name,
     description: definition.description,
     schema: definition.schema,
-    execute: (input, deps) => definition.execute(input as z.infer<S>, deps),
+    ...(definition.permission === undefined ? {} : { permission: definition.permission }),
+    execute: (input, deps, context) => definition.execute(input as z.infer<S>, deps, context),
   };
 }
 
@@ -77,6 +88,7 @@ const tools: readonly AnyTool[] = [
     name: "eval",
     description: evaluateTool.description,
     schema: evaluateTool.schema,
+    permission: evaluateTool.PERMISSION,
     execute: evaluateTool.execute,
   }),
 ];
@@ -132,8 +144,12 @@ export function registerBrowserTools(
       name: tool.name,
       description: tool.description,
       input: inputSchema(tool.schema),
-      options: { codemode: true, namespace },
-      execute: async (input: unknown) => {
+      options: {
+        codemode: true,
+        namespace,
+        ...(tool.permission === undefined ? {} : { permission: tool.permission }),
+      },
+      execute: async (input: unknown, context: ToolCallContext) => {
         let parsed: unknown;
         try {
           parsed = tool.schema.parse(input);
@@ -148,10 +164,19 @@ export function registerBrowserTools(
         }
 
         try {
-          const result = await tool.execute(parsed, deps);
+          const result = await tool.execute(parsed, deps, context);
           return { content: result.content, metadata: result.metadata };
         } catch (error) {
-          if (isToolError(error)) throw error;
+          if (isToolError(error) || isPassthrough(error)) throw error;
+          if (isInvalidInputError(error)) {
+            throw new ToolError({
+              message: error.message,
+              metadata: {
+                code: "INVALID_INPUT",
+                hint: error.hint ?? "check the tool's parameters and retry",
+              },
+            });
+          }
           throw new ToolError({
             message: error instanceof Error ? error.message : String(error),
             metadata: {

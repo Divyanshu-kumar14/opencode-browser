@@ -10,7 +10,11 @@
  * OAuth popups, …) is tracked; the active page pointer moves to new tabs and
  * a "switched to new tab" notification is emitted for the next tool response.
  *
- * Graceful teardown on SIGINT / SIGTERM / beforeExit.
+ * Concurrency: one launch at a time (single-flight), and `runExclusive`
+ * serializes tool turns so two turns never interleave on the shared page.
+ *
+ * Graceful teardown on SIGINT / SIGTERM / beforeExit. Signals close the
+ * browser and then let the process end the way it would have without us.
  */
 
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
@@ -60,7 +64,13 @@ export class BrowserSessionManager {
    * Pending tab switch for the next tool response. The page is stored, not its
    * URL: at the `page` event the URL is still about:blank.
    */
-  private pendingTabSwitch: Page | null = null;
+  private pendingTabSwitch: { readonly page: Page; readonly reason: "opened" | "closed" } | null = null;
+
+  /** In-flight launch, shared by concurrent callers (single-flight). */
+  private launching: Promise<void> | null = null;
+  /** Tail of the turn queue; each turn waits for the previous one. */
+  private turnQueue: Promise<void> = Promise.resolve();
+  private turnsActive = 0;
 
   constructor(config?: Partial<ResolvedConfig>) {
     this.config = { ...loadConfig(), ...(config ?? {}) };
@@ -81,6 +91,31 @@ export class BrowserSessionManager {
   /** Stable id for a page; the one place page identity is assigned. */
   pageIdFor(page: Page): string {
     return pageIdOf(page);
+  }
+
+  /**
+   * Run `fn` with exclusive use of the browser: turns run one at a time, in
+   * call order. The lock is released whether `fn` resolves or rejects.
+   */
+  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.turnQueue;
+    let release!: () => void;
+    this.turnQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    this.turnsActive += 1;
+    try {
+      return await fn();
+    } finally {
+      this.turnsActive -= 1;
+      release();
+    }
+  }
+
+  /** True while a turn holds the lock. */
+  isTurnActive(): boolean {
+    return this.turnsActive > 0;
   }
 
   /** Ensure a browser + context exist and return the active page (creating one if needed). */
@@ -187,10 +222,11 @@ export class BrowserSessionManager {
 
   /** Consume and return any pending tab-switch notification. */
   takeTabSwitchNotification(): string | null {
-    const page = this.pendingTabSwitch;
+    const pending = this.pendingTabSwitch;
     this.pendingTabSwitch = null;
-    if (!page || page.isClosed()) return null;
-    return `Switched to new tab: ${page.url()}`;
+    if (!pending || pending.page.isClosed()) return null;
+    if (pending.reason === "closed") return `Active tab closed; switched to tab: ${pending.page.url()}`;
+    return `Switched to new tab: ${pending.page.url()}`;
   }
 
   /** Close the browser / context and clear all state. */
@@ -219,16 +255,22 @@ export class BrowserSessionManager {
   registerTeardown(): void {
     if (this.teardownArmed) return;
     this.teardownArmed = true;
-    // Installing a signal handler replaces Node's default termination, so the
-    // handler must exit after closing. `beforeExit` must not call exit.
-    const closeAndExit = (): void => {
-      void this.close().finally(() => process.exit(0));
+    // Installing a signal handler replaces the default termination. After the
+    // browser is closed (bounded at 5 s), re-raise the signal only when no
+    // other listener remains: the default action then ends the process with
+    // the right signal status. When the host has its own handlers, they own
+    // termination. Never process.exit(0): that reports success for a signal
+    // and cuts off the host's asynchronous cleanup.
+    const onSignal = (signal: NodeJS.Signals): void => {
+      void Promise.race([this.close(), sleepMs(5000)]).finally(() => {
+        if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+      });
     };
     const closeOnly = (): void => {
       void this.close();
     };
-    process.once("SIGINT", closeAndExit);
-    process.once("SIGTERM", closeAndExit);
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
     process.on("beforeExit", closeOnly);
   }
 
@@ -295,7 +337,8 @@ export class BrowserSessionManager {
   }
 
   private async watchTick(): Promise<void> {
-    if (this.closed || this.viewportPinned) return;
+    // Never resize mid-turn: indexing and the screenshot must see one viewport.
+    if (this.closed || this.viewportPinned || this.turnsActive > 0) return;
     const page = this.activePage;
     if (!page || page.isClosed()) return;
     const geom = await readWindowGeometry(page);
@@ -307,45 +350,89 @@ export class BrowserSessionManager {
   // ------------------------------------------------------------------
 
   private async ensureBrowser(): Promise<void> {
-    if (this.browser && this.context) return;
-    if (this.config.cdpUrl) {
-      this.browser = await chromium.connectOverCDP(this.config.cdpUrl);
-      const contexts = this.browser.contexts();
-      const first = contexts[0];
-      this.context = first ?? (await this.browser.newContext());
-    } else {
-      // Headful: open maximized and sync the automation viewport to the real
-      // window size so no unpainted strip can appear. (launchPersistentContext
-      // ignores `noViewport`, so this is done explicitly.) Playwright passes
-      // --no-sandbox unless chromiumSandbox is enabled — that flag is what
-      // drew Chrome's "unsupported command-line flag" infobar, so opt in.
-      // Headless keeps the deterministic 1280x720 default (tests, screenshots).
-      const headful = !this.config.headless;
-      this.context = await chromium.launchPersistentContext(this.config.profileDir, {
-        headless: this.config.headless,
-        executablePath: this.config.executablePath,
-        chromiumSandbox: !this.config.noSandbox,
-        args: [
-          ...(this.config.noSandbox ? ["--no-sandbox"] : []),
-          "--disable-dev-shm-usage",
-          "--disable-background-networking",
-          "--disable-sync",
-          "--disable-extensions",
-          "--mute-audio",
-          ...(headful ? ["--start-maximized"] : []),
-        ],
-      });
-      this.browser = this.context.browser();
-      if (headful) {
-        await this.syncViewportToWindow(this.context);
-        this.startViewportWatch();
+    if (this.browserReady()) return;
+    // Single-flight: concurrent callers share one launch instead of racing
+    // two launches onto the same profile.
+    this.launching ??= this.launchAndSetup().finally(() => {
+      this.launching = null;
+    });
+    await this.launching;
+  }
+
+  private browserReady(): boolean {
+    return this.browser !== null && this.context !== null;
+  }
+
+  /**
+   * Launch (or attach) and run every setup step on locals. State is published
+   * only after all steps succeed, so a failure leaves nothing half-initialized
+   * and the next call runs the full setup again.
+   */
+  private async launchAndSetup(): Promise<void> {
+    const headful = !this.config.cdpUrl && !this.config.headless;
+    let browser: Browser | null = null;
+    let context: BrowserContext | null = null;
+    try {
+      if (this.config.cdpUrl) {
+        browser = await chromium.connectOverCDP(this.config.cdpUrl);
+        const first = browser.contexts()[0];
+        context = first ?? (await browser.newContext());
+      } else {
+        // Headful: open maximized and sync the automation viewport to the real
+        // window size so no unpainted strip can appear. (launchPersistentContext
+        // ignores `noViewport`, so this is done explicitly.) Playwright passes
+        // --no-sandbox unless chromiumSandbox is enabled — that flag is what
+        // drew Chrome's "unsupported command-line flag" infobar, so opt in.
+        // Headless keeps the deterministic 1280x720 default (tests, screenshots).
+        context = await chromium.launchPersistentContext(this.config.profileDir, {
+          headless: this.config.headless,
+          executablePath: this.config.executablePath,
+          chromiumSandbox: !this.config.noSandbox,
+          args: [
+            ...(this.config.noSandbox ? ["--no-sandbox"] : []),
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-extensions",
+            "--mute-audio",
+            ...(headful ? ["--start-maximized"] : []),
+          ],
+        });
+        browser = context.browser();
+        if (headful) await this.syncViewportToWindow(context);
       }
+
+      // Init scripts run on EVERY document (including after navigations), so
+      // the SoM indexer and HUD survive page loads. registerPage() also
+      // evaluates them once for pages that already exist.
+      await context.addInitScript(this.annotatorScript);
+      await context.addInitScript(AGENT_HUD_SCRIPT);
+      this.registerContextTracking(context);
+    } catch (error) {
+      // Roll back: close what we launched (an attached browser is only
+      // disconnected, never closed) and clear everything setup touched.
+      this.stopViewportWatch();
+      if (this.config.cdpUrl) {
+        await browser?.close().catch(() => undefined);
+      } else {
+        await context?.close().catch(() => undefined);
+      }
+      this.viewportRatio = null;
+      this.deathWatchArmed = false;
+      this.pages.clear();
+      this.perceptionInstalled.clear();
+      this.activePage = null;
+      this.pendingTabSwitch = null;
+      throw error;
     }
+
+    this.context = context;
+    this.browser = browser;
+    if (headful) this.startViewportWatch();
 
     // Dead-browser recovery: if Chromium dies (or is killed externally), drop
     // the stale handles so the next tool call relaunches cleanly instead of
     // wedging on a dead connection. Skipped during intentional close().
-    const browser = this.browser;
     if (browser !== null && !this.deathWatchArmed) {
       this.deathWatchArmed = true;
       browser.on("disconnected", () => {
@@ -356,14 +443,6 @@ export class BrowserSessionManager {
         this.deathWatchArmed = false;
       });
     }
-
-    // Init scripts run on EVERY document (including after navigations), so the
-    // SoM indexer and HUD survive page loads. registerPage() below also
-    // evaluates them once for pages that already exist.
-    await this.context.addInitScript(this.annotatorScript);
-    await this.context.addInitScript(AGENT_HUD_SCRIPT);
-
-    this.registerContextTracking(this.context!);
   }
 
   private registerContextTracking(context: BrowserContext): void {
@@ -371,7 +450,7 @@ export class BrowserSessionManager {
       this.registerPage(page);
       // Auto-switch active pointer to newly opened tabs (target=_blank, popups).
       this.setActive(page);
-      this.pendingTabSwitch = page;
+      this.pendingTabSwitch = { page, reason: "opened" };
     });
     for (const page of context.pages()) {
       this.registerPage(page);
@@ -394,6 +473,7 @@ export class BrowserSessionManager {
         for (const candidate of this.pages.values()) {
           if (!candidate.isClosed()) {
             this.setActive(candidate);
+            this.pendingTabSwitch = { page: candidate, reason: "closed" };
             break;
           }
         }
@@ -442,4 +522,11 @@ function pageIdOf(page: Page): string {
   const generated = pageId();
   pageIds.set(page, generated);
   return generated;
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms) as unknown as { unref?: () => void };
+    if (typeof t.unref === "function") t.unref();
+  });
 }

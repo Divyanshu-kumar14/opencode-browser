@@ -53,6 +53,9 @@ const ActionSchema = ActionShape.refine(
 ).refine(
   (action) => action.type !== "drag" || (action.toX !== undefined && action.toY !== undefined),
   { message: "drag requires `toX` and `toY`", path: ["toX"] },
+).refine(
+  (action) => action.type !== "select_option" || action.text !== undefined,
+  { message: "select_option requires `text` (the option label)", path: ["text"] },
 );
 
 export const schema = z
@@ -83,6 +86,10 @@ export const schema = z
   .refine(
     (input) => input.type !== "drag" || (input.toX !== undefined && input.toY !== undefined),
     { message: "drag requires `toX` and `toY`", path: ["toX"] },
+  )
+  .refine(
+    (input) => input.type !== "select_option" || input.text !== undefined,
+    { message: "select_option requires `text` (the option label)", path: ["text"] },
   );
 
 export type Input = z.infer<typeof schema>;

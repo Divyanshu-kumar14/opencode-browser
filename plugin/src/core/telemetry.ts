@@ -11,7 +11,12 @@
  * Delta-cursor architecture: `drain()` returns only events added since the
  * last drain and advances the cursor, so each tool execution reports only the
  * *new* errors since the previous tool call.
+ *
+ * URLs are redacted at the source (query, fragment, and userinfo removed), so
+ * tokens in request URLs never reach the tool output.
  */
+
+import { redactUrl, redactUrlsInText } from "./url-policy.ts";
 
 export interface TelemetryEvent {
   type: "console" | "pageerror" | "response" | "requestfailed";
@@ -46,7 +51,7 @@ export class Telemetry {
       const type = msg.type();
       if (type !== "error" && type !== "warning") return;
       const loc = msg.location();
-      const source = loc.url || "(inline)";
+      const source = loc.url ? redactUrl(loc.url) : "(inline)";
       const text = `[${type.toUpperCase()}] ${msg.text()} (${source})`;
       this.addConsole(text);
     });
@@ -56,6 +61,7 @@ export class Telemetry {
         .split("\n")
         .slice(1, 4)
         .filter(Boolean)
+        .map((frame) => redactUrlsInText(frame))
         .join(" | ");
       this.add({
         type: "pageerror",
@@ -67,10 +73,11 @@ export class Telemetry {
 
     page.on("response", (resp) => {
       if (resp.status() < 400) return;
+      const url = redactUrl(resp.url());
       this.add({
         type: "response",
-        text: `[HTTP ${resp.status()}] ${resp.request().method()} ${resp.url()}`,
-        source: resp.url(),
+        text: `[HTTP ${resp.status()}] ${resp.request().method()} ${url}`,
+        source: url,
         timestamp: Date.now(),
       });
     });
@@ -78,10 +85,11 @@ export class Telemetry {
     page.on("requestfailed", (req) => {
       const failure = req.failure();
       const reason = failure?.errorText ?? "failed";
+      const url = redactUrl(req.url());
       this.add({
         type: "requestfailed",
-        text: `[NET FAIL] ${req.method()} ${req.url()} - net::${reason}`,
-        source: req.url(),
+        text: `[NET FAIL] ${req.method()} ${url} - net::${reason}`,
+        source: url,
         timestamp: Date.now(),
       });
     });
@@ -113,8 +121,9 @@ export class Telemetry {
     this.events.push(event);
     if (this.events.length > this.max) {
       this.events.shift();
-      // Cursor may now exceed the (trimmed) length; clamp on drain.
-      if (this.cursor > this.events.length) this.cursor = this.events.length;
+      // The cursor counts drained events still in the ring. Evicting the
+      // oldest moves it back by one, or new events would be skipped forever.
+      if (this.cursor > 0) this.cursor -= 1;
     }
   }
 

@@ -7,6 +7,7 @@
  */
 
 import type { Page } from "playwright";
+import { InvalidInputError } from "./errors.ts";
 import { SOM_ATTRIBUTE } from "./som.ts";
 import { sanitizePageText } from "../utils/formatter.ts";
 
@@ -29,6 +30,8 @@ export interface InspectResult {
 }
 
 interface InspectInfo {
+  /** Set when `querySelector` rejected the selector. */
+  invalidSelector?: string;
   tag?: string;
   role?: string;
   classes?: string;
@@ -54,11 +57,16 @@ export async function inspectElement(page: Page, input: InspectInput): Promise<I
       const g = globalThis as unknown as Record<string, any>;
       const doc = g["document"];
       const getStyle = g["getComputedStyle"];
-      const el = (
-        args.mode === "id"
-          ? doc.querySelector(`[${args.attribute}="${args.target}"]`)
-          : doc.querySelector(args.target)
-      );
+      let el;
+      try {
+        el = (
+          args.mode === "id"
+            ? doc.querySelector(`[${args.attribute}="${args.target}"]`)
+            : doc.querySelector(args.target)
+        );
+      } catch (error) {
+        return { invalidSelector: error instanceof Error ? error.message : String(error) };
+      }
       if (!el) return null;
       const r = el.getBoundingClientRect();
       const style = getStyle(el);
@@ -73,7 +81,8 @@ export async function inspectElement(page: Page, input: InspectInput): Promise<I
       return {
         tag: el.tagName.toLowerCase(),
         role: el.getAttribute("role") || "",
-        classes: el.className || "",
+        // getAttribute, not className: SVG elements expose an SVGAnimatedString.
+        classes: el.getAttribute("class") ?? "",
         attributes,
         innerText: (el.innerText || "").slice(0, 500),
         bbox: {
@@ -94,6 +103,12 @@ export async function inspectElement(page: Page, input: InspectInput): Promise<I
 
   const lines: string[] = [];
   const clean = sanitizePageText;
+  if (info?.invalidSelector !== undefined) {
+    throw new InvalidInputError(
+      `invalid selector "${clean(target).slice(0, 200)}": ${clean(info.invalidSelector).slice(0, 200)}`,
+      "fix the CSS selector or use an elementId from the element map",
+    );
+  }
   if (!info) {
     lines.push(`Element not found: ${mode === "id" ? `[${clean(target)}]` : clean(target)}`);
     return { lines, found: false };

@@ -14,11 +14,11 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Page, Locator } from "playwright";
-import { waitForSettled } from "./settle.ts";
+import type { ElementHandle, Page, Locator } from "playwright";
+import { InvalidInputError } from "./errors.ts";
 import { somSelector } from "./som.ts";
 import { Telemetry } from "./telemetry.ts";
-import type { ElementLine } from "../utils/formatter.ts";
+import { sanitizePageText, type ElementLine } from "../utils/formatter.ts";
 
 export type ActionType =
   | "click"
@@ -94,6 +94,40 @@ export function hudRipple(page: Page, x: number, y: number): Promise<unknown> {
       if (h) h.showClickRipple(args.x, args.y);
     }, { x, y })
     .catch(() => undefined);
+}
+
+/**
+ * Page-side hit test that descends into open shadow roots (the annotator's
+ * `deepElementFromPoint`, serialized for `page.evaluateHandle`).
+ */
+function deepElementFromPointInPage(point: { x: number; y: number }): unknown {
+  const doc = (globalThis as unknown as Record<string, any>)["document"];
+  let hit = doc.elementFromPoint(point.x, point.y);
+  while (hit && hit.shadowRoot) {
+    const inner = hit.shadowRoot.elementFromPoint(point.x, point.y);
+    if (!inner || inner === hit) break;
+    hit = inner;
+  }
+  return hit;
+}
+
+/** The element at viewport (x, y), piercing open shadow roots, or null. */
+async function elementAtPoint(
+  page: Page,
+  point: { x: number; y: number },
+): Promise<ElementHandle | null> {
+  const handle = await page.evaluateHandle(deepElementFromPointInPage, point);
+  const element = handle.asElement();
+  if (!element) {
+    await handle.dispose();
+    return null;
+  }
+  return element as ElementHandle;
+}
+
+function short(text: string, max = 200): string {
+  const clean = sanitizePageText(text);
+  return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
 }
 
 /** Resolve an action's target to a Playwright Locator, or null. */
@@ -177,6 +211,14 @@ export async function execAction(page: Page, action: Action): Promise<void> {
       if (loc) {
         await loc.focus();
         await loc.fill(action.text ?? "");
+      } else if (center) {
+        const element = await elementAtPoint(page, center);
+        if (!element) throw new Error(`clear_and_type: no element at (${center.x}, ${center.y})`);
+        try {
+          await element.fill(action.text ?? "");
+        } finally {
+          await element.dispose();
+        }
       }
       if (action.pressEnter) await page.keyboard.press("Enter");
       break;
@@ -192,14 +234,34 @@ export async function execAction(page: Page, action: Action): Promise<void> {
       break;
     }
     case "select_option": {
-      if (loc) {
-        const el = await loc.elementHandle();
-        if (el) {
-          const tag = await el.evaluate((node: unknown) => (node as { tagName: string }).tagName);
-          if (tag === "SELECT" && action.text !== undefined) {
-            await loc.selectOption({ label: action.text });
-          }
+      if (action.text === undefined) {
+        throw new InvalidInputError("select_option requires `text` (the option label)");
+      }
+      const el = loc ? await loc.elementHandle() : center ? await elementAtPoint(page, center) : null;
+      if (!el) throw new Error(`select_option: no element at ${label ?? "the target"}`);
+      try {
+        const info = await el.evaluate((node: unknown) => {
+          const n = node as { tagName: string; options?: ArrayLike<{ label: string }> };
+          return {
+            tag: n.tagName,
+            labels: n.tagName === "SELECT" && n.options ? Array.from(n.options, (o) => o.label) : [],
+          };
+        });
+        if (info.tag !== "SELECT") {
+          throw new InvalidInputError(
+            `select_option target is <${short(info.tag.toLowerCase(), 40)}>, not <select>`,
+          );
         }
+        if (!info.labels.includes(action.text)) {
+          const options = info.labels.slice(0, 20).map((l) => `"${short(l, 60)}"`).join(", ");
+          throw new InvalidInputError(
+            `no option labelled "${short(action.text)}"; options: ${options || "(none)"}`,
+          );
+        }
+        if (loc) await loc.selectOption({ label: action.text });
+        else await el.selectOption({ label: action.text });
+      } finally {
+        await el.dispose();
       }
       break;
     }
@@ -212,13 +274,28 @@ export async function execAction(page: Page, action: Action): Promise<void> {
       else if (dir === "down") dy = amount;
       else if (dir === "left") dx = -amount;
       else if (dir === "right") dx = amount;
-      if (center) await page.mouse.wheel(dx, dy);
-      else await page.mouse.wheel(dx, dy);
+      if (loc) {
+        // Wheel over the target so its own scroll container moves.
+        await loc.scrollIntoViewIfNeeded();
+        const box = await loc.boundingBox();
+        if (!box) throw new Error(`scroll: could not resolve the position of ${label ?? "the target"}`);
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.mouse.wheel(dx, dy);
+      } else if (center) {
+        await page.mouse.move(center.x, center.y);
+        await page.mouse.wheel(dx, dy);
+      } else await page.mouse.wheel(dx, dy);
       break;
     }
     case "drag": {
-      if (center) await hudCursor(page, center.x, center.y);
-      const start = center ?? { x: 0, y: 0 };
+      if (!center) {
+        // Never fall back to (0, 0): that drags from a point nobody chose.
+        throw new Error(
+          `drag: could not resolve the position of ${label ?? "the start point"}; the element has no layout box`,
+        );
+      }
+      await hudCursor(page, center.x, center.y);
+      const start = center;
       if (action.toX === undefined || action.toY === undefined) {
         throw new Error("browse_interact: `drag` requires `toX` and `toY` (viewport CSS px)");
       }
@@ -244,6 +321,20 @@ export async function execBatch(
   page: Page,
   actions: Action[],
 ): Promise<BatchResult> {
+  // Reject a syntactically invalid selector before any step runs. Playwright's
+  // own parser keeps its selector extensions (text=, >>, …) valid.
+  for (const action of actions) {
+    if (action.selector === undefined) continue;
+    try {
+      await page.locator(action.selector).count();
+    } catch (error) {
+      const message = error instanceof Error ? error.message.split("\n")[0] : String(error);
+      throw new InvalidInputError(
+        `invalid selector "${short(action.selector)}": ${short(message ?? "")}`,
+        "fix the CSS selector or use an elementId from the element map",
+      );
+    }
+  }
   for (let i = 0; i < actions.length; i++) {
     const action = actions[i];
     if (!action) continue;
@@ -278,6 +369,14 @@ export async function capturePerception(
     readonly screenshotDir: string;
     readonly annotate?: boolean;
     readonly fullPage?: boolean;
+    /** Screenshot timeout (Playwright default 30 s when omitted). */
+    readonly timeoutMs?: number;
+    /**
+     * Drain telemetry into the result (default true). Callers that retry
+     * capture pass false and call `drainTelemetryEvents` once, so a failed
+     * attempt never consumes events.
+     */
+    readonly drainTelemetry?: boolean;
   },
 ): Promise<PerceptionResult> {
   // Re-index the current page into a fresh [1..N] element map.
@@ -318,7 +417,10 @@ export async function capturePerception(
         .catch(() => undefined);
     }
 
-    buffer = await page.screenshot({ fullPage: opts.fullPage ?? false });
+    buffer = await page.screenshot({
+      fullPage: opts.fullPage ?? false,
+      ...(opts.timeoutMs === undefined ? {} : { timeout: Math.max(1, Math.round(opts.timeoutMs)) }),
+    });
     const vp = page.viewportSize();
     width = vp?.width ?? null;
     height = vp?.height ?? null;
@@ -343,19 +445,69 @@ export async function capturePerception(
 
   screenshotPath = await savePng(buffer, opts.screenshotDir);
 
-  // Delta drain: only telemetry generated since the last tool call.
-  const drained = telemetry.drain();
-  const telemetryEvents = drained.events.map((e) => ({ type: e.type, text: e.text }));
+  const telemetryEvents = opts.drainTelemetry === false ? [] : drainTelemetryEvents(telemetry);
 
   return { elements, screenshotPath, width, height, telemetryEvents };
 }
 
+/** Delta drain: only telemetry generated since the last tool call. */
+export function drainTelemetryEvents(
+  telemetry: Telemetry,
+): { readonly type: string; readonly text: string }[] {
+  return telemetry.drain().events.map((e) => ({ type: e.type, text: e.text }));
+}
+
+/** Raised when a capture attempt runs past its perception budget. */
+export class PerceptionTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`perception did not finish within ${ms}ms`);
+    this.name = "PerceptionTimeoutError";
+  }
+}
+
+/**
+ * True for errors caused by the document changing under an evaluate or a
+ * screenshot: the page navigated or reloaded during capture.
+ */
+export function isNavigationRace(error: unknown): boolean {
+  if (error instanceof PerceptionTimeoutError) return true;
+  if (!(error instanceof Error)) return false;
+  const message = error.message;
+  if (
+    message.includes("Execution context was destroyed") ||
+    message.includes("frame was detached") ||
+    message.includes("Cannot find context with specified id")
+  ) {
+    return true;
+  }
+  return error.name === "TimeoutError" && message.includes("screenshot");
+}
+
+/**
+ * Create the screenshot directory owner-only (0700). An existing directory
+ * must be a real directory, not a symlink; one owned by this uid is tightened
+ * to 0700.
+ */
+function ensurePrivateDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = fs.lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error(`screenshot directory ${dir} is not a directory (or is a symlink)`);
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid !== null && st.uid === uid && (st.mode & 0o777) !== 0o700) {
+    fs.chmodSync(dir, 0o700);
+  }
+}
+
 async function savePng(buffer: Buffer, screenshotDir: string): Promise<string> {
-  fs.mkdirSync(screenshotDir, { recursive: true });
+  ensurePrivateDir(screenshotDir);
   const file = path.join(
     screenshotDir,
     `opencode-som-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.png`,
   );
-  fs.writeFileSync(file, buffer);
+  // 0600 and O_CREAT|O_EXCL: private even under a shared parent directory, and
+  // never follows a planted file or symlink.
+  fs.writeFileSync(file, buffer, { mode: 0o600, flag: "wx" });
   return file;
 }

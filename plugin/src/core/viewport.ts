@@ -1,11 +1,20 @@
 /**
- * Viewport math, separated from the browser lifecycle.
+ * The viewport module: how big the page is, and who decides.
  *
- * The session manager probes the real window and calls these pure helpers;
- * the fit itself (drift test, ratio calibration, width clamp) is unit-testable
- * without a browser.
+ * Two modes, chosen once at launch:
+ *   - native (headful launch, CDP attach): Playwright emulates no viewport, so
+ *     the page fills the real window and follows resize / maximize /
+ *     fullscreen. An explicit size is a CDP device-metrics override on a
+ *     session this module owns, so releasing it hands sizing back to the
+ *     window. (Playwright's setViewportSize cannot be undone.)
+ *   - emulated (headless): Playwright's fixed emulation; release returns to
+ *     1280x720.
+ *
+ * An override is remembered per tab, so a release clears every tab that
+ * carries one, including a tab the active pointer has since left.
  */
 
+import type { CDPSession, Page } from "playwright";
 import type { ViewportPreset } from "./turn.ts";
 
 export const VIEWPORT_PRESETS: Record<ViewportPreset, { readonly width: number; readonly height: number }> = {
@@ -15,44 +24,22 @@ export const VIEWPORT_PRESETS: Record<ViewportPreset, { readonly width: number; 
   mobile: { width: 390, height: 844 },
 };
 
-/** The browser chrome (borders + scrollbar) the automation viewport leaves out. */
-export const VIEWPORT_CHROME_PX = 16;
-
-/** Width below which a fitted viewport is not useful. */
-export const MIN_VIEWPORT_WIDTH = 320;
-
-/** Probe size used to learn the requested→CSS pixel ratio. */
-export const RATIO_PROBE = { width: 800, height: 600 } as const;
-
-export interface ViewportGeometry {
-  readonly outerW: number;
-  readonly innerW: number;
-}
+/** Headless default size; also what a released emulated viewport returns to. */
+export const HEADLESS_VIEWPORT = { width: 1280, height: 720 } as const;
 
 export interface ResolvedViewport {
   readonly width: number;
   readonly height: number;
 }
 
-/** True when the live window and the automation viewport have drifted apart. */
-export function viewportDrifted(geometry: ViewportGeometry): boolean {
-  return Math.abs(geometry.innerW - (geometry.outerW - VIEWPORT_CHROME_PX)) > 20;
-}
+export type ViewportMode = "native" | "emulated";
 
-/** Requested→CSS pixel ratio from the calibration probe. */
-export function calibratedRatio(probeInnerWidth: number): number | null {
-  if (!Number.isFinite(probeInnerWidth) || probeInnerWidth <= 0) return null;
-  return RATIO_PROBE.width / probeInnerWidth;
-}
-
-/** Viewport width that fills the live window at the calibrated ratio. */
-export function fittedWidth(outerW: number, ratio: number): number {
-  return Math.max(MIN_VIEWPORT_WIDTH, Math.round((outerW - VIEWPORT_CHROME_PX) * ratio));
-}
+/** The page surface this module needs; Playwright's Page satisfies it. */
+export type ViewportPage = Pick<Page, "setViewportSize" | "viewportSize" | "evaluate" | "context" | "once">;
 
 /**
  * Resolve an explicit viewport request. Returns null for a bare call, which
- * means "release the pin and re-sync to the live window".
+ * means "release the override and follow the live window again".
  */
 export function resolveViewport(input: {
   readonly preset?: ViewportPreset;
@@ -64,4 +51,77 @@ export function resolveViewport(input: {
     return { width: input.width, height: input.height };
   }
   return null;
+}
+
+/**
+ * CSS size of `page`'s viewport: the emulated size when there is one,
+ * otherwise the live window.innerWidth/innerHeight. The one size read.
+ */
+export async function viewportSizeOf(
+  page: Pick<Page, "viewportSize" | "evaluate">,
+): Promise<ResolvedViewport | null> {
+  const emulated = page.viewportSize();
+  if (emulated !== null) return emulated;
+  return page
+    .evaluate(() => {
+      const w = globalThis as unknown as { innerWidth: number; innerHeight: number };
+      return { width: w.innerWidth, height: w.innerHeight };
+    })
+    .catch(() => null);
+}
+
+export class Viewport {
+  /** Tabs carrying an explicit size; native tabs keep their CDP session. */
+  private readonly overrides = new Map<ViewportPage, CDPSession | null>();
+
+  constructor(readonly mode: ViewportMode) { }
+
+  /** Launch-time options that make `mode` work. */
+  static launchOptions(mode: ViewportMode): { readonly viewport?: null; readonly args: readonly string[] } {
+    return mode === "native" ? { viewport: null, args: ["--start-maximized"] } : { args: [] };
+  }
+
+  /** Give `page` an explicit size, or release every override (`null`). */
+  async apply(page: ViewportPage, size: ResolvedViewport | null): Promise<void> {
+    if (size === null) {
+      await this.releaseAll();
+      return;
+    }
+    if (this.mode === "emulated") {
+      await page.setViewportSize(size);
+      this.track(page, null);
+      return;
+    }
+    let session = this.overrides.get(page) ?? null;
+    if (session === null) {
+      session = await page.context().newCDPSession(page as Page);
+      this.track(page, session);
+    }
+    await session.send("Emulation.setDeviceMetricsOverride", {
+      width: size.width,
+      height: size.height,
+      deviceScaleFactor: 0,
+      mobile: false,
+    });
+  }
+
+  private track(page: ViewportPage, session: CDPSession | null): void {
+    if (!this.overrides.has(page)) page.once("close", () => this.overrides.delete(page));
+    this.overrides.set(page, session);
+  }
+
+  private async releaseAll(): Promise<void> {
+    const entries = [...this.overrides];
+    this.overrides.clear();
+    await Promise.all(
+      entries.map(([page, session]) =>
+        session === null
+          ? page.setViewportSize(HEADLESS_VIEWPORT)
+          : session
+            .send("Emulation.clearDeviceMetricsOverride")
+            .then(() => session.detach())
+            .catch(() => undefined),
+      ),
+    );
+  }
 }

@@ -21,66 +21,19 @@
 
 import { Plugin } from "@opencode/plugin";
 import { PlaywrightBrowserSession } from "./core/browser-session.ts";
-import { BrowserSessionManager, MANAGER_API_VERSION } from "./core/session-manager.ts";
+import { processBrowser } from "./core/process-browser.ts";
 import { registerBrowserTools } from "./tools/index.ts";
 import { registerEvalPrompt } from "./tools/evaluate.ts";
 
 const NAMESPACE = "browse";
 
-/**
- * The host re-instantiates plugins many times per server process (292 loads
- * observed in one afternoon, ~9/minute during active turns). A per-setup
- * manager meant every disposal closed the shared Chromium — i.e. one browser
- * open/close per agent step. The browser session therefore lives on
- * `globalThis`, shared by every plugin instance, and only process teardown
- * (SIGINT/SIGTERM) closes it.
- */
-const MANAGER_KEY = Symbol.for("opencode.browser.session-manager");
-
-interface ManagerSlot {
-  [MANAGER_KEY]?: BrowserSessionManager;
-}
-
-function globalSlot(): ManagerSlot {
-  return globalThis as unknown as ManagerSlot;
-}
-
-async function getSessionManager(): Promise<BrowserSessionManager> {
-  const slot = globalSlot();
-  const existing = slot[MANAGER_KEY];
-  if (isReusableManager(existing)) return existing;
-  // A manager built by an older plugin build survives a hot reload on
-  // `globalThis`; its missing methods would fail at call time. Close it so no
-  // orphaned Chromium keeps the profile lock, then start fresh.
-  if (existing !== undefined) {
-    const stale = existing as { close?: () => Promise<void> };
-    if (typeof stale.close === "function") await stale.close().catch(() => undefined);
-  }
-  const created = new BrowserSessionManager();
-  slot[MANAGER_KEY] = created;
-  return created;
-}
-
-/** Whether a cached manager implements the interface this build calls. */
-function isReusableManager(value: unknown): value is BrowserSessionManager {
-  if (typeof value !== "object" || value === null) return false;
-  const candidate = value as Partial<BrowserSessionManager>;
-  return (
-    candidate.apiVersion === MANAGER_API_VERSION &&
-    typeof candidate.ensureActivePage === "function" &&
-    typeof candidate.runExclusive === "function"
-  );
-}
-
 export default Plugin.define({
   id: "browser",
 
   async setup(ctx) {
-    const sessionManager = await getSessionManager();
-
-    // Graceful teardown: never leave zombie Chromium behind. registerTeardown
-    // is idempotent, so every plugin instance can call it safely.
-    sessionManager.registerTeardown();
+    // One browser per process, shared across plugin instances and reloads;
+    // process teardown (not disposal) closes it.
+    const sessionManager = await processBrowser.acquire();
 
     const config = sessionManager.getConfig();
     const deps = {

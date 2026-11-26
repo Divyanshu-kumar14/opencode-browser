@@ -7,15 +7,15 @@
  *
  * Traverses open shadow trees, filters occluded/invisible nodes, assigns
  * deterministic [1..N] IDs in reading order, caps + truncates for token
- * efficiency, and tags DOM nodes with `data-opencode-id` for fast lookup.
+ * efficiency, and tags DOM nodes with SOM_ATTRIBUTE (`data-opencode-id`) for fast lookup.
  */
 
-import { IMPLICIT_ROLE_BY_TAG } from "../core/som.ts";
+import { IMPLICIT_ROLE_BY_TAG, PAGE_GLOBALS, SOM_ATTRIBUTE } from "../core/som.ts";
 
 export function makeDomAnnotatorScript(maxElements = 100): string {
   const script = `
 (function(){
-  if (window.__opencodeSom) return;
+  if (window[${JSON.stringify(PAGE_GLOBALS.som)}]) return;
   // Top frame only: the SoM index is always built in the main frame.
   try {
     if (window.self !== window.top) return;
@@ -23,6 +23,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     return;
   }
   const MAX_ELEMENTS = ${maxElements};
+  const ATTR = ${JSON.stringify(SOM_ATTRIBUTE)};
   const LABEL_MAX = 60;
   const SELECTOR =
     'a[href],button,input:not([type="hidden"]),textarea,select,summary,details,' +
@@ -230,7 +231,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     // Drop the ids from the previous indexing first: an element that leaves
     // the index must not keep an id that is about to be reused.
     for (const old of byId.values()){
-      try { old.removeAttribute("data-opencode-id"); } catch {}
+      try { old.removeAttribute(ATTR); } catch {}
     }
     indexed = [];
     byId.clear();
@@ -275,7 +276,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     // Sweep ids that survived a lost byId (e.g. a re-installed script).
     for (const root of searchedRoots){
       try {
-        for (const stale of root.querySelectorAll("[data-opencode-id]")) stale.removeAttribute("data-opencode-id");
+        for (const stale of root.querySelectorAll("[" + ATTR + "]")) stale.removeAttribute(ATTR);
       } catch {}
     }
 
@@ -286,7 +287,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
       n += 1;
       const id = n;
       const tag = el.tagName.toLowerCase();
-      el.setAttribute("data-opencode-id", String(id));
+      el.setAttribute(ATTR, String(id));
       const entry = {
         id, tag, role: roleOf(el), label: labelOf(el),
         value: el.value === undefined ? ""
@@ -312,7 +313,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     const cls = el.getAttribute("class");
     const classSel = cls ? '.' + cls.trim().split(/\\s+/).filter(Boolean).join('.') : '';
     const sel = tag + classSel;
-    if (el.getAttribute("data-opencode-id")) return '[data-opencode-id="' + el.getAttribute("data-opencode-id") + '"]';
+    if (el.getAttribute(ATTR)) return '[' + ATTR + '="' + el.getAttribute(ATTR) + '"]';
     return sel;
   }
 
@@ -368,7 +369,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     if (overlay) overlay.remove();
   }
 
-  window.__opencodeSom = {
+  window[${JSON.stringify(PAGE_GLOBALS.som)}] = {
     indexPage, renderSoMOverlay, removeSoMOverlay, getElements: () => indexed,
   };
 })();

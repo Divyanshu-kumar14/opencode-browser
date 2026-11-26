@@ -46,7 +46,7 @@ function ready(): boolean {
 }
 
 function page(): Page {
-  return env!.manager.getActivePage()!;
+  return env!.manager.tabs.active()!;
 }
 
 async function goto(p: string): Promise<ToolResult> {
@@ -257,8 +257,8 @@ describe("Group 2: annotator and HUD", () => {
   test("1.25 the HUD cursor is drawn at (x, y)", async () => {
     if (!ready()) return;
     await goto("/second");
-    const { hudCursor } = await import("../src/core/action-engine.ts");
-    await hudCursor(page(), 300, 200);
+    const { hud } = await import("../src/core/page-agent.ts");
+    await hud.cursor(page(), 300, 200);
     await new Promise((r) => setTimeout(r, 250));
     const rect = await page().evaluate(() => {
       const host = document.querySelector("opencode-agent-hud")!;
@@ -457,18 +457,18 @@ describe("Group 5: session and tab lifecycle", () => {
     await b.session.turn({ kind: "navigate", action: "goto", url: base + "popup" });
     const r = await b.session.turn({ kind: "act", actions: [{ type: "click", selector: "#pop" }] });
     const out = text(r);
-    const active = b.manager.getActivePage()!;
+    const active = b.manager.tabs.active()!;
     expect(out).toContain(`URL: ${base}second`);
     expect(out).toContain('<a href="/x">');
     expect(out).not.toContain('"Open popup"');
-    expect(r.metadata["tabId"]).toBe(b.manager.pageIdFor(active));
+    expect(r.metadata["tabId"]).toBe(b.manager.tabs.idOf(active));
     expect(r.metadata["url"]).toBe(`${base}second`);
     expect(out).toContain(`Tab: Switched to new tab: ${base}second`);
     expect(out).not.toContain("about:blank");
     // Act on an id from the returned map: the click lands in the new tab.
     const linkId = Number(/\[(\d+)\] <a href="\/x">/.exec(out)![1]);
     await b.session.turn({ kind: "act", actions: [{ type: "click", elementId: linkId }] });
-    expect(b.manager.getActivePage()!.url()).toBe(`${base}x`);
+    expect(b.manager.tabs.active()!.url()).toBe(`${base}x`);
   }, 60000);
 
   test("1.24 an active tab that closes itself is reported on the next turn", async () => {
@@ -478,7 +478,7 @@ describe("Group 5: session and tab lifecycle", () => {
     const opened = text(await b.session.turn({ kind: "act", actions: [{ type: "click", selector: "#signin" }] }));
     expect(opened).toContain(`Tab: Switched to new tab: ${base}oauth-close`);
     const deadline = Date.now() + 5000;
-    while (b.manager.listPages().length > 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    while (b.manager.tabs.list().length > 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
     const out = text(await b.session.turn({ kind: "observe" }));
     expect(out).toContain(`Tab: Active tab closed; switched to tab: ${base}oauth`);
     expect(out).toContain(`URL: ${base}oauth`);
@@ -516,19 +516,20 @@ describe("Group 5: session and tab lifecycle", () => {
     if (!ready()) return;
     const cold = coldSession();
     try {
-      const internals = cold.manager as unknown as { registerContextTracking(c: unknown): void };
-      const original = internals.registerContextTracking.bind(cold.manager);
+      // Fail the last setup step once, through the tab tracker's interface.
+      const tabs = cold.manager.tabs;
+      const original = tabs.watch.bind(tabs);
       let thrown = false;
-      internals.registerContextTracking = (c: unknown) => {
+      tabs.watch = (source) => {
         if (!thrown) {
           thrown = true;
           throw new Error("injected setup failure");
         }
-        original(c);
+        original(source);
       };
       expect((await errorOf(cold.manager.ensureActivePage())).message).toContain("injected setup failure");
       const p = await cold.manager.ensureActivePage();
-      expect(cold.manager.listPages().length).toBeGreaterThanOrEqual(1);
+      expect(cold.manager.tabs.list().length).toBeGreaterThanOrEqual(1);
       cold.manager.getTelemetry().drain();
       await p.goto(base + "second");
       await p.evaluate("console.error('after-recovery')");
@@ -552,14 +553,14 @@ describe("Group 5: session and tab lifecycle", () => {
     if (!ready()) return;
     const b = await extraBrowser({});
     await b.session.turn({ kind: "observe" });
-    expect(b.manager.getActivePage()!.viewportSize()).toEqual({ width: 1280, height: 720 });
+    expect(b.manager.tabs.active()!.viewportSize()).toEqual({ width: 1280, height: 720 });
   }, 60000);
 
   test("3.18 a killed browser is relaunched cleanly on the next turn", async () => {
     if (!ready()) return;
     const b = await extraBrowser({});
     await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" });
-    const before = b.manager.getActivePage()!;
+    const before = b.manager.tabs.active()!;
     const pids = Bun.spawnSync(["pgrep", "-f", "--", `--user-data-dir=${b.profileDir}`]).stdout.toString().trim().split(/\s+/).filter(Boolean);
     expect(pids.length).toBeGreaterThan(0);
     for (const pid of pids) {
@@ -765,10 +766,10 @@ describe("Integration flows", () => {
     if (!ready()) return;
     const b = await extraBrowser({});
     await b.session.turn({ kind: "navigate", action: "goto", url: base + "popup" });
-    const mainId = b.manager.pageIdFor(b.manager.getActivePage()!);
+    const mainId = b.manager.tabs.idOf(b.manager.tabs.active()!);
     const r = await b.session.turn({ kind: "act", actions: [{ type: "click", selector: "#pop" }] });
     expect(r.metadata["tabId"]).not.toBe(mainId);
-    await b.manager.switchTo(mainId);
+    await b.manager.tabs.switchTo(mainId);
     const back = await b.session.turn({ kind: "observe" });
     expect(back.metadata["tabId"]).toBe(mainId);
     expect(text(back)).toContain(`URL: ${base}popup`);

@@ -14,6 +14,12 @@ export interface ResolvedConfig {
   readonly headless: boolean;
   /** CDP URL for attach mode (OPENCODE_BROWSER_CDP_URL). */
   readonly cdpUrl: string | undefined;
+  /**
+   * When no explicit CDP URL is set, probe the conventional local DevTools
+   * endpoint (127.0.0.1:9222) and attach to that browser
+   * (OPENCODE_BROWSER_CDP_AUTODETECT, default true).
+   */
+  readonly cdpAutoDetect: boolean;
   /** Chromium executable override (OPENCODE_BROWSER_EXECUTABLE_PATH, auto-detected). */
   readonly executablePath: string | undefined;
   /** Persistent user-data-dir for profile launch. */
@@ -98,6 +104,7 @@ export function loadConfig(): ResolvedConfig {
   return {
     headless: envBool("OPENCODE_BROWSER_HEADLESS", false),
     cdpUrl: process.env["OPENCODE_BROWSER_CDP_URL"] ?? undefined,
+    cdpAutoDetect: envBool("OPENCODE_BROWSER_CDP_AUTODETECT", true),
     executablePath: process.env["OPENCODE_BROWSER_EXECUTABLE_PATH"] ?? detectChromium(),
     profileDir: path.resolve(profileDir),
     maxElements: envNum("OPENCODE_BROWSER_MAX_ELEMENTS", 100),

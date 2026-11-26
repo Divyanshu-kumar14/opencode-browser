@@ -14,10 +14,17 @@ import { checkNavigationUrl, redactUrl, redactUrlsInText } from "../src/core/url
 import { registerBrowserTools } from "../src/tools/index.ts";
 import type { ToolDeps } from "../src/tools/types.ts";
 import { FakeBrowserSession } from "./fake-session.ts";
-import { BrowserSessionManager } from "../src/core/session-manager.ts";
+import {
+  AUTODETECT_CDP_URL,
+  BrowserSessionManager,
+  probeCdpEndpoint,
+  resolveCdpEndpoint,
+} from "../src/core/session-manager.ts";
 import * as evaluateTool from "../src/tools/evaluate.ts";
 import plugin from "../src/index.ts";
+import { processBrowser } from "../src/core/process-browser.ts";
 import { Telemetry } from "../src/core/telemetry.ts";
+import { TabTracker } from "../src/core/tab-tracker.ts";
 import { inspectElement } from "../src/core/inspect.ts";
 import { IMPLICIT_ROLE_BY_TAG } from "../src/core/som.ts";
 import { formatElementMap } from "../src/utils/formatter.ts";
@@ -126,6 +133,53 @@ describe("Group 0: shared groundwork", () => {
     expect(s.allowFileUrls).toBe(true);
     expect(s.evalPrompt).toBe(false);
     expect(s.evalTimeoutMs).toBe(1234);
+  });
+
+  test("config autodetects a local DevTools browser unless disabled", () => {
+    const on = withEnv({ OPENCODE_BROWSER_CDP_AUTODETECT: undefined }, loadConfig);
+    expect(on.cdpAutoDetect).toBe(true);
+    const off = withEnv({ OPENCODE_BROWSER_CDP_AUTODETECT: "0" }, loadConfig);
+    expect(off.cdpAutoDetect).toBe(false);
+  });
+
+  test("resolveCdpEndpoint prefers an explicit URL, then a live 9222, then launch", async () => {
+    const base = { cdpUrl: undefined, cdpAutoDetect: true };
+    const calls: string[] = [];
+    const live = async (url: string) => {
+      calls.push(url);
+      return true;
+    };
+    const dead = async (url: string) => {
+      calls.push(url);
+      return false;
+    };
+
+    expect(await resolveCdpEndpoint({ ...base, cdpUrl: "http://127.0.0.1:9333" }, dead)).toBe(
+      "http://127.0.0.1:9333",
+    );
+    expect(calls).toEqual([]);
+    expect(await resolveCdpEndpoint(base, live)).toBe(AUTODETECT_CDP_URL);
+    expect(await resolveCdpEndpoint(base, dead)).toBeUndefined();
+    expect(await resolveCdpEndpoint({ ...base, cdpAutoDetect: false }, live)).toBeUndefined();
+    expect(calls).toEqual([AUTODETECT_CDP_URL, AUTODETECT_CDP_URL]);
+  });
+
+  test("probeCdpEndpoint accepts a DevTools listener and rejects a dead port", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        if (new URL(request.url).pathname === "/json/version") {
+          return Response.json({ webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/test" });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      expect(await probeCdpEndpoint(`http://127.0.0.1:${server.port}`)).toBe(true);
+    } finally {
+      await server.stop(true);
+    }
+    expect(await probeCdpEndpoint(`http://127.0.0.1:${server.port}`)).toBe(false);
   });
 
   test("InvalidInputError maps to INVALID_INPUT with its hint", async () => {
@@ -239,14 +293,11 @@ describe("Group 1: eval permission gate (1.21)", () => {
 
   test("plugin setup wires ctx.permission into browse_eval and registers the prompt hook", async () => {
     // Seed the process-global manager so nothing can launch Chromium here.
-    const slot = globalThis as unknown as Record<symbol, unknown>;
-    const key = Symbol.for("opencode.browser.session-manager");
-    const saved = slot[key];
     const manager = new BrowserSessionManager({ headless: true });
     manager.ensureActivePage = async () => {
       throw new Error("no browser in unit tests");
     };
-    slot[key] = manager;
+    const saved = processBrowser.replace(manager);
     try {
       const added: Registered[] = [];
       const hookNames: string[] = [];
@@ -280,7 +331,7 @@ describe("Group 1: eval permission gate (1.21)", () => {
       await (cleanup as () => Promise<void>)();
       expect(disposed.sort()).toEqual(["hook", "tools"]);
     } finally {
-      slot[key] = saved;
+      processBrowser.replace(saved);
     }
   });
 });
@@ -409,74 +460,40 @@ describe("Group 3: telemetry", () => {
 interface FakeTab {
   on(e: string, f: (a: unknown) => void): void;
   emit(e: string, a?: unknown): void;
-  evaluate: (fn: unknown, arg?: unknown) => Promise<unknown>;
   isClosed(): boolean;
   url(): string;
-  viewportSize(): { width: number; height: number };
-  setViewportSize(size: unknown): Promise<void>;
+  bringToFront(): Promise<void>;
+  close(): void;
   closed: boolean;
-  resized: unknown[];
 }
-
-function fakeTab(url: string, geometry = { outerW: 1600, innerW: 1000 }): FakeTab {
+function fakeTab(url: string): FakeTab {
   const em = fakePage();
   const tab: FakeTab = {
     on: em.on,
     emit: (e, a) => em.emit(e, a),
-    evaluate: async () => geometry,
     isClosed: () => tab.closed,
     url: () => url,
-    viewportSize: () => ({ width: 1000, height: 800 }),
-    setViewportSize: async (size) => {
-      tab.resized.push(size);
+    bringToFront: async () => undefined,
+    close: () => {
+      tab.closed = true;
+      em.emit("close", undefined);
     },
     closed: false,
-    resized: [],
   };
   return tab;
 }
-
-type ManagerInternals = {
-  registerPage(p: unknown): void;
-  registerContextTracking(c: unknown): void;
-  setActive(p: unknown): void;
-  watchTick(): Promise<void>;
-  viewportRatio: number | null;
-  runExclusive?<T>(fn: () => Promise<T>): Promise<T>;
-};
-
+/** A context double that opens tabs on demand. */
+function fakeContext(initial: FakeTab[] = []) {
+  const em = fakePage();
+  return {
+    on: (e: string, f: (p: FakeTab) => void) => em.on(e, f as (a: unknown) => void),
+    pages: () => initial,
+    open: (tab: FakeTab) => em.emit("page", tab),
+  };
+}
 describe("Group 5: session lifecycle (unit)", () => {
-  test("1.27 the viewport watcher never resizes during a turn", async () => {
-    const m = new BrowserSessionManager({ headless: false });
-    const internals = m as unknown as ManagerInternals;
-    const tab = fakeTab("http://a.test/");
-    internals.registerPage(tab);
-    internals.setActive(tab);
-    internals.viewportRatio = 1;
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-    let turn: Promise<unknown>;
-    if (typeof internals.runExclusive === "function") {
-      turn = internals.runExclusive(() => gate);
-    } else {
-      // F has no turn tracking: a pending turn changes nothing.
-      turn = gate;
-    }
-    // Let the queued turn start before the tick fires.
-    await new Promise((r) => setTimeout(r, 0));
-    await internals.watchTick();
-    expect(tab.resized).toEqual([]);
-    release();
-    await turn;
-    // Outside a turn the watcher still fits a drifted viewport.
-    await internals.watchTick();
-    expect(tab.resized.length).toBe(1);
-  });
-
   test("runExclusive runs turns one at a time, in order, and releases on rejection", async () => {
-    const m = new BrowserSessionManager({ headless: true }) as unknown as ManagerInternals & {
-      isTurnActive(): boolean;
-    };
+    const m = new BrowserSessionManager({ headless: true });
     expect(typeof m.runExclusive).toBe("function");
     const log: string[] = [];
     const step = (name: string, ms: number, fail = false) =>
@@ -494,28 +511,66 @@ describe("Group 5: session lifecycle (unit)", () => {
   });
 
   test("1.24 tab-switch notices name the reason: opened vs closed", () => {
-    const m = new BrowserSessionManager({ headless: true });
-    const internals = m as unknown as ManagerInternals;
-    const ctxEm = fakePage();
+    const tabs = new TabTracker<FakeTab>();
     const main = fakeTab("http://a.test/main");
-    internals.registerPage(main);
-    internals.setActive(main);
-    internals.registerContextTracking({ on: ctxEm.on, pages: () => [] });
+    const ctx = fakeContext([main]);
+    tabs.watch(ctx);
+    tabs.activate(main);
     const popup = fakeTab("http://a.test/popup");
-    ctxEm.emit("page", popup);
-    expect(m.takeTabSwitchNotification()).toBe("Switched to new tab: http://a.test/popup");
-    expect(m.takeTabSwitchNotification()).toBeNull();
-    popup.closed = true;
-    popup.emit("close");
-    expect(m.getActivePage() as unknown).toBe(main);
-    expect(m.takeTabSwitchNotification()).toBe("Active tab closed; switched to tab: http://a.test/main");
+    ctx.open(popup);
+    expect(tabs.active()).toBe(popup);
+    expect(tabs.takeNotice()).toBe("Switched to new tab: http://a.test/popup");
+    expect(tabs.takeNotice()).toBeNull();
+    popup.close();
+    expect(tabs.active()).toBe(main);
+    expect(tabs.takeNotice()).toBe("Active tab closed; switched to tab: http://a.test/main");
   });
-
+  test("tabs: each tracked page gets one stable id and runs the tracking hook once", () => {
+    const tracked: FakeTab[] = [];
+    const tabs = new TabTracker<FakeTab>((p) => void tracked.push(p));
+    const a = fakeTab("http://a.test/");
+    const b = fakeTab("http://b.test/");
+    tabs.add(a);
+    tabs.add(a);
+    tabs.activate(b);
+    expect(tracked).toEqual([a, b]);
+    expect(tabs.idOf(a)).toBe(tabs.idOf(a));
+    expect(tabs.idOf(a)).not.toBe(tabs.idOf(b));
+    expect(tabs.list().map((t) => t.url)).toEqual(["http://a.test/", "http://b.test/"]);
+    b.close();
+    expect(tabs.list().map((t) => t.url)).toEqual(["http://a.test/"]);
+    expect(tabs.active()).toBe(a);
+  });
+  test("tabs: switchTo rejects unknown or closed tabs", async () => {
+    const tabs = new TabTracker<FakeTab>();
+    const a = fakeTab("http://a.test/");
+    tabs.add(a);
+    await tabs.switchTo(tabs.idOf(a));
+    expect(tabs.active()).toBe(a);
+    a.close();
+    await expect(tabs.switchTo(tabs.idOf(a))).rejects.toThrow("not found or closed");
+  });
+  test("tabs: after reset, a dead browser's tabs and context cannot touch new state", () => {
+    const tabs = new TabTracker<FakeTab>();
+    const old = fakeTab("http://old.test/");
+    const oldCtx = fakeContext([old]);
+    tabs.watch(oldCtx);
+    oldCtx.open(fakeTab("http://old.test/popup"));
+    tabs.reset();
+    expect(tabs.active()).toBeNull();
+    expect(tabs.list()).toEqual([]);
+    expect(tabs.takeNotice()).toBeNull();
+    // Late events from the old browser are ignored.
+    const fresh = fakeTab("http://new.test/");
+    tabs.activate(fresh);
+    oldCtx.open(fakeTab("http://old.test/late"));
+    old.close();
+    expect(tabs.active()).toBe(fresh);
+    expect(tabs.takeNotice()).toBeNull();
+    expect(tabs.list().map((t) => t.url)).toEqual(["http://new.test/"]);
+  });
   test("3.13 two plugin setups share one process-global manager and launch nothing", async () => {
-    const slot = globalThis as unknown as Record<symbol, unknown>;
-    const key = Symbol.for("opencode.browser.session-manager");
-    const saved = slot[key];
-    delete slot[key];
+    const saved = processBrowser.replace(undefined);
     const ctx = {
       tool: {
         transform: async (cb: (editor: unknown) => void) => {
@@ -528,24 +583,22 @@ describe("Group 5: session lifecycle (unit)", () => {
     };
     try {
       await plugin.setup(ctx as never);
-      const first = slot[key] as BrowserSessionManager;
+      const first = processBrowser.current() as BrowserSessionManager;
+      expect(first).toBeInstanceOf(BrowserSessionManager);
       await plugin.setup(ctx as never);
-      expect(slot[key]).toBe(first);
-      expect(first.getActivePage()).toBeNull();
-      expect(first.listPages()).toEqual([]);
+      expect(processBrowser.current()).toBe(first);
+      expect(first.tabs.active()).toBeNull();
+      expect(first.tabs.list()).toEqual([]);
     } finally {
-      slot[key] = saved;
+      processBrowser.replace(saved);
     }
   });
 
-  test("3.14 a cached manager from an older plugin build is replaced, not reused", async () => {
+  test("3.14 a cached manager from another plugin build is closed and replaced, not reused", async () => {
     // Regression: a plugin hot reload can run newer code against a manager
-    // created by an older build. The old guard only checked ensureActivePage,
-    // so a manager missing runExclusive survived and every tool turn failed
-    // with "this.manager.runExclusive is not a function".
-    const slot = globalThis as unknown as Record<symbol, unknown>;
-    const key = Symbol.for("opencode.browser.session-manager");
-    const saved = slot[key];
+    // created by an older build ("this.manager.runExclusive is not a
+    // function"). Compatibility is the build fingerprint, not a hand-bumped
+    // version number.
     let closed = 0;
     const stale = {
       ensureActivePage: async () => {
@@ -555,7 +608,6 @@ describe("Group 5: session lifecycle (unit)", () => {
         closed += 1;
       },
     };
-    slot[key] = stale;
     const ctx = {
       tool: {
         transform: async (cb: (editor: unknown) => void) => {
@@ -566,19 +618,34 @@ describe("Group 5: session lifecycle (unit)", () => {
       },
       permission: { assert: async () => undefined, hook: async () => ({ dispose: async () => undefined }) },
     };
+    const saved = processBrowser.replace(stale, "older-build");
     try {
       await plugin.setup(ctx as never);
-      const manager = slot[key] as BrowserSessionManager;
+      const manager = processBrowser.current() as BrowserSessionManager;
       expect(manager).not.toBe(stale as unknown);
       expect(manager).toBeInstanceOf(BrowserSessionManager);
       expect(closed).toBe(1);
-      expect(manager.getActivePage()).toBeNull();
+      expect(manager.tabs.active()).toBeNull();
     } finally {
-      slot[key] = saved;
+      processBrowser.replace(saved);
+    }
+  });
+  test("a manager left under the pre-fingerprint key is closed and dropped", async () => {
+    const legacyKey = Symbol.for("opencode.browser.session-manager");
+    const g = globalThis as unknown as Record<symbol, unknown>;
+    let closed = 0;
+    g[legacyKey] = { close: async () => void (closed += 1) };
+    const saved = processBrowser.replace(undefined);
+    try {
+      const manager = await processBrowser.acquire(() => new BrowserSessionManager({ headless: true }));
+      expect(closed).toBe(1);
+      expect(g[legacyKey]).toBeUndefined();
+      expect(await processBrowser.acquire()).toBe(manager);
+    } finally {
+      processBrowser.replace(saved);
     }
   });
 });
-
 // ---------------------------------------------------------------------------
 // Group 6: inspect on a stub page (1.17, 1.18)
 // ---------------------------------------------------------------------------

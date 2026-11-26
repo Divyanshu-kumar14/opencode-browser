@@ -58,15 +58,19 @@ profile, and one login state.
 
 | Path | Responsibility |
 |---|---|
-| `plugin/src/index.ts` | Plugin entry; registers the six tools against a process-global manager |
-| `plugin/src/core/browser-session.ts` | The turn seam: Playwright adapter and the one closed loop |
-| `plugin/src/core/session-manager.ts` | Browser/context/tab lifetime, viewport sync, teardown |
+| `plugin/src/index.ts` | Plugin entry; registers the six tools against the process browser |
+| `plugin/src/core/process-browser.ts` | One manager per process, build-fingerprint reuse across reloads, signal teardown |
+| `plugin/src/core/browser-session.ts` | The turn seam: the shared turn sequence plus one intent per request kind |
+| `plugin/src/core/session-manager.ts` | Launch / CDP attach, single-flight setup, turn lock, browser reset |
+| `plugin/src/core/tab-tracker.ts` | Tracked tabs, active tab, tab-switch notices |
+| `plugin/src/core/viewport.ts` | Native vs emulated viewport, preset overrides and release, size reads |
+| `plugin/src/core/perception.ts` | Element map + clean screenshot + telemetry drain, with retry and deadline |
+| `plugin/src/core/page-agent.ts` | Host side of the in-page HUD and SoM objects |
 | `plugin/src/core/turn.ts` | `TurnRequest`, `TurnOutcome`, and the single result formatter |
-| `plugin/src/core/action-engine.ts` | Action batches, stale-id recovery, perception capture, HUD helpers |
+| `plugin/src/core/action-engine.ts` | Action batches and stale-id recovery |
 | `plugin/src/core/settle.ts` | Deterministic post-action settling |
 | `plugin/src/core/telemetry.ts` | Bounded ring buffer + delta cursor for console/network errors |
 | `plugin/src/core/inspect.ts` | Element diagnostics probe |
-| `plugin/src/core/viewport.ts` | Pure preset/fit/drift math |
 | `plugin/src/injected/` | Set-of-Mark annotator and live HUD scripts |
 | `plugin/src/tools/` | Six thin handlers: zod schema + `TurnRequest` mapping |
 | `plugin/src/tools/index.ts` | `defineTool` registry; JSON Schema derived from zod |
@@ -110,7 +114,7 @@ its built-in tools).
 | `browse_interact` | single action or batched `actions[]` (click, type, hover, scroll, press_key, select_option, drag, wait) by `elementId`, selector, or coordinates | element map + screenshot + telemetry |
 | `browse_snapshot` | re-index + fresh screenshot without mutating | element map + screenshot + telemetry |
 | `browse_inspect` | tag, attributes, bbox, visibility, computed styles for one element | inspect block + screenshot + telemetry |
-| `browse_viewport` | desktop/laptop/tablet/mobile preset, custom size, or bare resync | element map + screenshot + telemetry |
+| `browse_viewport` | desktop/laptop/tablet/mobile preset, custom size, or bare call to follow the window again | element map + screenshot + telemetry |
 | `browse_eval` | JavaScript in the page context (localStorage, globals, React state) | serialized value + screenshot + telemetry |
 
 `browse_eval` is **not a sandbox**: the expression runs with the page's privileges. Treat it as
@@ -134,6 +138,7 @@ All options are optional; defaults shown.
 |---|---|---|
 | `OPENCODE_BROWSER_HEADLESS` | unset (headful) | `1`/`true` for headless (CI, servers) |
 | `OPENCODE_BROWSER_CDP_URL` | unset (persistent launch) | e.g. `http://127.0.0.1:9222` — attach to a running Chrome instead of launching |
+| `OPENCODE_BROWSER_CDP_AUTODETECT` | `1` (on) | with no CDP URL, attach to a browser already listening on `http://127.0.0.1:9222`; `0` always launches its own Chromium |
 | `OPENCODE_BROWSER_PROFILE_DIR` | `.opencode/browser-profile` | persistent profile; cookies/localStorage survive runs |
 | `OPENCODE_BROWSER_EXECUTABLE_PATH` | auto-detected (`/usr/bin/chromium`, `google-chrome`, …) or `CHROME_PATH` | override when Playwright has no bundled browser |
 | `OPENCODE_BROWSER_SCREENSHOT_DIR` | `$TMPDIR/opencode/browser-screenshots` | annotated PNG output |
@@ -147,17 +152,30 @@ All options are optional; defaults shown.
 | `OPENCODE_BROWSER_EVAL_PROMPT` | `1` (prompt) | `0` stops upgrading `browser_eval` from allow to ask; your permission rules then decide |
 | `OPENCODE_BROWSER_EVAL_TIMEOUT_MS` | `30000` | `browse_eval` deadline; a blocking script is terminated |
 
-Attach to an existing Chrome:
+Attach to a real browser (Brave/Chrome/Chromium) instead of the plugin's own Chromium:
 
 ```sh
-chromium --remote-debugging-port=9222
-OPENCODE_BROWSER_CDP_URL=http://127.0.0.1:9222 opencode
+# Chrome/Brave 136+ refuse remote debugging on the default profile, so start a
+# dedicated automation profile. The plugin then finds it on 127.0.0.1:9222.
+scripts/brave-cdp.sh
+
+# No env var: the plugin probes 9222 and attaches to the running browser.
+opencode
+```
+
+Explicit endpoint (any port, autodetect bypassed):
+
+```sh
+OPENCODE_BROWSER_CDP_URL=http://127.0.0.1:9333 opencode
 ```
 
 ## 🔒 Security
 
 - **Profile:** a persistent Chromium profile under `.opencode/browser-profile` is reused across
   runs. Anything you log into stays logged in until that directory is removed.
+- **Attach mode:** a browser started with `--remote-debugging-port` lets any local process drive
+  that profile. Point the plugin at a dedicated automation profile, never your daily one; set
+  `OPENCODE_BROWSER_CDP_AUTODETECT=0` to stop it adopting a browser on 9222.
 - **Navigation:** `browse_navigate goto` opens only `http:`, `https:`, and `about:` URLs. Other
   schemes fail with `INVALID_INPUT`; `file:` needs `OPENCODE_BROWSER_ALLOW_FILE_URLS=1`.
   Redirects and links the page follows are not re-checked.

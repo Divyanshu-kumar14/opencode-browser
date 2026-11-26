@@ -49,7 +49,7 @@ interface SomEl {
 }
 
 async function somElements(): Promise<SomEl[]> {
-  const page = manager!.getActivePage()!;
+  const page = manager!.tabs.active()!;
   return (await page.evaluate(() => {
     const w = globalThis as unknown as Record<string, any>;
     const s = w["__opencodeSom"];
@@ -136,7 +136,7 @@ describe("perception-action engine e2e", () => {
       { session: session! },
     );
     expect(res.metadata?.["stoppedAt"]).toBeNull();
-    const page = manager!.getActivePage()!;
+    const page = manager!.tabs.active()!;
     const value = await page.evaluate(() => {
       const g = globalThis as unknown as Record<string, any>;
       const doc = g["document"];
@@ -188,7 +188,7 @@ describe("perception-action engine e2e", () => {
     expect(shot).toBeTruthy();
     expect(fs.existsSync(shot!)).toBe(true);
     expect(fs.statSync(shot!).size).toBeGreaterThan(1000);
-    const page = manager!.getActivePage()!;
+    const page = manager!.tabs.active()!;
     const overlay = await page.evaluate(() => {
       const g = globalThis as unknown as Record<string, any>;
       return !!g["document"].getElementById("opencode-som-overlay");
@@ -272,7 +272,7 @@ describe("perception-action engine e2e", () => {
       expect(text).not.toContain("Switched to new tab: about:blank");
     } finally {
       // Close the popup and let the manager re-point to the fixture tab.
-      const active = manager!.getActivePage();
+      const active = manager!.tabs.active();
       if (active && active.url().includes("/second")) await active.close();
     }
   });

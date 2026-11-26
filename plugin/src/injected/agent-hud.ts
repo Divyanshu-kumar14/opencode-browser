@@ -14,10 +14,12 @@
  * pollutes the LLM's visual observation.
  */
 
+import { PAGE_GLOBALS } from "../core/som.ts";
+
 export const AGENT_HUD_SCRIPT = (() => {
   const script = `
 (function(){
-  if (window.__opencodeHud) return;
+  if (window[${JSON.stringify(PAGE_GLOBALS.hud)}]) return;
   // Top frame only: installing per-iframe HUDs is wasteful and their scripts
   // can trip host-page Trusted Types enforcement for no benefit.
   try {
@@ -87,7 +89,7 @@ export const AGENT_HUD_SCRIPT = (() => {
 
   let visible = false;
 
-  window.__opencodeHud = {
+  window[${JSON.stringify(PAGE_GLOBALS.hud)}] = {
     updateStatus(text){
       label.textContent = text || "OpenCode";
       if (!text) { pill.classList.remove("visible"); visible = false; return; }

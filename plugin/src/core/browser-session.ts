@@ -13,20 +13,19 @@
 
 import type { Page } from "playwright";
 import type { BrowserSessionManager } from "./session-manager.ts";
-import {
-  PerceptionTimeoutError,
-  capturePerception,
-  drainTelemetryEvents,
-  execBatch,
-  hudClear,
-  hudUpdate,
-  isNavigationRace,
-  type PerceptionResult,
-} from "./action-engine.ts";
+import { execBatch, type Action } from "./action-engine.ts";
+import { hud } from "./page-agent.ts";
+import { perceive } from "./perception.ts";
 import { inspectElement } from "./inspect.ts";
 import { waitForSettled, trackNetwork, type NetworkActivity, type SettleResult } from "./settle.ts";
-import { formatTurn, type ToolResult, type TurnRequest, type TurnSnapshot } from "./turn.ts";
-import { resolveViewport } from "./viewport.ts";
+import {
+  formatTurn,
+  type ToolResult,
+  type TurnOutcome,
+  type TurnRequest,
+  type TurnSnapshot,
+} from "./turn.ts";
+import { resolveViewport, viewportSizeOf } from "./viewport.ts";
 import { checkNavigationUrl, redactUrl } from "./url-policy.ts";
 
 export interface BrowserSession {
@@ -36,11 +35,36 @@ export interface BrowserSession {
   activeUrl(): string;
 }
 
+/** What the turn loop needs from the process browser; the manager satisfies it. */
+export type SessionHost = Pick<
+  BrowserSessionManager,
+  "ensureActivePage" | "runExclusive" | "getConfig" | "getTelemetry" | "getViewport" | "tabs"
+>;
+
+/** What one request kind's intent hands back to the shared turn sequence. */
+interface Intent {
+  readonly settle?: SettleResult;
+  readonly notice?: string | null;
+  readonly metadata?: Record<string, unknown>;
+  /** SoM badges on the screenshot (default true). */
+  readonly annotate?: boolean;
+  readonly fullPage?: boolean;
+  /** The outcome built from the snapshot; default is a page outcome. */
+  readonly outcome?: (snapshot: TurnSnapshot, metadata: Record<string, unknown>) => TurnOutcome;
+}
+
 export class PlaywrightBrowserSession implements BrowserSession {
-  constructor(private readonly manager: BrowserSessionManager) { }
+  /**
+   * `perceiveTab` is the perception adapter: core/perception.ts in
+   * production, a stand-in in turn-loop tests.
+   */
+  constructor(
+    private readonly manager: SessionHost,
+    private readonly perceiveTab: typeof perceive = perceive,
+  ) { }
 
   activeUrl(): string {
-    const page = this.manager.getActivePage();
+    const page = this.manager.tabs.active();
     if (!page || page.isClosed()) return "about:blank";
     return page.url();
   }
@@ -53,255 +77,177 @@ export class PlaywrightBrowserSession implements BrowserSession {
     return this.manager.runExclusive(() => this.runTurn(request));
   }
 
+  /**
+   * The shared sequence every kind runs: ensure page -> intent -> pick the
+   * tab to perceive -> perceive -> snapshot -> format, and clear the HUD on
+   * every tab the turn touched, success or failure.
+   */
   private async runTurn(request: TurnRequest): Promise<ToolResult> {
-    // A bare viewport call releases the pin *before* the page is ensured, so
-    // ensureActivePage() re-syncs to the live window.
-    if (request.kind === "viewport" && resolveViewport(request) === null) {
-      this.manager.unpinViewport();
-    }
-
     const page = await this.manager.ensureActivePage();
     const config = this.manager.getConfig();
-    // The tab perceived at the end of the turn; the intent may open or close
-    // tabs, which moves the manager's active pointer.
     let target: Page = page;
-
-    let settle: SettleResult | undefined;
-    let notice: string | null = null;
-    let kind: "page" | "inspect" | "evaluate" = "page";
-    let inspectLines: readonly string[] = [];
-    let inspectFound = false;
-    let evalRendered = "";
-    let evalThrew = false;
-    let extraMetadata: Record<string, unknown> = {};
-    let annotate = true;
-    let fullPage = false;
-
     try {
-      switch (request.kind) {
-        case "navigate": {
-          await this.withNetwork(page, async (activity) => {
-            await this.navigate(page, request.action, request.url, request.waitUntil);
-            settle = await this.settle(page, activity);
-          });
-          extraMetadata = { action: request.action };
-          break;
-        }
+      const intent = await this.intent(page, request);
 
-        case "act": {
-          const actions = [...request.actions];
-          if (actions.length === 0) {
-            throw new Error("browse_interact: pass `actions` or a single `type` action");
-          }
-          if (actions.length > 1) await hudUpdate(page, `Batch: ${actions.length} actions`);
-          const batch = await this.withNetwork(page, async (activity) => {
-            const result = await execBatch(page, actions);
-            settle = await this.settle(page, activity);
-            return result;
-          });
-          notice = batch.message;
-          extraMetadata = {
-            stoppedAt: batch.stoppedAt,
-            batchMessage: batch.message ?? undefined,
-          };
-          if (batch.staleElementId !== null) {
-            await hudUpdate(page, `Stopped at [${batch.staleElementId}] — stale`);
-          } else if (actions.length > 1) {
-            await hudUpdate(page, `Batch complete (${batch.completed}/${actions.length})`);
-          }
-          break;
-        }
-
-        case "observe": {
-          annotate = request.annotate !== false;
-          fullPage = request.fullPage ?? false;
-          break;
-        }
-
-        case "inspect": {
-          kind = "inspect";
-          annotate = false;
-          const inspected = await inspectElement(page, request);
-          inspectLines = inspected.lines;
-          inspectFound = inspected.found;
-          extraMetadata = {
-            elementId: request.elementId,
-            selector: request.selector,
-            found: inspected.found,
-          };
-          break;
-        }
-
-        case "viewport": {
-          const resolved = resolveViewport(request);
-          if (resolved === null) {
-            const vs = page.viewportSize();
-            extraMetadata = {
-              viewport: { width: vs?.width ?? 1280, height: vs?.height ?? 720 },
-            };
-          } else {
-            // Pin before resizing so the 1 s viewport watcher cannot re-fit
-            // the page while the resize is in flight.
-            this.manager.pinViewport();
-            try {
-              await this.withNetwork(page, async (activity) => {
-                await page.setViewportSize(resolved);
-                settle = await this.settle(page, activity);
-              });
-            } catch (error) {
-              this.manager.unpinViewport();
-              throw error;
-            }
-            extraMetadata = { viewport: resolved };
-          }
-          break;
-        }
-
-        case "evaluate": {
-          kind = "evaluate";
-          annotate = false;
-          if (request.approvedUrl !== undefined) {
-            const now = redactUrl(page.url());
-            if (now !== request.approvedUrl) {
-              throw new Error(
-                `page changed since browse_eval was approved (approved ${request.approvedUrl}, now ${now}); retry`,
-              );
-            }
-          }
-          const evaluated = await this.evaluateBounded(page, request.expression, config.evalTimeoutMs);
-          if (evaluated.kind === "value") {
-            const value = evaluated.value;
-            if (value === undefined) {
-              evalRendered = "undefined";
-            } else {
-              try {
-                evalRendered = JSON.stringify(value);
-              } catch {
-                evalRendered = String(value);
-              }
-            }
-            extraMetadata = { threw: false };
-          } else if (evaluated.kind === "error") {
-            evalThrew = true;
-            const error = evaluated.error;
-            evalRendered = error instanceof Error ? error.message : String(error);
-            extraMetadata = { threw: true };
-          } else {
-            evalThrew = true;
-            evalRendered =
-              `timed out after ${config.evalTimeoutMs}ms` +
-              (evaluated.terminated
-                ? "; the page script was terminated"
-                : "; the page script may still be pending");
-            extraMetadata = { threw: true, timedOut: true };
-          }
-          break;
-        }
-      }
-
-      // Perceive the tab that is active now, not the one the turn started on.
+      // Perceive the tab that is active now, not the one the turn started on:
+      // the intent may open or close tabs, which moves the active pointer.
       const deadline = Date.now() + config.perceptionTimeoutMs;
-      const after = this.manager.getActivePage();
+      const after = this.manager.tabs.active();
       if (after !== page || page.isClosed()) {
         target = after && !after.isClosed() ? after : await this.manager.ensureActivePage();
         const wait = Math.max(1, Math.min(deadline - Date.now(), config.navigationTimeoutMs));
         await target.waitForLoadState("domcontentloaded", { timeout: wait }).catch(() => undefined);
       }
 
-      const perception = await this.perceive(target, { annotate, fullPage }, deadline);
-      const turnNotice = [notice, perception.notice].filter((n): n is string => !!n).join("\n\n") || null;
-
+      const perception = await this.perceiveTab(target, {
+        telemetry: this.manager.getTelemetry(),
+        screenshotDir: config.screenshotDir,
+        deadline,
+        budgetMs: config.perceptionTimeoutMs,
+        annotate: intent.annotate ?? true,
+        fullPage: intent.fullPage ?? false,
+      });
+      const notice = [intent.notice, perception.notice].filter((n): n is string => !!n).join("\n\n") || null;
       const snapshot: TurnSnapshot = {
         url: target.url(),
         title: await target.title().catch(() => ""),
-        tabId: this.manager.pageIdFor(target),
+        tabId: this.manager.tabs.idOf(target),
         elements: perception.elements,
         screenshotPath: perception.screenshotPath,
         width: perception.width,
         height: perception.height,
         telemetry: perception.telemetryEvents,
-        tabSwitch: this.manager.takeTabSwitchNotification(),
-        settled: settle?.settled,
-        durationMs: settle?.durationMs,
-        notice: turnNotice,
+        tabSwitch: this.manager.tabs.takeNotice(),
+        settled: intent.settle?.settled,
+        durationMs: intent.settle?.durationMs,
+        notice,
       };
-
-      if (kind === "inspect") {
-        return formatTurn({
-          kind,
-          snapshot,
-          lines: inspectLines,
-          found: inspectFound,
-          metadata: extraMetadata,
-        });
-      }
-      if (kind === "evaluate") {
-        return formatTurn({
-          kind,
-          snapshot,
-          rendered: evalRendered,
-          threw: evalThrew,
-          metadata: extraMetadata,
-        });
-      }
-      return formatTurn({ kind: "page", snapshot, metadata: extraMetadata });
+      const metadata = intent.metadata ?? {};
+      return formatTurn(intent.outcome ? intent.outcome(snapshot, metadata) : { kind: "page", snapshot, metadata });
     } finally {
-      // Never leave the status pill showing a stale activity, on success or
-      // failure. capturePerception restores the HUD before this runs.
-      await hudClear(page);
-      if (target !== page) await hudClear(target);
+      // Never leave the status pill showing a stale activity. Perception
+      // restores the hidden HUD before this runs.
+      await hud.clear(page);
+      if (target !== page) await hud.clear(target);
     }
   }
 
-  /**
-   * Capture the element map and screenshot within `perceptionTimeoutMs`.
-   * A navigation during capture is retried (up to 3 attempts) after the new
-   * document loads; if it never stabilizes, the turn still succeeds with a
-   * "Perception incomplete" notice. Telemetry is drained exactly once for
-   * every returned result. Other errors propagate as before.
-   */
-  private async perceive(
-    page: Page,
-    opts: { readonly annotate: boolean; readonly fullPage: boolean },
-    deadline: number,
-  ): Promise<PerceptionResult & { readonly notice: string | null }> {
+  /** Run one request kind's intent on `page`. */
+  private intent(page: Page, request: TurnRequest): Promise<Intent> {
+    switch (request.kind) {
+      case "navigate":
+        return this.navigateIntent(page, request);
+      case "act":
+        return this.actIntent(page, request.actions);
+      case "observe":
+        return Promise.resolve({ annotate: request.annotate !== false, fullPage: request.fullPage ?? false });
+      case "inspect":
+        return this.inspectIntent(page, request);
+      case "viewport":
+        return this.viewportIntent(page, request);
+      case "evaluate":
+        return this.evaluateIntent(page, request);
+    }
+  }
+
+  private async navigateIntent(page: Page, request: Extract<TurnRequest, { kind: "navigate" }>): Promise<Intent> {
+    const settle = await this.withNetwork(page, async (activity) => {
+      await this.navigate(page, request.action, request.url, request.waitUntil);
+      return this.settle(page, activity);
+    });
+    return { settle, metadata: { action: request.action } };
+  }
+
+  private async actIntent(page: Page, requested: readonly Action[]): Promise<Intent> {
+    const actions = [...requested];
+    if (actions.length === 0) {
+      throw new Error("browse_interact: pass `actions` or a single `type` action");
+    }
+    if (actions.length > 1) await hud.status(page, `Batch: ${actions.length} actions`);
+    const { batch, settle } = await this.withNetwork(page, async (activity) => {
+      const batch = await execBatch(page, actions);
+      return { batch, settle: await this.settle(page, activity) };
+    });
+    if (batch.staleElementId !== null) {
+      await hud.status(page, `Stopped at [${batch.staleElementId}] — stale`);
+    } else if (actions.length > 1) {
+      await hud.status(page, `Batch complete (${batch.completed}/${actions.length})`);
+    }
+    return {
+      settle,
+      notice: batch.message,
+      metadata: { stoppedAt: batch.stoppedAt, batchMessage: batch.message ?? undefined },
+    };
+  }
+
+  private async inspectIntent(page: Page, request: Extract<TurnRequest, { kind: "inspect" }>): Promise<Intent> {
+    const inspected = await inspectElement(page, request);
+    return {
+      annotate: false,
+      metadata: { elementId: request.elementId, selector: request.selector, found: inspected.found },
+      outcome: (snapshot, metadata) => ({
+        kind: "inspect",
+        snapshot,
+        lines: inspected.lines,
+        found: inspected.found,
+        metadata,
+      }),
+    };
+  }
+
+  private async viewportIntent(page: Page, request: Extract<TurnRequest, { kind: "viewport" }>): Promise<Intent> {
+    // null = release the override and follow the live window again.
+    const resolved = resolveViewport(request);
+    const settle = await this.withNetwork(page, async (activity) => {
+      await this.manager.getViewport().apply(page, resolved);
+      return this.settle(page, activity);
+    });
+    return { settle, metadata: { viewport: resolved ?? (await viewportSizeOf(page)) } };
+  }
+
+  private async evaluateIntent(page: Page, request: Extract<TurnRequest, { kind: "evaluate" }>): Promise<Intent> {
     const config = this.manager.getConfig();
-    const telemetry = this.manager.getTelemetry();
-    const budget = config.perceptionTimeoutMs;
-    let lastRace: unknown = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      const capture = capturePerception(page, telemetry, {
-        screenshotDir: config.screenshotDir,
-        annotate: opts.annotate,
-        fullPage: opts.fullPage,
-        timeoutMs: remaining,
-        drainTelemetry: false,
-      });
-      capture.catch(() => undefined);
-      try {
-        const result = await raceDeadline(capture, remaining, () => new PerceptionTimeoutError(budget));
-        return { ...result, telemetryEvents: drainTelemetryEvents(telemetry), notice: null };
-      } catch (error) {
-        if (!isNavigationRace(error)) throw error;
-        lastRace = error;
-        const left = deadline - Date.now();
-        if (left <= 0) break;
-        await page.waitForLoadState("domcontentloaded", { timeout: left }).catch(() => undefined);
+    if (request.approvedUrl !== undefined) {
+      const now = redactUrl(page.url());
+      if (now !== request.approvedUrl) {
+        throw new Error(
+          `page changed since browse_eval was approved (approved ${request.approvedUrl}, now ${now}); retry`,
+        );
       }
     }
-    const vs = page.isClosed() ? null : page.viewportSize();
-    const reason = firstLine(lastRace) ?? `perception did not finish within ${budget}ms`;
+    const evaluated = await this.evaluateBounded(page, request.expression, config.evalTimeoutMs);
+    let rendered: string;
+    let threw = true;
+    let metadata: Record<string, unknown>;
+    if (evaluated.kind === "value") {
+      threw = false;
+      const value = evaluated.value;
+      if (value === undefined) {
+        rendered = "undefined";
+      } else {
+        try {
+          rendered = JSON.stringify(value);
+        } catch {
+          rendered = String(value);
+        }
+      }
+      metadata = { threw: false };
+    } else if (evaluated.kind === "error") {
+      const error = evaluated.error;
+      rendered = error instanceof Error ? error.message : String(error);
+      metadata = { threw: true };
+    } else {
+      rendered =
+        `timed out after ${config.evalTimeoutMs}ms` +
+        (evaluated.terminated
+          ? "; the page script was terminated"
+          : "; the page script may still be pending");
+      metadata = { threw: true, timedOut: true };
+    }
     return {
-      elements: [],
-      screenshotPath: null,
-      width: vs?.width ?? null,
-      height: vs?.height ?? null,
-      telemetryEvents: drainTelemetryEvents(telemetry),
-      notice:
-        `Perception incomplete: the page navigated during capture (${reason}). ` +
-        "Call browse_snapshot to observe the new page.",
+      annotate: false,
+      metadata,
+      outcome: (snapshot, meta) => ({ kind: "evaluate", snapshot, rendered, threw, metadata: meta }),
     };
   }
 
@@ -382,7 +328,7 @@ export class PlaywrightBrowserSession implements BrowserSession {
     if (action === "goto") {
       if (!url) throw new Error("browse_navigate: `url` is required when action is `goto`");
       checkNavigationUrl(url, { allowFile: config.allowFileUrls });
-      await hudUpdate(page, `Navigating to ${url}`);
+      await hud.status(page, `Navigating to ${url}`);
       await page.goto(url, {
         waitUntil: waitUntil ?? "load",
         timeout,
@@ -390,16 +336,16 @@ export class PlaywrightBrowserSession implements BrowserSession {
       return;
     }
     if (action === "back") {
-      await hudUpdate(page, "Going back");
+      await hud.status(page, "Going back");
       await page.goBack({ timeout });
       return;
     }
     if (action === "forward") {
-      await hudUpdate(page, "Going forward");
+      await hud.status(page, "Going forward");
       await page.goForward({ timeout });
       return;
     }
-    await hudUpdate(page, "Reloading");
+    await hud.status(page, "Reloading");
     await page.reload({ timeout });
   }
 
@@ -422,21 +368,4 @@ function orNullAfter<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([promise, deadline]).finally(() => {
     if (timer !== undefined) clearTimeout(timer);
   });
-}
-
-/** Reject with `makeError()` if `promise` has not settled within `ms`. */
-function raceDeadline<T>(promise: Promise<T>, ms: number, makeError: () => Error): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(makeError()), ms);
-  });
-  return Promise.race([promise, deadline]).finally(() => {
-    if (timer !== undefined) clearTimeout(timer);
-  });
-}
-
-function firstLine(error: unknown): string | null {
-  if (error === null || error === undefined) return null;
-  const message = error instanceof Error ? error.message : String(error);
-  return message.split("\n")[0] ?? null;
 }

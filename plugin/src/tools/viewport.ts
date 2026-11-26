@@ -1,6 +1,6 @@
 /**
  * browse_viewport — resize the page to a preset or custom CSS size.
- * A bare call releases the pin and re-syncs to the live browser window.
+ * A bare call releases the override so the page follows the live window again.
  */
 
 import { z } from "zod";
@@ -30,8 +30,8 @@ export type Input = z.infer<typeof schema>;
 
 export const description =
   "Resize the page to a preset (desktop 1440x900, laptop 1280x800, tablet 768x1024, " +
-  "mobile 390x844), a custom width+height, or call with no arguments to release the pin " +
-  "and re-sync to the live browser window. Settles and returns the refreshed element map " +
+  "mobile 390x844), a custom width+height, or call with no arguments to release the " +
+  "override so the page fills the live browser window again. Settles and returns the refreshed element map " +
   "and screenshot.";
 
 export async function execute(input: Input, deps: ToolDeps): Promise<ToolResult> {

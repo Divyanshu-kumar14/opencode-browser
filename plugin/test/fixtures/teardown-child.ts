@@ -9,10 +9,10 @@
  */
 
 import { BrowserSessionManager } from "../../src/core/session-manager.ts";
+import { processBrowser } from "../../src/core/process-browser.ts";
 
 const mode = process.argv[2] ?? "bare";
-const manager = new BrowserSessionManager({ headless: true });
-manager.registerTeardown();
+await processBrowser.acquire(() => new BrowserSessionManager({ headless: true }));
 
 if (mode === "host-handler") {
   process.on("SIGTERM", () => {

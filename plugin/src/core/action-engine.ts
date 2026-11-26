@@ -1,23 +1,19 @@
 /**
  * Action execution engine for the perception-action loop.
  *
- * Supports a single action or a batched `actions[]` sequence. Every mutating
- * action runs: Update HUD -> Execute Action(s) -> waitForSettled() -> Re-index
- * SoM + annotated screenshot -> Drain telemetry -> Formatted payload (the tool
- * layer owns formatting).
+ * Supports a single action or a batched `actions[]` sequence. The turn loop
+ * runs: Update HUD -> Execute Action(s) -> waitForSettled() -> perception
+ * (core/perception.ts) -> Formatted payload.
  *
  * Stale-ID recovery: in a batch, each step's target element is re-verified
  * against the live DOM before acting. If an earlier step navigates or removes
  * a later step's target, the batch stops cleanly and reports which action #.
  */
 
-import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { ElementHandle, Page, Locator } from "playwright";
 import { InvalidInputError } from "./errors.ts";
 import { somSelector } from "./som.ts";
-import { Telemetry } from "./telemetry.ts";
+import { hud } from "./page-agent.ts";
 import { sanitizePageText, type ElementLine } from "../utils/formatter.ts";
 
 export type ActionType =
@@ -54,46 +50,6 @@ export interface BatchResult {
   readonly stoppedAt: number | null;
   readonly message: string | null;
   readonly staleElementId: number | null;
-}
-
-export function hudUpdate(page: Page, text: string): Promise<unknown> {
-  return page
-    .evaluate((t: string) => {
-      const w = globalThis as unknown as Record<string, any>;
-      const h = w["__opencodeHud"];
-      if (h) h.updateStatus(t);
-    }, text)
-    .catch(() => undefined);
-}
-
-export function hudClear(page: Page): Promise<unknown> {
-  return page
-    .evaluate(() => {
-      const w = globalThis as unknown as Record<string, any>;
-      const h = w["__opencodeHud"];
-      if (h) h.updateStatus("");
-    })
-    .catch(() => undefined);
-}
-
-export function hudCursor(page: Page, x: number, y: number): Promise<unknown> {
-  return page
-    .evaluate((args: { x: number; y: number }) => {
-      const w = globalThis as unknown as Record<string, any>;
-      const h = w["__opencodeHud"];
-      if (h) h.moveCursor(args.x, args.y);
-    }, { x, y })
-    .catch(() => undefined);
-}
-
-export function hudRipple(page: Page, x: number, y: number): Promise<unknown> {
-  return page
-    .evaluate((args: { x: number; y: number }) => {
-      const w = globalThis as unknown as Record<string, any>;
-      const h = w["__opencodeHud"];
-      if (h) h.showClickRipple(args.x, args.y);
-    }, { x, y })
-    .catch(() => undefined);
 }
 
 /**
@@ -167,32 +123,32 @@ export async function execAction(page: Page, action: Action): Promise<void> {
     action.elementId !== undefined
       ? `[${action.elementId}]`
       : action.selector ?? (center ? `${center.x},${center.y}` : null);
-  if (label) await hudUpdate(page, `Acting on ${label}`);
+  if (label) await hud.status(page, `Acting on ${label}`);
 
   switch (action.type) {
     case "click": {
-      if (center) await hudCursor(page, center.x, center.y);
+      if (center) await hud.cursor(page, center.x, center.y);
       if (loc) {
         await loc.click();
       } else if (center) {
         await page.mouse.click(center.x, center.y);
       }
-      if (center) await hudRipple(page, center.x, center.y);
+      if (center) await hud.ripple(page, center.x, center.y);
       break;
     }
     case "double_click": {
-      if (center) await hudCursor(page, center.x, center.y);
+      if (center) await hud.cursor(page, center.x, center.y);
       if (loc) await loc.dblclick();
       else if (center) await page.mouse.dblclick(center.x, center.y);
-      if (center) await hudRipple(page, center.x, center.y);
+      if (center) await hud.ripple(page, center.x, center.y);
       break;
     }
     case "right_click": {
-      if (center) await hudCursor(page, center.x, center.y);
+      if (center) await hud.cursor(page, center.x, center.y);
       if (loc) await loc.click({ button: "right" });
       else if (center)
         await page.mouse.click(center.x, center.y, { button: "right" });
-      if (center) await hudRipple(page, center.x, center.y);
+      if (center) await hud.ripple(page, center.x, center.y);
       break;
     }
     case "type": {
@@ -228,7 +184,7 @@ export async function execAction(page: Page, action: Action): Promise<void> {
       break;
     }
     case "hover": {
-      if (center) await hudCursor(page, center.x, center.y);
+      if (center) await hud.cursor(page, center.x, center.y);
       if (loc) await loc.hover();
       else if (center) await page.mouse.move(center.x, center.y);
       break;
@@ -294,7 +250,7 @@ export async function execAction(page: Page, action: Action): Promise<void> {
           `drag: could not resolve the position of ${label ?? "the start point"}; the element has no layout box`,
         );
       }
-      await hudCursor(page, center.x, center.y);
+      await hud.cursor(page, center.x, center.y);
       const start = center;
       if (action.toX === undefined || action.toY === undefined) {
         throw new Error("browse_interact: `drag` requires `toX` and `toY` (viewport CSS px)");
@@ -303,7 +259,7 @@ export async function execAction(page: Page, action: Action): Promise<void> {
       await page.mouse.down();
       await page.mouse.move(action.toX, action.toY, { steps: 12 });
       await page.mouse.up();
-      await hudRipple(page, action.toX, action.toY);
+      await hud.ripple(page, action.toX, action.toY);
       break;
     }
     case "wait": {
@@ -352,162 +308,4 @@ export async function execBatch(
     await execAction(page, action);
   }
   return { completed: actions.length, stoppedAt: null, message: null, staleElementId: null };
-}
-
-export interface PerceptionResult {
-  readonly elements: readonly ElementLine[];
-  readonly screenshotPath: string | null;
-  readonly width: number | null;
-  readonly height: number | null;
-  readonly telemetryEvents: readonly { readonly type: string; readonly text: string }[];
-}
-
-export async function capturePerception(
-  page: Page,
-  telemetry: Telemetry,
-  opts: {
-    readonly screenshotDir: string;
-    readonly annotate?: boolean;
-    readonly fullPage?: boolean;
-    /** Screenshot timeout (Playwright default 30 s when omitted). */
-    readonly timeoutMs?: number;
-    /**
-     * Drain telemetry into the result (default true). Callers that retry
-     * capture pass false and call `drainTelemetryEvents` once, so a failed
-     * attempt never consumes events.
-     */
-    readonly drainTelemetry?: boolean;
-  },
-): Promise<PerceptionResult> {
-  // Re-index the current page into a fresh [1..N] element map.
-  const indexed: unknown = await page.evaluate(() => {
-    const w = globalThis as unknown as Record<string, any>;
-    const s = w["__opencodeSom"];
-    if (!s) return { elements: [], count: 0, capped: false };
-    return s.indexPage();
-  });
-  const rec = indexed as { elements?: unknown } | null;
-  const elements = Array.isArray(rec?.elements) ? (rec.elements as ElementLine[]) : [];
-
-  let screenshotPath: string | null = null;
-  let width: number | null = null;
-  let height: number | null = null;
-
-  // Always capture: annotate:false means a clean screenshot, not no screenshot.
-  // Screenshot hygiene: hide HUD, optionally render SoM badges, capture,
-  // remove the overlay, restore the HUD. The restore is a finally: a failed or
-  // timed-out screenshot must never leave the HUD hidden or badges painted.
-  await page
-    .evaluate(() => {
-      const w = globalThis as unknown as Record<string, any>;
-      const h = w["__opencodeHud"];
-      if (h) h.hide();
-    })
-    .catch(() => undefined);
-
-  let buffer: Buffer;
-  try {
-    if (opts.annotate !== false) {
-      await page
-        .evaluate(() => {
-          const w = globalThis as unknown as Record<string, any>;
-          const s = w["__opencodeSom"];
-          if (s) s.renderSoMOverlay();
-        })
-        .catch(() => undefined);
-    }
-
-    buffer = await page.screenshot({
-      fullPage: opts.fullPage ?? false,
-      ...(opts.timeoutMs === undefined ? {} : { timeout: Math.max(1, Math.round(opts.timeoutMs)) }),
-    });
-    const vp = page.viewportSize();
-    width = vp?.width ?? null;
-    height = vp?.height ?? null;
-  } finally {
-    if (opts.annotate !== false) {
-      await page
-        .evaluate(() => {
-          const w = globalThis as unknown as Record<string, any>;
-          const s = w["__opencodeSom"];
-          if (s) s.removeSoMOverlay();
-        })
-        .catch(() => undefined);
-    }
-    await page
-      .evaluate(() => {
-        const w = globalThis as unknown as Record<string, any>;
-        const h = w["__opencodeHud"];
-        if (h) h.show();
-      })
-      .catch(() => undefined);
-  }
-
-  screenshotPath = await savePng(buffer, opts.screenshotDir);
-
-  const telemetryEvents = opts.drainTelemetry === false ? [] : drainTelemetryEvents(telemetry);
-
-  return { elements, screenshotPath, width, height, telemetryEvents };
-}
-
-/** Delta drain: only telemetry generated since the last tool call. */
-export function drainTelemetryEvents(
-  telemetry: Telemetry,
-): { readonly type: string; readonly text: string }[] {
-  return telemetry.drain().events.map((e) => ({ type: e.type, text: e.text }));
-}
-
-/** Raised when a capture attempt runs past its perception budget. */
-export class PerceptionTimeoutError extends Error {
-  constructor(ms: number) {
-    super(`perception did not finish within ${ms}ms`);
-    this.name = "PerceptionTimeoutError";
-  }
-}
-
-/**
- * True for errors caused by the document changing under an evaluate or a
- * screenshot: the page navigated or reloaded during capture.
- */
-export function isNavigationRace(error: unknown): boolean {
-  if (error instanceof PerceptionTimeoutError) return true;
-  if (!(error instanceof Error)) return false;
-  const message = error.message;
-  if (
-    message.includes("Execution context was destroyed") ||
-    message.includes("frame was detached") ||
-    message.includes("Cannot find context with specified id")
-  ) {
-    return true;
-  }
-  return error.name === "TimeoutError" && message.includes("screenshot");
-}
-
-/**
- * Create the screenshot directory owner-only (0700). An existing directory
- * must be a real directory, not a symlink; one owned by this uid is tightened
- * to 0700.
- */
-function ensurePrivateDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const st = fs.lstatSync(dir);
-  if (st.isSymbolicLink() || !st.isDirectory()) {
-    throw new Error(`screenshot directory ${dir} is not a directory (or is a symlink)`);
-  }
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  if (uid !== null && st.uid === uid && (st.mode & 0o777) !== 0o700) {
-    fs.chmodSync(dir, 0o700);
-  }
-}
-
-async function savePng(buffer: Buffer, screenshotDir: string): Promise<string> {
-  ensurePrivateDir(screenshotDir);
-  const file = path.join(
-    screenshotDir,
-    `opencode-som-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.png`,
-  );
-  // 0600 and O_CREAT|O_EXCL: private even under a shared parent directory, and
-  // never follows a planted file or symlink.
-  fs.writeFileSync(file, buffer, { mode: 0o600, flag: "wx" });
-  return file;
 }

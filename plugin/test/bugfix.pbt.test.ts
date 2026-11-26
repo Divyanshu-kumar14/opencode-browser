@@ -39,7 +39,7 @@ function ready(): boolean {
 }
 
 function page(): Page {
-  return env!.manager.getActivePage()!;
+  return env!.manager.tabs.active()!;
 }
 
 function text(result: { content: unknown }): string {
@@ -686,7 +686,7 @@ describe("Group 5: concurrent turns (PBT)", () => {
               statuses: kinds.map(() => "fulfilled"),
             });
             expect(launches).toBe(1);
-            const max = await manager.getActivePage()!.evaluate("window.__max || 0");
+            const max = await manager.tabs.active()!.evaluate("window.__max || 0");
             expect(max as number).toBeLessThanOrEqual(1);
           } finally {
             await manager.close().catch(() => undefined);

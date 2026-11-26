@@ -21,7 +21,7 @@ There are two code bases in this repository:
 | Agent → navigation | `core/url-policy.ts`, `core/browser-session.ts` | scheme allowlist on `browse_navigate goto` |
 | Agent → page JS | `tools/evaluate.ts`, `index.ts` | `browser_eval` permission prompt, eval timeout |
 | Page → agent | `injected/dom-annotator.ts`, `core/telemetry.ts` | sensitive-input and URL redaction; page text is data, never instructions |
-| Local user → screenshots | `core/action-engine.ts` | owner-only directory and files |
+| Local user → screenshots | `core/perception.ts` | owner-only directory and files |
 
 ### Navigation
 

@@ -1,3 +1,6 @@
+/** Page globals the injected scripts install (HUD and SoM indexer). */
+export const PAGE_GLOBALS = { hud: "__opencodeHud", som: "__opencodeSom" } as const;
+
 /** Attribute the injected SoM annotator tags indexed nodes with. */
 export const SOM_ATTRIBUTE = "data-opencode-id";
 

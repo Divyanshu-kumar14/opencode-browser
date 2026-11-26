@@ -3,15 +3,18 @@
  * formatting, and the turn formatter. No browser required.
  */
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { Page } from "playwright";
 import { Telemetry } from "../src/core/telemetry.ts";
-import { capturePerception } from "../src/core/action-engine.ts";
+import { perceive } from "../src/core/perception.ts";
+import { PAGE_GLOBALS, hud } from "../src/core/page-agent.ts";
 import {
-  calibratedRatio,
-  fittedWidth,
+  Viewport,
   resolveViewport,
-  viewportDrifted,
+  viewportSizeOf,
 } from "../src/core/viewport.ts";
 import { formatTurn, type TurnSnapshot } from "../src/core/turn.ts";
 import {
@@ -87,27 +90,94 @@ function consoleMessage(type: string, text: string) {
 }
 
 describe("viewport math", () => {
-  test("detects drift outside the 20 px tolerance", () => {
-    expect(viewportDrifted({ outerW: 1432, innerW: 1416 })).toBe(false);
-    expect(viewportDrifted({ outerW: 1432, innerW: 1200 })).toBe(true);
-  });
-
-  test("calibrates the requested-to-CSS ratio and rejects bad probes", () => {
-    expect(calibratedRatio(800)).toBe(1);
-    expect(calibratedRatio(400)).toBe(2);
-    expect(calibratedRatio(0)).toBeNull();
-    expect(calibratedRatio(Number.NaN)).toBeNull();
-  });
-
-  test("fits the window width and clamps to the minimum", () => {
-    expect(fittedWidth(1432, 1)).toBe(1416);
-    expect(fittedWidth(100, 1)).toBe(320);
-  });
-
-  test("resolves presets, custom sizes, and bare resync", () => {
+  test("resolves presets, custom sizes, and bare release", () => {
     expect(resolveViewport({ preset: "mobile" })).toEqual({ width: 390, height: 844 });
     expect(resolveViewport({ width: 500, height: 400 })).toEqual({ width: 500, height: 400 });
     expect(resolveViewport({})).toBeNull();
+  });
+});
+
+/** A tab double for the viewport module: records resizes and CDP calls. */
+function viewportTab(name: string, log: string[]) {
+  const closers: (() => void)[] = [];
+  return {
+    setViewportSize: async (size: { width: number; height: number }) => {
+      log.push(`${name} emulate ${size.width}x${size.height}`);
+    },
+    viewportSize: () => null,
+    evaluate: async () => ({ width: 1618, height: 910 }),
+    once: (_event: string, fn: () => void) => void closers.push(fn),
+    close: () => closers.forEach((fn) => fn()),
+    context: () => ({
+      newCDPSession: async () => ({
+        send: async (method: string, params?: { width?: number; height?: number }) => {
+          log.push(params?.width ? `${name} ${method} ${params.width}x${params.height}` : `${name} ${method}`);
+        },
+        detach: async () => void log.push(`${name} detach`),
+      }),
+    }),
+  };
+}
+
+describe("viewport module", () => {
+  test("native mode launches without emulation, maximized", () => {
+    expect(Viewport.launchOptions("native")).toEqual({ viewport: null, args: ["--start-maximized"] });
+    expect(Viewport.launchOptions("emulated")).toEqual({ args: [] });
+  });
+
+  test("native: a preset is a CDP override, and release hands sizing back to the window", async () => {
+    const log: string[] = [];
+    const viewport = new Viewport("native");
+    const tab = viewportTab("a", log);
+    await viewport.apply(tab as never, { width: 390, height: 844 });
+    await viewport.apply(tab as never, null);
+    expect(log).toEqual([
+      "a Emulation.setDeviceMetricsOverride 390x844",
+      "a Emulation.clearDeviceMetricsOverride",
+      "a detach",
+    ]);
+  });
+
+  test("release clears every overridden tab, not just the active one", async () => {
+    const log: string[] = [];
+    const viewport = new Viewport("native");
+    const first = viewportTab("first", log);
+    const popup = viewportTab("popup", log);
+    await viewport.apply(first as never, { width: 390, height: 844 });
+    // The active pointer moved to the popup; a bare call is made there.
+    await viewport.apply(popup as never, null);
+    expect(log).toContain("first Emulation.clearDeviceMetricsOverride");
+    // Nothing is left to release afterwards.
+    log.length = 0;
+    await viewport.apply(popup as never, null);
+    expect(log).toEqual([]);
+  });
+
+  test("a closed tab is forgotten and never released", async () => {
+    const log: string[] = [];
+    const viewport = new Viewport("native");
+    const tab = viewportTab("a", log);
+    await viewport.apply(tab as never, { width: 500, height: 400 });
+    tab.close();
+    log.length = 0;
+    await viewport.apply(tab as never, null);
+    expect(log).toEqual([]);
+  });
+
+  test("emulated: presets use Playwright emulation and release to 1280x720", async () => {
+    const log: string[] = [];
+    const viewport = new Viewport("emulated");
+    const tab = viewportTab("a", log);
+    await viewport.apply(tab as never, { width: 390, height: 844 });
+    await viewport.apply(tab as never, null);
+    expect(log).toEqual(["a emulate 390x844", "a emulate 1280x720"]);
+  });
+
+  test("the size read falls back to the live window when nothing is emulated", async () => {
+    const log: string[] = [];
+    expect(await viewportSizeOf(viewportTab("a", log) as never)).toEqual({ width: 1618, height: 910 });
+    const emulated = { viewportSize: () => ({ width: 1280, height: 720 }), evaluate: async () => null };
+    expect(await viewportSizeOf(emulated as never)).toEqual({ width: 1280, height: 720 });
   });
 });
 
@@ -268,42 +338,133 @@ describe("payload formatting", () => {
   });
 });
 
-describe("perception capture", () => {
+afterAll(() => {
+  const g = globalThis as unknown as Record<string, unknown>;
+  delete g[PAGE_GLOBALS.hud];
+  delete g[PAGE_GLOBALS.som];
+});
+
+/**
+ * A page double for perception. `evaluate` runs the real page closures against
+ * recording HUD / SoM objects installed on globalThis; the first `races` calls
+ * hit a navigation instead.
+ */
+function perceptionPage(opts: { races?: number; screenshot?: () => Promise<Buffer> } = {}) {
+  const events: string[] = [];
+  let races = opts.races ?? 0;
+  const g = globalThis as unknown as Record<string, unknown>;
+  g[PAGE_GLOBALS.hud] = {
+    hide: () => events.push("hide"),
+    show: () => events.push("show"),
+    updateStatus: (t: string) => events.push(`status:${t}`),
+  };
+  g[PAGE_GLOBALS.som] = {
+    indexPage: () => ({ elements: [{ id: 1, tag: "button", label: "Go" }] }),
+    renderSoMOverlay: () => events.push("render"),
+    removeSoMOverlay: () => events.push("remove"),
+  };
+  const page = {
+    events,
+    evaluate: async (fn: (arg: unknown) => unknown, arg?: unknown) => {
+      if (races > 0) {
+        races -= 1;
+        events.push("race");
+        throw new Error("page.evaluate: Execution context was destroyed, most likely because of a navigation");
+      }
+      return fn(arg);
+    },
+    screenshot: opts.screenshot ?? (async () => {
+      events.push("screenshot");
+      return Buffer.from("png");
+    }),
+    waitForLoadState: async () => void events.push("load"),
+    isClosed: () => false,
+    viewportSize: () => ({ width: 1280, height: 720 }),
+  };
+  return page;
+}
+
+function perceiveOpts(telemetry = new Telemetry()) {
+  return {
+    telemetry,
+    screenshotDir: fs.mkdtempSync(path.join(os.tmpdir(), "perceive-")),
+    deadline: Date.now() + 2000,
+    budgetMs: 2000,
+  };
+}
+
+describe("perception", () => {
+  test("the screenshot sees a clean frame: HUD hidden, badges painted, then both restored", async () => {
+    const page = perceptionPage();
+    await perceive(page as unknown as Page, perceiveOpts());
+    expect(page.events).toEqual(["hide", "render", "screenshot", "remove", "show"]);
+  });
+
+  test("annotate:false takes a clean screenshot without badges", async () => {
+    const page = perceptionPage();
+    const result = await perceive(page as unknown as Page, { ...perceiveOpts(), annotate: false });
+    expect(result.screenshotPath).not.toBeNull();
+    expect(page.events).toEqual(["hide", "screenshot", "show"]);
+  });
+
   test("a failed screenshot still restores the HUD and removes the overlay", async () => {
-    const events: string[] = [];
-    const page = {
-      evaluate: async (fn: () => unknown) => {
-        const src = fn.toString();
-        if (src.includes("indexPage")) return { elements: [] };
-        if (src.includes("h.hide")) {
-          events.push("hide");
-          return undefined;
-        }
-        if (src.includes("renderSoMOverlay")) {
-          events.push("render");
-          return undefined;
-        }
-        if (src.includes("removeSoMOverlay")) {
-          events.push("remove");
-          return undefined;
-        }
-        if (src.includes("h.show")) {
-          events.push("show");
-          return undefined;
-        }
-        return undefined;
-      },
+    const page = perceptionPage({
       screenshot: async () => {
-        events.push("screenshot");
+        page.events.push("screenshot");
         throw new Error("screenshot failed");
       },
-      viewportSize: () => ({ width: 1280, height: 720 }),
-    } as unknown as Page;
+    });
+    await expect(perceive(page as unknown as Page, perceiveOpts())).rejects.toThrow("screenshot failed");
+    expect(page.events).toEqual(["hide", "render", "screenshot", "remove", "show"]);
+  });
 
-    await expect(
-      capturePerception(page, new Telemetry(), { screenshotDir: "/tmp" }),
-    ).rejects.toThrow("screenshot failed");
-    expect(events).toEqual(["hide", "render", "screenshot", "remove", "show"]);
+  test("a navigation during capture is retried after the new document loads", async () => {
+    const page = perceptionPage({ races: 2 });
+    const result = await perceive(page as unknown as Page, perceiveOpts());
+    expect(result.notice).toBeNull();
+    expect(result.elements).toHaveLength(1);
+    expect(result.screenshotPath).not.toBeNull();
+    expect(page.events.filter((e) => e === "load")).toHaveLength(2);
+  });
+
+  test("a page that never stabilizes yields an incomplete perception, not an error", async () => {
+    const page = perceptionPage({ races: 99 });
+    const result = await perceive(page as unknown as Page, perceiveOpts());
+    expect(page.events.filter((e) => e === "race")).toHaveLength(3);
+    expect(result.elements).toEqual([]);
+    expect(result.screenshotPath).toBeNull();
+    expect(result).toMatchObject({ width: 1280, height: 720 });
+    expect(result.notice).toContain("Perception incomplete");
+    expect(result.notice).toContain("Execution context was destroyed");
+  });
+
+  test("telemetry is drained exactly once, even across failed attempts", async () => {
+    const source = new FakePage();
+    const telemetry = new Telemetry(200);
+    telemetry.attach(asPage(source));
+    source.emit("console", consoleMessage("error", "boom"));
+    const result = await perceive(perceptionPage({ races: 2 }) as unknown as Page, perceiveOpts(telemetry));
+    expect(result.telemetryEvents).toHaveLength(1);
+    expect(telemetry.drain().events).toHaveLength(0);
+  });
+
+  test("errors other than a navigation race propagate", async () => {
+    const page = perceptionPage();
+    page.evaluate = async () => {
+      throw new Error("boom");
+    };
+    await expect(perceive(page as unknown as Page, perceiveOpts())).rejects.toThrow("boom");
+  });
+});
+
+describe("page agent", () => {
+  test("HUD calls reach the page object and never throw", async () => {
+    const page = perceptionPage();
+    await hud.status(page as unknown as Page, "Navigating");
+    await hud.clear(page as unknown as Page);
+    expect(page.events).toEqual(["status:Navigating", "status:"]);
+    const broken = { evaluate: async () => Promise.reject(new Error("Target closed")) };
+    await expect(hud.status(broken as unknown as Page, "x")).resolves.toBeUndefined();
   });
 });
 

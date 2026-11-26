@@ -25,6 +25,7 @@ import plugin from "../src/index.ts";
 import { processBrowser } from "../src/core/process-browser.ts";
 import { Telemetry } from "../src/core/telemetry.ts";
 import { TabTracker } from "../src/core/tab-tracker.ts";
+import { Presence } from "../src/core/presence.ts";
 import { inspectElement } from "../src/core/inspect.ts";
 import { IMPLICIT_ROLE_BY_TAG } from "../src/core/som.ts";
 import { formatElementMap } from "../src/utils/formatter.ts";
@@ -711,6 +712,13 @@ describe("Group 5: session lifecycle (unit)", () => {
     } finally {
       processBrowser.replace(saved);
     }
+  });
+  test("the build fingerprint is stable within a process and covers presence", async () => {
+    const { MANAGER_BUILD } = await import("../src/core/process-browser.ts");
+    expect(MANAGER_BUILD).toMatch(/^[0-9a-f]{16}$/);
+    const again = await import("../src/core/process-browser.ts");
+    expect(again.MANAGER_BUILD).toBe(MANAGER_BUILD);
+    expect(String(Presence)).toContain("takeOver");
   });
   test("a manager left under the pre-fingerprint key is closed and dropped", async () => {
     const legacyKey = Symbol.for("opencode.browser.session-manager");

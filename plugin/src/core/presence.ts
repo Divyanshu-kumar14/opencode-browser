@@ -12,7 +12,9 @@
  *   - Take over (the Stop button): release the HUD and interrupt every session.
  *
  * A safety timer releases the HUD when no idle signal arrives (the host does
- * not send one after an interrupt or a failure). Each browser call re-arms it.
+ * not send one after an interrupt or a failure). It counts from the end of the
+ * last browser call and never fires while a call is still running, so a long
+ * `goto` or `browse_eval` keeps the HUD up.
  */
 
 import type { Page } from "playwright";
@@ -60,6 +62,8 @@ export class Presence {
   /** Tabs that already carry the navigation / close listeners. */
   private readonly watched = new WeakSet<PresencePage>();
   private timer: unknown = null;
+  /** Browser calls that have begun and not yet settled. */
+  private inFlight = 0;
   private interrupter: ((sessionId: string) => Promise<void> | void) | undefined;
 
   constructor(
@@ -88,6 +92,7 @@ export class Presence {
   /** A browser tool call starts: `sessionId` is using the browser on `pages`. */
   async begin(sessionId: string, pages: readonly PresencePage[]): Promise<void> {
     if (!this.enabled) return;
+    this.inFlight += 1;
     this.sessions.add(sessionId);
     this.arm();
     await Promise.all(pages.map((page) => this.mark(page)));
@@ -102,6 +107,8 @@ export class Presence {
       await Promise.all(pages.map((page) => hud.clear(page)));
       return;
     }
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    if (this.isActive()) this.arm();
     if (!this.isActive()) {
       await Promise.all(
         pages.map(async (page) => {
@@ -148,6 +155,7 @@ export class Presence {
 
   /** The browser is gone: forget everything without touching dead tabs. */
   discard(): void {
+    this.inFlight = 0;
     this.disarm();
     this.sessions.clear();
     this.marked.clear();
@@ -163,7 +171,11 @@ export class Presence {
 
   private arm(): void {
     this.disarm();
-    this.timer = this.timers.set(() => void this.release(), this.options.timeoutMs);
+    this.timer = this.timers.set(() => {
+      // A call is still running: keep the HUD and check again later.
+      if (this.inFlight > 0) this.arm();
+      else void this.release();
+    }, this.options.timeoutMs);
   }
 
   private disarm(): void {

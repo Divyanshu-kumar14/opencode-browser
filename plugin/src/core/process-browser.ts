@@ -16,6 +16,7 @@
 
 import * as crypto from "node:crypto";
 import { BrowserSessionManager } from "./session-manager.ts";
+import { Presence } from "./presence.ts";
 import { TabTracker } from "./tab-tracker.ts";
 import { Telemetry } from "./telemetry.ts";
 import { Viewport } from "./viewport.ts";
@@ -28,7 +29,7 @@ const LEGACY_KEY = Symbol.for("opencode.browser.session-manager");
 /** Fingerprint of the code a manager instance runs. */
 export const MANAGER_BUILD = crypto
   .createHash("sha256")
-  .update([BrowserSessionManager, Viewport, TabTracker, Telemetry].map(String).join("\n"))
+  .update([BrowserSessionManager, Viewport, TabTracker, Presence, Telemetry].map(String).join("\n"))
   .update(pageScripts(1).join("\n"))
   .digest("hex")
   .slice(0, 16);

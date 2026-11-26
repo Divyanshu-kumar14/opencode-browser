@@ -149,12 +149,14 @@ describe("presence", () => {
     expect(presence.isActive()).toBe(false);
   });
 
-  test("the safety timer releases the HUD when no idle signal arrives, and each call re-arms it", async () => {
+  test("the safety timer releases the HUD when no idle signal arrives, counted from the last finished call", async () => {
     const { presence, clock } = make(30000);
     const a = tab("a");
     await presence.begin("s1", [page(a)]);
+    await presence.settle([page(a)]);
     await clock.advance(20000);
     await presence.begin("s1", [page(a)]);
+    await presence.settle([page(a)]);
     await clock.advance(20000);
     expect(presence.isActive()).toBe(true);
     await clock.advance(10000);
@@ -163,10 +165,25 @@ describe("presence", () => {
     expect(clock.pending()).toBe(0);
   });
 
+  test("a call that outlasts the safety timer keeps the HUD until it finishes", async () => {
+    const { presence, clock } = make(30000);
+    const a = tab("a");
+    await presence.begin("s1", [page(a)]);
+    await clock.advance(90000);
+    expect(presence.isActive()).toBe(true);
+    expect(a.calls).not.toContain("setPresent(false)");
+    await presence.settle([page(a)]);
+    await clock.advance(29000);
+    expect(presence.isActive()).toBe(true);
+    await clock.advance(1000);
+    expect(presence.isActive()).toBe(false);
+  });
+
   test("a call after a timed-out release presents the tab again", async () => {
     const { presence, clock } = make(1000);
     const a = tab("a");
     await presence.begin("s1", [page(a)]);
+    await presence.settle([page(a)]);
     await clock.advance(1000);
     a.calls.length = 0;
     await presence.begin("s1", [page(a)]);

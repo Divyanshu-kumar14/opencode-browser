@@ -11,6 +11,7 @@ in the same window without getting in your way.
 ![OpenCode](https://img.shields.io/badge/OpenCode-V2%20plugin-7c3aed)
 ![Runtime](https://img.shields.io/badge/runtime-Bun%20%E2%89%A5%201.4.4-f472b6)
 ![Tools](https://img.shields.io/badge/tools-13-16a34a)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
 [Quickstart](#quickstart) · [Tools](#tools) · [How it works](#how-it-works) · [Configuration](#configuration) · [Security](#security) · [Development](#development)
 
@@ -340,3 +341,7 @@ Issues and pull requests are welcome. Before opening a pull request:
    behaviour can be tested end to end.
 3. Use the terms in [`GLOSSARY.md`](GLOSSARY.md) and keep [`docs/security.md`](docs/security.md)
    current when a change touches what the agent can reach.
+
+## License
+
+[MIT](LICENSE) © 2026 Divyanshu Kumar

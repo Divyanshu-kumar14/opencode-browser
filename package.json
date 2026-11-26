@@ -1,6 +1,7 @@
 {
   "name": "opencode-browser",
   "version": "0.1.0",
+  "license": "MIT",
   "description": "Browser automation for OpenCode: a Playwright perception-action engine (Set-of-Mark ids, annotated screenshots, deterministic settling)",
   "type": "module",
   "exports": {
@@ -8,7 +9,8 @@
   },
   "files": [
     "plugin/src",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build:native": "node scripts/build-native.mjs",

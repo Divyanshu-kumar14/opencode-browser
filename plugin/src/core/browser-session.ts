@@ -133,8 +133,11 @@ export class PlaywrightBrowserSession implements BrowserSession {
       const perception = await this.perceiveTab(target, {
         telemetry: this.manager.getTelemetry(),
         screenshotDir: config.screenshotDir,
-        // Only this session's tabs: other sessions' errors are theirs to report.
-        telemetryPages: target === page ? [target] : [page, target],
+        // Every tab this session owns (including ones in the background), and
+        // nothing else: other sessions' errors are theirs to report.
+        telemetryPages: [
+          ...new Set<Page>([page, target, ...this.manager.tabs.list(sessionId).map((tab) => tab.page)]),
+        ],
         deadline,
         budgetMs: config.perceptionTimeoutMs,
         annotate: intent.annotate ?? true,
@@ -385,6 +388,8 @@ export class PlaywrightBrowserSession implements BrowserSession {
       }
       case "open": {
         const opened = await this.manager.openTabFor(sessionId);
+        // The new tab's site rules must be in place before it loads anything.
+        await this.manager.sitesReady();
         if (request.url !== undefined) {
           await this.withNetwork(opened, async (activity) => {
             await this.navigate(opened, "goto", request.url, undefined);

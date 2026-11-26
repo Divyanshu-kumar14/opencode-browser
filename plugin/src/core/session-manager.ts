@@ -98,8 +98,8 @@ export class BrowserSessionManager {
 
   /** True when attached to a browser the user runs (CDP), not one this plugin launched. */
   private attached = false;
-  /** Answers and reports alert / confirm / prompt dialogs on every tracked tab. */
-  readonly dialogs = new Dialogs();
+  /** Answers and reports alert / confirm / prompt dialogs on the agent's tabs. */
+  readonly dialogs: Dialogs;
   /** Keeps agent tabs to the allowed sites (when rules are set). */
   readonly sites: SiteGuard;
   /** Recent requests and console lines per tab (browse_network). */
@@ -122,7 +122,9 @@ export class BrowserSessionManager {
     this.telemetry = new Telemetry(this.config.maxTelemetry);
     this.pageScripts = pageScripts(this.config.maxElements);
     this.presence = new Presence({ timeoutMs: this.config.hudTimeoutMs });
-    this.downloads = new Downloads(this.config.downloadDir);
+    const owned = (page: object): boolean => this.tabs.ownerOf(page as Page) !== null;
+    this.dialogs = new Dialogs({ isOwned: owned, userPresent: () => this.presence.enabled });
+    this.downloads = new Downloads(this.config.downloadDir, { isOwned: owned });
     this.sites = new SiteGuard(parseSiteRules(this.config.allowOrigins, this.config.denyOrigins));
     this.tabs = new TabTracker<Page>((page) => {
       this.telemetry.attach(page);

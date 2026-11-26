@@ -90,10 +90,19 @@ export class Downloads {
   private readonly notices = new WeakMap<object, string[]>();
   private readonly inFlight = new WeakMap<object, Set<Promise<void>>>();
 
-  constructor(private readonly dir: string) {}
+  private readonly isOwned: (page: object) => boolean;
+
+  /** Only downloads from tabs a session owns are saved; the user's are left to the browser. */
+  constructor(
+    private readonly dir: string,
+    options: { readonly isOwned?: (page: object) => boolean } = {},
+  ) {
+    this.isOwned = options.isOwned ?? (() => true);
+  }
 
   attach(page: Pick<Page, "on">): void {
     page.on("download", (download) => {
+      if (!this.isOwned(page)) return;
       const job = this.save(page, download);
       const set = this.inFlight.get(page) ?? new Set();
       set.add(job);

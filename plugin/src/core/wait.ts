@@ -37,7 +37,8 @@ type Step = { readonly label: string; readonly run: (remainingMs: number) => Pro
 export async function waitFor(page: Page, conditions: WaitConditions, timeoutMs: number): Promise<WaitResult> {
   const steps = await plan(page, conditions);
   const started = Date.now();
-  const deadline = started + timeoutMs;
+  // An explicit delay is always waited in full, even past the timeout.
+  const deadline = started + Math.max(timeoutMs, conditions.ms ?? 0);
   const held: string[] = [];
   for (const step of steps) {
     const remaining = deadline - Date.now();
@@ -64,7 +65,7 @@ const isInvalidSelector = (error: unknown): boolean => error instanceof InvalidS
 async function plan(page: Page, c: WaitConditions): Promise<Step[]> {
   const steps: Step[] = [];
   if (c.ms !== undefined) {
-    steps.push({ label: `${c.ms}ms`, run: (left) => sleep(Math.min(c.ms!, left)) });
+    steps.push({ label: `${c.ms}ms`, run: () => sleep(c.ms!) });
   }
   if (c.selector !== undefined) {
     const selector = c.selector;

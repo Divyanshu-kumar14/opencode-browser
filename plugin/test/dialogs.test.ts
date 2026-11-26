@@ -138,4 +138,32 @@ describe("dialogs", () => {
     await expect(page.open(dialog("confirm", "x", true))).resolves.toBeUndefined();
     expect(dialogs.take(page as never)[0]).toContain("could not be answered");
   });
+
+  test("a dialog on the user's own tab is left open for the user to answer", async () => {
+    const dialogs = new Dialogs({ isOwned: () => false, userPresent: () => true });
+    const page = fakePage();
+    dialogs.attach(page as never);
+    const d = dialog("confirm", "Leave this page?");
+    await page.open(d);
+    expect(d.outcome.action).toBeNull();
+    expect(dialogs.take(page as never)).toEqual([]);
+  });
+
+  test("with nobody watching (headless), an unowned tab's dialog is dismissed so the page never freezes", async () => {
+    const dialogs = new Dialogs({ isOwned: () => false, userPresent: () => false });
+    const page = fakePage();
+    dialogs.attach(page as never);
+    const d = dialog("confirm", "x");
+    await page.open(d);
+    expect(d.outcome.action).toBe("dismissed");
+  });
+
+  test("an agent tab's dialogs are still answered when a user is present", async () => {
+    const dialogs = new Dialogs({ isOwned: () => true, userPresent: () => true });
+    const page = fakePage();
+    dialogs.attach(page as never);
+    const d = dialog("alert", "Saved");
+    await page.open(d);
+    expect(d.outcome.action).toBe("accepted");
+  });
 });

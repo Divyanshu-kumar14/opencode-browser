@@ -11,6 +11,11 @@
  *     appears when the agent itself navigates away)
  *   - confirm, prompt: dismissed, the safe answer to "delete this?"
  *
+ * Only the agent's own tabs are answered. A dialog on a tab no session owns
+ * (the user's, in an attached browser) is left open for the user: the listener
+ * itself keeps Playwright from dismissing it. With nobody watching (headless)
+ * such a dialog is dismissed, so the page cannot freeze.
+ *
  * The agent overrides the next dialog on a tab with `plan` (browse_dialog).
  * The message is page text, so it is sanitized and capped before it reaches the
  * agent.
@@ -35,9 +40,23 @@ interface DialogLike {
 
 const MAX_MESSAGE = 200;
 
+export interface DialogsOptions {
+  /** Whether a session owns the tab (default: every tab). */
+  readonly isOwned?: (page: object) => boolean;
+  /** Whether a person can answer dialogs in the browser window (default false). */
+  readonly userPresent?: () => boolean;
+}
+
 export class Dialogs {
   private readonly plans = new WeakMap<object, DialogPlan>();
   private readonly notices = new WeakMap<object, string[]>();
+  private readonly isOwned: (page: object) => boolean;
+  private readonly userPresent: () => boolean;
+
+  constructor(options: DialogsOptions = {}) {
+    this.isOwned = options.isOwned ?? (() => true);
+    this.userPresent = options.userPresent ?? (() => false);
+  }
 
   /** Start answering this page's dialogs. */
   attach(page: Pick<Page, "on">): void {
@@ -62,6 +81,12 @@ export class Dialogs {
   }
 
   private async answer(page: object, dialog: DialogLike): Promise<void> {
+    if (!this.isOwned(page)) {
+      // The user's tab: leave the dialog for them when they can see it.
+      if (this.userPresent()) return;
+      await dialog.dismiss().catch(() => undefined);
+      return;
+    }
     const type = dialog.type();
     const planned = this.plans.get(page);
     this.plans.delete(page);

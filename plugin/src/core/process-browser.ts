@@ -8,13 +8,16 @@
  * `globalThis` and only process teardown closes it.
  *
  * A hot reload can run newer code next to a manager built by older code. Each
- * slot entry records the build that created it: a fingerprint of the source
- * the manager instance carries (its class, the modules it holds, the page
- * scripts it installs). A different build is closed and replaced; an
- * identical re-evaluation is reused. Nobody bumps a version by hand.
+ * slot entry records the build that created it: a fingerprint of every source
+ * file of the plugin, so a change to any module the manager holds (dialogs,
+ * downloads, site rules, …) replaces it. An identical re-evaluation is reused.
+ * Nobody bumps a version by hand, and no module can be forgotten.
  */
 
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { BrowserSessionManager } from "./session-manager.ts";
 import { Presence } from "./presence.ts";
 import { TabTracker } from "./tab-tracker.ts";
@@ -26,13 +29,36 @@ const SLOT_KEY = Symbol.for("opencode.browser.process");
 /** Where builds before the process-browser module kept a bare manager. */
 const LEGACY_KEY = Symbol.for("opencode.browser.session-manager");
 
-/** Fingerprint of the code a manager instance runs. */
-export const MANAGER_BUILD = crypto
-  .createHash("sha256")
-  .update([BrowserSessionManager, Viewport, TabTracker, Presence, Telemetry].map(String).join("\n"))
-  .update(pageScripts(1).join("\n"))
-  .digest("hex")
-  .slice(0, 16);
+/** Hash of every .ts file under `dir`, in a stable order. */
+export function sourceFingerprint(dir: string): string {
+  const hash = crypto.createHash("sha256");
+  const walk = (current: string): void => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".ts")) hash.update(path.relative(dir, full)).update("\0").update(fs.readFileSync(full));
+    }
+  };
+  walk(dir);
+  return hash.digest("hex").slice(0, 16);
+}
+
+/**
+ * Fingerprint of the code a manager instance runs: every file of the plugin's
+ * source. Falls back to the loaded classes when the files cannot be read.
+ */
+export const MANAGER_BUILD = (() => {
+  try {
+    return sourceFingerprint(path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
+  } catch {
+    return crypto
+      .createHash("sha256")
+      .update([BrowserSessionManager, Viewport, TabTracker, Presence, Telemetry].map(String).join("\n"))
+      .update(pageScripts(1).join("\n"))
+      .digest("hex")
+      .slice(0, 16);
+  }
+})();
 
 interface Entry {
   readonly manager: unknown;

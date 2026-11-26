@@ -866,6 +866,21 @@ describe("Group 5: session lifecycle (unit)", () => {
     expect(again.MANAGER_BUILD).toBe(MANAGER_BUILD);
     expect(String(Presence)).toContain("takeOver");
   });
+  test("the build fingerprint changes when any source file changes, in any module", async () => {
+    const { sourceFingerprint } = await import("../src/core/process-browser.ts");
+    const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "opencode-fp-"));
+    fs.mkdirSync(path.join(dir, "core"));
+    fs.writeFileSync(path.join(dir, "core", "dialogs.ts"), "export const a = 1;");
+    fs.writeFileSync(path.join(dir, "index.ts"), "export {};");
+    fs.writeFileSync(path.join(dir, "notes.md"), "not code");
+    const before = sourceFingerprint(dir);
+    expect(sourceFingerprint(dir)).toBe(before);
+    fs.writeFileSync(path.join(dir, "notes.md"), "still not code");
+    expect(sourceFingerprint(dir)).toBe(before);
+    fs.writeFileSync(path.join(dir, "core", "dialogs.ts"), "export const a = 2;");
+    expect(sourceFingerprint(dir)).not.toBe(before);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
   test("a manager left under the pre-fingerprint key is closed and dropped", async () => {
     const legacyKey = Symbol.for("opencode.browser.session-manager");
     const g = globalThis as unknown as Record<symbol, unknown>;

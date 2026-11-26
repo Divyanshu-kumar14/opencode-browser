@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { InvalidInputError } from "../src/core/errors.ts";
-import { MAX_UPLOAD_BYTES, resolveUploadPaths, safeDownloadName } from "../src/core/files.ts";
+import { Downloads, MAX_UPLOAD_BYTES, resolveUploadPaths, safeDownloadName } from "../src/core/files.ts";
 
 let root = "";
 let project = "";
@@ -79,6 +79,21 @@ describe("upload paths", () => {
     fs.mkdirSync(sibling, { recursive: true });
     fs.writeFileSync(path.join(sibling, "x.txt"), "x");
     rejectsWith(() => resolveUploadPaths([path.join(sibling, "x.txt")], roots()), "outside the folders uploads may read");
+  });
+});
+
+describe("downloads", () => {
+  test("a download from a tab no session owns is left to the browser, never copied", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-dl-unowned-"));
+    const downloads = new Downloads(dir, { isOwned: () => false });
+    let saved = 0;
+    let listener: ((d: unknown) => void) | null = null;
+    downloads.attach({ on: (_e: string, fn: (d: unknown) => void) => void (listener = fn) } as never);
+    listener!({ suggestedFilename: () => "bank.pdf", saveAs: async () => void (saved += 1), failure: async () => null });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(saved).toBe(0);
+    expect(fs.readdirSync(dir)).toEqual([]);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
 

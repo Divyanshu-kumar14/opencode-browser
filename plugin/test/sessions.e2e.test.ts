@@ -161,6 +161,29 @@ describe("parallel sessions", () => {
   }, 90000);
 });
 
+describe("telemetry across a session's tabs", () => {
+  test("an error on one of the session's background tabs is reported on its next turn", async () => {
+    if (!ready()) return;
+    await go("ses_bg", "second");
+    const first = env!.manager.tabs.active("ses_bg")!;
+    await env!.session.turn({ kind: "tabs", action: "open", url: base + "popup" }, { sessionId: "ses_bg" });
+    await first.evaluate(() => console.error("background-tab-error"));
+    await new Promise((r) => setTimeout(r, 100));
+    const out = text(await env!.session.turn({ kind: "observe" }, { sessionId: "ses_bg" }));
+    expect(out).toContain("background-tab-error");
+  }, 90000);
+
+  test("another session's error is still never reported", async () => {
+    if (!ready()) return;
+    await go("ses_bg2", "second");
+    await go("ses_bg3", "second");
+    await env!.manager.tabs.active("ses_bg3")!.evaluate(() => console.error("not-yours-error"));
+    await new Promise((r) => setTimeout(r, 100));
+    const out = text(await env!.session.turn({ kind: "observe" }, { sessionId: "ses_bg2" }));
+    expect(out).not.toContain("not-yours-error");
+  }, 90000);
+});
+
 describe("browse_tabs", () => {
   const tabsTurn = (sessionId: string, request: Record<string, unknown>) =>
     env!.session.turn({ kind: "tabs", ...request } as never, { sessionId });

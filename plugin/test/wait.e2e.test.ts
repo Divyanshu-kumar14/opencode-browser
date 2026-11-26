@@ -118,6 +118,16 @@ describe("waitFor", () => {
     await page.close();
   });
 
+  test("a delay longer than the timeout still waits the full delay, and says so truthfully", async () => {
+    if (!ready()) return;
+    const page = await pageWith("");
+    const result = await waitFor(page, { ms: 900 }, 300);
+    expect(result.ok).toBe(true);
+    expect(result.waitedMs).toBeGreaterThanOrEqual(880);
+    expect(result.summary).toBe("Waited for 900ms.");
+    await page.close();
+  });
+
   test("the timeout is shared across conditions, not applied to each", async () => {
     if (!ready()) return;
     const page = await pageWith("");

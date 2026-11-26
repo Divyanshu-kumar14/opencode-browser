@@ -318,13 +318,148 @@ describe("Group 2: annotator and HUD", () => {
     await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, { sessionId: "ses_1" });
     for (const req of [{ kind: "observe" as const }, { kind: "observe" as const, annotate: false }]) {
       await b.session.turn(req, { sessionId: "ses_1" });
-      const hud = await b.manager.tabs.active()!.evaluate(() => {
+      const hud = await b.manager.tabs.active("ses_1")!.evaluate(() => {
         const host = document.querySelector("opencode-agent-hud") as HTMLElement | null;
         const pill = host?.shadowRoot?.querySelector(".pill") as HTMLElement | null;
         return { vis: host?.style.visibility, pill: pill?.className, text: pill?.textContent };
       });
       expect(hud).toEqual({ vis: "visible", pill: "pill visible", text: "Thinking…" });
     }
+  }, 60000);
+  test("screenshot:false returns the element map and text, with no image", async () => {
+    if (!ready()) return;
+    const r = await env!.session.turn({ kind: "navigate", action: "goto", url: base + "second", screenshot: false });
+    expect(text(r)).toContain("## Interactive elements");
+    expect(text(r)).not.toContain("## Screenshot");
+    expect(r.content.some((c) => c.type === "file")).toBe(false);
+    expect(r.metadata["screenshotPath"]).toBeNull();
+    const withShot = await env!.session.turn({ kind: "observe" });
+    expect(withShot.content.some((c) => c.type === "file")).toBe(true);
+  }, 60000);
+  test("browse_wait returns the page once the text appears, and a note when it never does", async () => {
+    if (!ready()) return;
+    await goto("/second");
+    await page().evaluate("setTimeout(() => document.body.append('Results loaded'), 300)");
+    const ok = await env!.session.turn({ kind: "wait", conditions: { text: "Results loaded" }, timeoutMs: 5000 });
+    expect(text(ok)).toContain('Waited for text "Results loaded" to appear.');
+    expect(ok.metadata["waited"]).toBe(true);
+    const slow = await env!.session.turn({ kind: "wait", conditions: { text: "never" }, timeoutMs: 400 });
+    expect(text(slow)).toContain('Timed out after 400ms waiting for text "never" to appear.');
+    expect(text(slow)).toContain("## Interactive elements");
+    expect(slow.metadata["waited"]).toBe(false);
+  }, 60000);
+  test("dialogs never freeze the page: defaults are reported, and browse_dialog overrides one", async () => {
+    if (!ready()) return;
+    await goto("/second");
+    await page().evaluate(() => {
+      document.body.insertAdjacentHTML(
+        "beforeend",
+        "<button id=del onclick=\"window.__r = confirm('Delete everything?')\">Delete</button>" +
+          "<button id=hi onclick=\"alert('Saved'); window.__r = 'alerted'\">Hi</button>" +
+          "<button id=ask onclick=\"window.__r = prompt('Your name?')\">Ask</button>",
+      );
+    });
+    const click = (selector: string) =>
+      env!.session.turn({ kind: "act", actions: [{ type: "click", selector }] });
+    const result = () => page().evaluate(() => (window as unknown as { __r: unknown }).__r);
+
+    const dismissed = await click("#del");
+    expect(await result()).toBe(false);
+    expect(text(dismissed)).toContain('Dialog: confirm "Delete everything?" was dismissed');
+    expect(text(dismissed)).toContain("browse_dialog");
+
+    const alerted = await click("#hi");
+    expect(await result()).toBe("alerted");
+    expect(text(alerted)).toContain('Dialog: alert "Saved" was accepted');
+
+    await env!.session.turn({ kind: "dialog", accept: true });
+    const accepted = await click("#del");
+    expect(await result()).toBe(true);
+    expect(text(accepted)).toContain('Dialog: confirm "Delete everything?" was accepted');
+
+    // The plan was one-shot.
+    await click("#del");
+    expect(await result()).toBe(false);
+
+    await env!.session.turn({ kind: "dialog", accept: true, promptText: "Ada" });
+    const answered = await click("#ask");
+    expect(await result()).toBe("Ada");
+    expect(text(answered)).toContain('answered "Ada"');
+  }, 60000);
+  test("browse_read returns the page as markdown in windows, with no screenshot by default", async () => {
+    if (!ready()) return;
+    await goto("/second");
+    await page().evaluate(() => {
+      document.body.innerHTML =
+        "<main><h1>Papers</h1>" + Array.from({ length: 80 }, (_, i) => `<p>Paper number ${i} about scaling.</p>`).join("") + "</main>";
+    });
+    const first = await env!.session.turn({ kind: "read", links: true, maxChars: 600, offset: 0 });
+    const out = text(first);
+    expect(out).toContain("# Papers");
+    expect(out).toContain("Paper number 0 about scaling.");
+    expect(out).toMatch(/More below: call browse_read again with offset=\d+/);
+    expect(first.content.some((c) => c.type === "file")).toBe(false);
+    const next = first.metadata["nextOffset"] as number;
+    const second = await env!.session.turn({ kind: "read", links: true, maxChars: 600, offset: next });
+    expect(text(second)).not.toContain("# Papers");
+    expect(text(second)).toContain("Paper number");
+    const shot = await env!.session.turn({ kind: "read", links: true, maxChars: 600, offset: 0, screenshot: true });
+    expect(shot.content.some((c) => c.type === "file")).toBe(true);
+  }, 60000);
+  test("hand-off: the tab says 'Your turn', survives idle and the user's navigation, and clears when the agent resumes", async () => {
+    if (!ready()) return;
+    const b = await extraBrowser({});
+    b.manager.presence.enabled = true;
+    const ses = { sessionId: "ses_h" };
+    await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, ses);
+    const r = await b.session.turn({ kind: "handoff", reason: "Sign in to the fixture" }, ses);
+    expect(text(r)).toContain("Handed this tab to the user: Sign in to the fixture");
+    expect(text(r)).toContain("Stop using the browser now");
+    const tab = b.manager.tabs.active("ses_h")!;
+    const panel = () =>
+      tab.evaluate(() => {
+        const root = document.querySelector("opencode-agent-hud")!.shadowRoot!;
+        const el = root.querySelector(".handoff") as HTMLElement;
+        return el.classList.contains("visible") ? el.textContent : null;
+      });
+    expect(await panel()).toContain("Sign in to the fixture");
+    // The session goes idle while the user works.
+    await b.manager.presence.end("ses_h", []);
+    expect(await panel()).toContain("Sign in to the fixture");
+    // The user signs in: the page navigates.
+    await tab.goto(base + "popup");
+    await tab.waitForFunction(() => {
+      const root = document.querySelector("opencode-agent-hud")?.shadowRoot;
+      return !!root?.querySelector(".handoff.visible");
+    });
+    expect(await panel()).toContain("Sign in to the fixture");
+    // The user replies; the agent continues.
+    await b.session.turn({ kind: "observe" }, ses);
+    expect(await panel()).toBeNull();
+  }, 60000);
+  test("browse_network lists the tab's requests and console lines, redacted, filterable", async () => {
+    if (!ready()) return;
+    await goto("/second");
+    await page().evaluate(async () => {
+      console.log("loading items");
+      console.error("items failed to render");
+      await fetch("/api/missing?token=SECRET123").catch(() => undefined);
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    const all = text(
+      await env!.session.turn({ kind: "network", show: "both", onlyErrors: false, limit: 30 }),
+    );
+    expect(all).toContain("## Requests (newest last)");
+    expect(all).toMatch(/- 404 GET http:\/\/127\.0\.0\.1:\d+\/api\/missing \[fetch\] \d+ms/);
+    expect(all).not.toContain("SECRET123");
+    expect(all).toContain("- [log] loading items");
+    expect(all).toContain("- [error] items failed to render");
+    const errors = text(
+      await env!.session.turn({ kind: "network", show: "console", onlyErrors: true, limit: 30 }),
+    );
+    expect(errors).toContain("items failed to render");
+    expect(errors).not.toContain("loading items");
+    expect(errors).not.toContain("## Requests");
   }, 60000);
   test("the HUD's Stop button is never in the agent's element map", async () => {
     if (!ready()) return;
@@ -333,7 +468,7 @@ describe("Group 2: annotator and HUD", () => {
     await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, { sessionId: "ses_1" });
     const out = text(await b.session.turn({ kind: "observe" }, { sessionId: "ses_1" }));
     expect(out).not.toMatch(/Stop the agent|<button[^>]*> ""/);
-    const indexed = await b.manager.tabs.active()!.evaluate(
+    const indexed = await b.manager.tabs.active("ses_1")!.evaluate(
       () => (window as any).__opencodeSom.getElements().map((e: { label: string }) => e.label),
     );
     expect(indexed.join("|")).not.toContain("Stop the agent");
@@ -343,13 +478,14 @@ describe("Group 2: annotator and HUD", () => {
     const b = await extraBrowser({});
     b.manager.presence.enabled = true;
     await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, { sessionId: "ses_1" });
-    const other = await b.manager.tabs.list()[0]!.page.context().newPage();
+    const mine = b.manager.tabs.active("ses_1")!;
+    const other = await mine.context().newPage();
     await other.goto(base + "second");
     const state = (p: Page) =>
       p.evaluate(() => (document.querySelector("opencode-agent-hud") as HTMLElement | null)?.style.visibility);
     expect(await state(other)).toBe("hidden");
     await b.manager.presence.end("ses_1", []);
-    expect(await state(b.manager.tabs.list()[0]!.page)).toBe("hidden");
+    expect(await state(mine)).toBe("hidden");
   }, 60000);
   test("Stop in the page takes over: sessions are interrupted and the HUD leaves", async () => {
     if (!ready()) return;
@@ -358,7 +494,7 @@ describe("Group 2: annotator and HUD", () => {
     const interrupted: string[] = [];
     b.manager.presence.setInterrupter((id) => void interrupted.push(id));
     await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, { sessionId: "ses_1" });
-    const tab = b.manager.tabs.active()!;
+    const tab = b.manager.tabs.active("ses_1")!;
     const at = await tab.evaluate(() => {
       const r = document.querySelector("opencode-agent-hud")!.shadowRoot!.querySelector(".stop")!.getBoundingClientRect();
       return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
@@ -814,7 +950,7 @@ describe("Integration flows", () => {
 
   test("security: an approved eval returns its value; a denied one never touches the page", async () => {
     if (!ready()) return;
-    await goto("/second");
+    await env!.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, { sessionId: CALL.sessionID });
     const allowed = await evalToolWith(async () => undefined).execute({ expression: "document.title" }, CALL);
     expect(text(allowed)).toContain('"Second"');
     const denial = new Error("denied by user");

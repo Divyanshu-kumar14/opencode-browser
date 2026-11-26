@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { PermissionDomain } from "@opencode/plugin/promise/permission";
 import type { BrowserSession } from "../core/browser-session.ts";
 
@@ -20,6 +21,12 @@ export interface ToolCallContext {
   readonly messageID: string;
   readonly id: string;
 }
+
+/** The `screenshot` parameter every tool shares. */
+export const screenshotField = z
+  .boolean()
+  .optional()
+  .describe("Attach a screenshot to the result (default true). false returns text only, which is cheaper.");
 
 /** The per-turn context a tool hands to the browser session. */
 export function turnContext(context: ToolCallContext | undefined): { readonly sessionId?: string } {

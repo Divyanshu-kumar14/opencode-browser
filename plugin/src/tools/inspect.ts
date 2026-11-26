@@ -5,13 +5,14 @@
 
 import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
-import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
+import { screenshotField, turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
     elementId: z.number().int().positive().optional().describe("[1..N] element id from the element map"),
     selector: z.string().optional().describe("CSS selector fallback"),
     cssProperties: z.array(z.string()).optional().describe("Additional computed CSS properties to return"),
+    screenshot: screenshotField,
   })
   .strict()
   .refine((input) => input.elementId !== undefined || input.selector !== undefined, {
@@ -37,5 +38,6 @@ export async function execute(
     elementId: input.elementId,
     selector: input.selector,
     cssProperties: input.cssProperties,
+    screenshot: input.screenshot,
   }, turnContext(context));
 }

@@ -13,7 +13,7 @@
 
 import type { Page } from "playwright";
 import { AGENT_HUD_SCRIPT, makeDomAnnotatorScript } from "../injected/index.ts";
-import type { ElementLine } from "../utils/formatter.ts";
+import type { ElementLine, UnindexedFrame } from "../utils/formatter.ts";
 import { PAGE_GLOBALS } from "./som.ts";
 
 export { PAGE_GLOBALS };
@@ -26,7 +26,7 @@ export function pageScripts(maxElements: number): readonly string[] {
   return [makeDomAnnotatorScript(maxElements), AGENT_HUD_SCRIPT];
 }
 
-type HudMethod = "updateStatus" | "moveCursor" | "showClickRipple" | "setPresent";
+type HudMethod = "updateStatus" | "moveCursor" | "showClickRipple" | "setPresent" | "setHandoff";
 
 function callHud(page: Evaluator, method: HudMethod, args: readonly unknown[]): Promise<void> {
   return page
@@ -50,21 +50,30 @@ export const hud = {
   clear: (page: Evaluator): Promise<void> => callHud(page, "updateStatus", [""]),
   /** Move the virtual cursor to viewport (x, y). */
   cursor: (page: Evaluator, x: number, y: number): Promise<void> => callHud(page, "moveCursor", [x, y]),
+  /** Hand the tab to the user ("Your turn: …"), or clear the hand-off (null). */
+  handoff: (page: Evaluator, reason: string | null): Promise<void> =>
+    callHud(page, "setHandoff", [reason ?? ""]),
   /** Show or hide the whole HUD on this tab (only agent tabs are presented). */
   present: (page: Evaluator, on: boolean): Promise<void> => callHud(page, "setPresent", [on]),
   /** Play the click ripple at viewport (x, y). */
   ripple: (page: Evaluator, x: number, y: number): Promise<void> => callHud(page, "showClickRipple", [x, y]),
 };
 
-/** Re-index the page into a fresh [1..N] element map. Navigation errors propagate. */
-export async function indexPage(page: Evaluator): Promise<ElementLine[]> {
+/**
+ * Re-index the page into a fresh [1..N] element map, plus the cross-origin
+ * frames on screen. Navigation errors propagate.
+ */
+export async function indexPage(page: Evaluator): Promise<{ elements: ElementLine[]; frames: UnindexedFrame[] }> {
   const indexed: unknown = await page.evaluate((names: Names) => {
     const s = (globalThis as unknown as Record<string, any>)[names.som];
     if (!s) return { elements: [] };
     return s.indexPage();
   }, PAGE_GLOBALS);
-  const rec = indexed as { elements?: unknown } | null;
-  return Array.isArray(rec?.elements) ? (rec.elements as ElementLine[]) : [];
+  const rec = indexed as { elements?: unknown; frames?: unknown } | null;
+  return {
+    elements: Array.isArray(rec?.elements) ? (rec.elements as ElementLine[]) : [],
+    frames: Array.isArray(rec?.frames) ? (rec.frames as UnindexedFrame[]) : [],
+  };
 }
 
 /**

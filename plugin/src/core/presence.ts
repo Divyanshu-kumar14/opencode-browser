@@ -10,6 +10,9 @@
  *   - which tabs are presented (only tabs the agent used, so the user's other
  *     tabs stay untouched, including in an attached browser);
  *   - Take over (the Stop button): release the HUD and interrupt every session.
+ *   - Hand-off: a session hands a tab to the user ("Your turn: sign in"). The
+ *     notice outlives the session going idle and every page load while the
+ *     user works, and clears on that session's next browser call.
  *
  * A safety timer releases the HUD when no idle signal arrives (the host does
  * not send one after an interrupt or a failure). It counts from the end of the
@@ -59,6 +62,8 @@ export class Presence {
 
   private readonly sessions = new Set<string>();
   private readonly marked = new Set<PresencePage>();
+  /** Tabs handed to the user, with the reason shown and the session that did it. */
+  private readonly handoffs = new Map<PresencePage, { readonly reason: string; readonly sessionId: string }>();
   /** Tabs that already carry the navigation / close listeners. */
   private readonly watched = new WeakSet<PresencePage>();
   private timer: unknown = null;
@@ -92,6 +97,15 @@ export class Presence {
   /** A browser tool call starts: `sessionId` is using the browser on `pages`. */
   async begin(sessionId: string, pages: readonly PresencePage[]): Promise<void> {
     if (!this.enabled) return;
+    // The agent is back: its hand-offs are over.
+    await Promise.all(
+      [...this.handoffs]
+        .filter(([, h]) => h.sessionId === sessionId)
+        .map(([page]) => {
+          this.handoffs.delete(page);
+          return page.isClosed() ? undefined : hud.handoff(page, null);
+        }),
+    );
     this.inFlight += 1;
     this.sessions.add(sessionId);
     this.arm();
@@ -153,8 +167,17 @@ export class Presence {
     );
   }
 
+  /** Hand `page` to the user with `reason` until `sessionId` acts again. */
+  async handOff(sessionId: string, page: PresencePage, reason: string): Promise<void> {
+    if (!this.enabled) return;
+    this.handoffs.set(page, { reason, sessionId });
+    this.watch(page);
+    await hud.handoff(page, reason);
+  }
+
   /** The browser is gone: forget everything without touching dead tabs. */
   discard(): void {
+    this.handoffs.clear();
     this.inFlight = 0;
     this.disarm();
     this.sessions.clear();
@@ -190,14 +213,23 @@ export class Presence {
   private async mark(page: PresencePage): Promise<void> {
     const alreadyPresented = this.marked.has(page);
     this.marked.add(page);
-    if (!this.watched.has(page)) {
-      this.watched.add(page);
-      // A new document starts with a fresh, unpresented HUD.
-      page.on("domcontentloaded", () => {
-        if (this.isActive() && this.marked.has(page)) void hud.present(page, true);
-      });
-      page.on("close", () => void this.marked.delete(page));
-    }
+    this.watch(page);
     if (!alreadyPresented) await hud.present(page, true);
+  }
+
+  /** Re-apply this tab's HUD state on every new document; forget it on close. */
+  private watch(page: PresencePage): void {
+    if (this.watched.has(page)) return;
+    this.watched.add(page);
+    // A new document starts with a fresh, hidden HUD.
+    page.on("domcontentloaded", () => {
+      if (this.isActive() && this.marked.has(page)) void hud.present(page, true);
+      const handoff = this.handoffs.get(page);
+      if (handoff !== undefined) void hud.handoff(page, handoff.reason);
+    });
+    page.on("close", () => {
+      this.marked.delete(page);
+      this.handoffs.delete(page);
+    });
   }
 }

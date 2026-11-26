@@ -73,7 +73,7 @@ type in an agent tab at any time.
 
 | Path | Responsibility |
 |---|---|
-| `plugin/src/index.ts` | Plugin entry; registers the six tools against the process browser |
+| `plugin/src/index.ts` | Plugin entry; registers the `browse_*` tools against the process browser |
 | `plugin/src/core/process-browser.ts` | One manager per process, build-fingerprint reuse across reloads, signal teardown |
 | `plugin/src/core/browser-session.ts` | The turn seam: the shared turn sequence plus one intent per request kind |
 | `plugin/src/core/session-manager.ts` | Launch / CDP attach, single-flight setup, turn lock, browser reset |
@@ -81,6 +81,13 @@ type in an agent tab at any time.
 | `plugin/src/core/viewport.ts` | Native vs emulated viewport, preset overrides and release, size reads |
 | `plugin/src/core/perception.ts` | Element map + clean screenshot + telemetry drain, with retry and deadline |
 | `plugin/src/core/page-agent.ts` | Host side of the in-page HUD and SoM objects |
+| `plugin/src/core/read.ts` | Page text as markdown, in windows |
+| `plugin/src/core/files.ts` | Upload path rules; saving and reporting downloads |
+| `plugin/src/core/site-rules.ts` | Allow / deny host matching |
+| `plugin/src/core/site-guard.ts` | Enforces site rules on agent tabs' page loads |
+| `plugin/src/core/network-log.ts` | Recent requests and console lines per tab |
+| `plugin/src/core/wait.ts` | Wait for text, selector, URL, network idle |
+| `plugin/src/core/dialogs.ts` | Answer and report alert / confirm / prompt |
 | `plugin/src/core/presence.ts` | Which sessions use the browser, which tabs show the HUD, safety timer, Take over |
 | `plugin/src/core/turn.ts` | `TurnRequest`, `TurnOutcome`, and the single result formatter |
 | `plugin/src/core/action-engine.ts` | Action batches and stale-id recovery |
@@ -130,8 +137,22 @@ its built-in tools).
 | `browse_interact` | single action or batched `actions[]` (click, type, hover, scroll, press_key, select_option, drag, wait) by `elementId`, selector, or coordinates | element map + screenshot + telemetry |
 | `browse_snapshot` | re-index + fresh screenshot without mutating | element map + screenshot + telemetry |
 | `browse_inspect` | tag, attributes, bbox, visibility, computed styles for one element | inspect block + screenshot + telemetry |
+| `browse_read` | the page's text as markdown (headings, lists, tables, code, links), in windows for long pages; no hidden content or form values | page text + telemetry (no screenshot unless asked) |
 | `browse_viewport` | desktop/laptop/tablet/mobile preset, custom size, or bare call to follow the window again | element map + screenshot + telemetry |
+| `browse_wait` | wait for text to appear/disappear, a selector, the URL, network idle, or a delay, within one shared timeout | element map + screenshot + a note on what held or timed out |
+| `browse_tabs` | list / open / switch / close **your own** tabs; other sessions' and the user's tabs are never touched | element map of the active tab + screenshot |
+| `browse_upload` | put files into a file input, or into the picker a button opens; only files inside the project folder or the download folder | element map + screenshot |
+| `browse_network` | this tab's recent requests (status, type, duration; URLs without query) and console lines of every level; filterable; no bodies or headers | request and console lists (no screenshot) |
+| `browse_handoff` | hand the tab to you for a step only you should do (sign in, MFA, passkey, CAPTCHA, payment): the tab shows "Your turn: …" until the agent's next call | a note telling the agent to wait for your reply |
+| `browse_dialog` | how to answer the next alert/confirm/prompt (dialogs are always answered and reported; default: accept alerts, dismiss confirms) | element map + screenshot |
 | `browse_eval` | JavaScript in the page context (localStorage, globals, React state) | serialized value + screenshot + telemetry |
+
+Every tool that returns the page takes `screenshot: false` to return text only (fewer tokens, no image).
+Each OpenCode session gets its own tabs, and sessions (subagents included) run their turns at the same
+time; a popup belongs to the session whose tab opened it. Same-origin iframes are indexed like the page
+(marked `(in frame)`); cross-origin frames are listed under "Frames not indexed". Alerts, confirms and
+prompts are always answered and reported; downloads are saved owner-only to the download folder and
+reported.
 
 `browse_eval` is **not a sandbox**: the expression runs with the page's privileges. Treat it as
 you would DevTools. Each call asks for the `browser_eval` permission first (see
@@ -157,6 +178,11 @@ All options are optional; defaults shown.
 | `OPENCODE_BROWSER_CDP_AUTODETECT` | `1` (on) | with no CDP URL, attach to a browser already listening on `http://127.0.0.1:9222`; `0` always launches its own Chromium |
 | `OPENCODE_BROWSER_INDICATORS` | `1` (on) | show the agent's HUD (current step, "Thinking…", Stop button) on the tabs it uses; `0` hides it. Never shown when headless |
 | `OPENCODE_BROWSER_HUD_TIMEOUT_MS` | `30000` | hide the HUD this long after the last browser call if OpenCode sends no idle signal (interrupt, failure) |
+| `OPENCODE_BROWSER_SCREENSHOTS` | `1` (on) | attach a screenshot to every result; `0` returns text only. Any call can also pass `screenshot: false` |
+| `OPENCODE_BROWSER_UPLOAD_DIR` | the folder OpenCode runs in | `browse_upload` may only read files inside this folder or the download folder (symlinks are followed before the check; max 50 MB per file) |
+| `OPENCODE_BROWSER_DOWNLOAD_DIR` | `$TMPDIR/opencode/browser-downloads` | downloads are saved here, owner-only, and reported in the turn |
+| `OPENCODE_BROWSER_DENY_ORIGINS` | unset | comma-separated hosts the agent's tabs may never load (`example.com` includes subdomains, `*.corp.net` subdomains only, `host:port` pins a port). Applies to goto, clicks, redirects and popups; a blocked load shows a blocked page and is reported |
+| `OPENCODE_BROWSER_ALLOW_ORIGINS` | unset (any host) | when set, the only hosts the agent's tabs may load; deny entries still win. Your own tabs are never filtered. Rules turn on request interception, which disables the HTTP cache for agent tabs |
 | `OPENCODE_BROWSER_PROFILE_DIR` | `.opencode/browser-profile` | persistent profile; cookies/localStorage survive runs |
 | `OPENCODE_BROWSER_EXECUTABLE_PATH` | auto-detected (`/usr/bin/chromium`, `google-chrome`, …) or `CHROME_PATH` | override when Playwright has no bundled browser |
 | `OPENCODE_BROWSER_SCREENSHOT_DIR` | `$TMPDIR/opencode/browser-screenshots` | annotated PNG output |

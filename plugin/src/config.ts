@@ -30,6 +30,22 @@ export interface ResolvedConfig {
    * idle signal, e.g. after an interrupt or failure (OPENCODE_BROWSER_HUD_TIMEOUT_MS).
    */
   readonly hudTimeoutMs: number;
+  /**
+   * Attach a screenshot to every result (OPENCODE_BROWSER_SCREENSHOTS, default
+   * true). A call can still opt out with `screenshot: false`.
+   */
+  readonly screenshots: boolean;
+  /**
+   * Folder uploads may read from, besides the download folder
+   * (OPENCODE_BROWSER_UPLOAD_DIR, default the folder OpenCode runs in).
+   */
+  readonly uploadDir: string;
+  /** Where downloads are saved, owner-only (OPENCODE_BROWSER_DOWNLOAD_DIR). */
+  readonly downloadDir: string;
+  /** Hosts agent tabs may never load (OPENCODE_BROWSER_DENY_ORIGINS, comma-separated). */
+  readonly denyOrigins: string;
+  /** When set, the only hosts agent tabs may load (OPENCODE_BROWSER_ALLOW_ORIGINS). */
+  readonly allowOrigins: string;
   /** Chromium executable override (OPENCODE_BROWSER_EXECUTABLE_PATH, auto-detected). */
   readonly executablePath: string | undefined;
   /** Persistent user-data-dir for profile launch. */
@@ -117,6 +133,13 @@ export function loadConfig(): ResolvedConfig {
     cdpAutoDetect: envBool("OPENCODE_BROWSER_CDP_AUTODETECT", true),
     indicators: envBool("OPENCODE_BROWSER_INDICATORS", true),
     hudTimeoutMs: envNum("OPENCODE_BROWSER_HUD_TIMEOUT_MS", 30000),
+    screenshots: envBool("OPENCODE_BROWSER_SCREENSHOTS", true),
+    uploadDir: path.resolve(process.env["OPENCODE_BROWSER_UPLOAD_DIR"] ?? process.cwd()),
+    downloadDir: path.resolve(
+      process.env["OPENCODE_BROWSER_DOWNLOAD_DIR"] ?? path.join(os.tmpdir(), "opencode", "browser-downloads"),
+    ),
+    denyOrigins: process.env["OPENCODE_BROWSER_DENY_ORIGINS"] ?? "",
+    allowOrigins: process.env["OPENCODE_BROWSER_ALLOW_ORIGINS"] ?? "",
     executablePath: process.env["OPENCODE_BROWSER_EXECUTABLE_PATH"] ?? detectChromium(),
     profileDir: path.resolve(profileDir),
     maxElements: envNum("OPENCODE_BROWSER_MAX_ELEMENTS", 100),

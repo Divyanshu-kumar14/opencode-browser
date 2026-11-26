@@ -2,10 +2,10 @@
  * opencode-browser plugin entry point — Antigravity-grade stateful
  * perception-action engine.
  *
- * Registers 6 tools under the `browse` namespace (the host reserves `browser`
- * for its built-in tools, so `browse_*` avoids silent id shadowing):
- *   browse_navigate, browse_interact, browse_snapshot, browse_inspect,
- *   browse_viewport, browse_eval
+ * Registers the browse_* tools (the host reserves `browser` for its built-in
+ * tools, so `browse_*` avoids silent id shadowing): navigate, interact,
+ * snapshot, read, inspect, viewport, wait, tabs, network, upload, handoff,
+ * dialog, eval.
  *
  * Every mutating tool runs the closed loop:
  *   Update HUD -> Execute Action(s) -> waitForSettled() -> Re-index SoM +

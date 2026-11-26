@@ -58,14 +58,21 @@ async function toolError(promise: Promise<unknown>): Promise<ToolError> {
 }
 
 describe("tool registration", () => {
-  test("registers the six engine tools under the browse namespace", () => {
+  test("registers the engine tools under the browse namespace", () => {
     const { tools } = register();
     expect([...tools.keys()]).toEqual([
       "navigate",
       "interact",
       "snapshot",
+      "read",
       "inspect",
       "viewport",
+      "wait",
+      "tabs",
+      "network",
+      "upload",
+      "handoff",
+      "dialog",
       "eval",
     ]);
     for (const tool of tools.values()) {
@@ -224,6 +231,111 @@ describe("handler -> TurnRequest mapping", () => {
     expect(session.requests).toHaveLength(0);
   });
 
+  test("every tool forwards screenshot:false to the turn, and omits it by default", async () => {
+    const { session, tools } = register();
+    for (const [name, input] of [
+      ["navigate", { url: "https://a.test/" }],
+      ["interact", { type: "click", elementId: 1 }],
+      ["snapshot", {}],
+      ["inspect", { elementId: 1 }],
+      ["viewport", { preset: "mobile" }],
+    ] as const) {
+      await tools.get(name)!.execute({ ...input, screenshot: false });
+      await tools.get(name)!.execute(input);
+    }
+    const flags = session.requests.map((r) => r.screenshot);
+    expect(flags).toEqual([false, undefined, false, undefined, false, undefined, false, undefined, false, undefined]);
+  });
+  test("wait forwards its conditions and a default timeout, and rejects a call with no condition", async () => {
+    const { session, tools } = register();
+    await tools.get("wait")!.execute({ text: "Results", urlContains: "/search", networkIdle: true });
+    expect(session.requests[0]).toMatchObject({
+      kind: "wait",
+      conditions: { text: "Results", urlContains: "/search", networkIdle: true },
+      timeoutMs: 10000,
+    });
+    await tools.get("wait")!.execute({ ms: 500, timeoutMs: 2000 });
+    expect(session.requests[1]).toMatchObject({ kind: "wait", conditions: { ms: 500 }, timeoutMs: 2000 });
+    await toolError(tools.get("wait")!.execute({}));
+    await toolError(tools.get("wait")!.execute({ text: "x", timeoutMs: 999999 }));
+    expect(session.requests).toHaveLength(2);
+  });
+  test("read forwards its scope and window, with text-friendly defaults", async () => {
+    const { session, tools } = register();
+    await tools.get("read")!.execute({});
+    await tools.get("read")!.execute({ selector: "article", links: false, maxChars: 3000, offset: 500 });
+    expect(session.requests).toMatchObject([
+      { kind: "read", links: true, maxChars: 12000, offset: 0 },
+      { kind: "read", selector: "article", links: false, maxChars: 3000, offset: 500 },
+    ]);
+    await toolError(tools.get("read")!.execute({ maxChars: 10 }));
+    await toolError(tools.get("read")!.execute({ maxChars: 1000000 }));
+    await toolError(tools.get("read")!.execute({ offset: -1 }));
+    expect(session.requests).toHaveLength(2);
+  });
+  test("tabs forwards list/open/switch/close and validates each", async () => {
+    const { session, tools } = register();
+    await tools.get("tabs")!.execute({ action: "list" });
+    await tools.get("tabs")!.execute({ action: "open", url: "https://a.test/" });
+    await tools.get("tabs")!.execute({ action: "open" });
+    await tools.get("tabs")!.execute({ action: "switch", tabId: "page-3" });
+    await tools.get("tabs")!.execute({ action: "close", tabId: "page-3" });
+    await tools.get("tabs")!.execute({ action: "close" });
+    expect(session.requests).toMatchObject([
+      { kind: "tabs", action: "list" },
+      { kind: "tabs", action: "open", url: "https://a.test/" },
+      { kind: "tabs", action: "open" },
+      { kind: "tabs", action: "switch", tabId: "page-3" },
+      { kind: "tabs", action: "close", tabId: "page-3" },
+      { kind: "tabs", action: "close" },
+    ]);
+    await toolError(tools.get("tabs")!.execute({ action: "switch" }));
+    await toolError(tools.get("tabs")!.execute({ action: "list", url: "https://a.test/" }));
+    expect(session.requests).toHaveLength(6);
+  });
+  test("network forwards its query with defaults, never asking for a screenshot", async () => {
+    const { session, tools } = register();
+    await tools.get("network")!.execute({});
+    await tools.get("network")!.execute({ show: "console", filter: "api", onlyErrors: true, limit: 5 });
+    expect(session.requests).toMatchObject([
+      { kind: "network", show: "both", onlyErrors: false, limit: 30, screenshot: false },
+      { kind: "network", show: "console", filter: "api", onlyErrors: true, limit: 5 },
+    ]);
+    await toolError(tools.get("network")!.execute({ limit: 0 }));
+    await toolError(tools.get("network")!.execute({ show: "bodies" }));
+    expect(session.requests).toHaveLength(2);
+  });
+  test("upload forwards its target and paths, and needs a target and at least one path", async () => {
+    const { session, tools } = register();
+    await tools.get("upload")!.execute({ elementId: 4, paths: ["docs/cv.pdf"] });
+    expect(session.requests[0]).toMatchObject({ kind: "upload", elementId: 4, paths: ["docs/cv.pdf"] });
+    await toolError(tools.get("upload")!.execute({ paths: ["a"] }));
+    await toolError(tools.get("upload")!.execute({ elementId: 4, paths: [] }));
+    expect(session.requests).toHaveLength(1);
+  });
+  test("handoff forwards a trimmed reason and rejects empty or long ones", async () => {
+    const { session, tools } = register();
+    await tools.get("handoff")!.execute({ reason: "  Sign in to GitHub  " });
+    expect(session.requests[0]).toMatchObject({ kind: "handoff", reason: "Sign in to GitHub" });
+    await toolError(tools.get("handoff")!.execute({ reason: "  " }));
+    await toolError(tools.get("handoff")!.execute({ reason: "x".repeat(161) }));
+    await toolError(tools.get("handoff")!.execute({}));
+    expect(session.requests).toHaveLength(1);
+  });
+  test("dialog forwards the answer for the next dialog and validates it", async () => {
+    const { session, tools } = register();
+    await tools.get("dialog")!.execute({ action: "accept" });
+    await tools.get("dialog")!.execute({ action: "accept", promptText: "Ada" });
+    await tools.get("dialog")!.execute({ action: "dismiss" });
+    expect(session.requests).toMatchObject([
+      { kind: "dialog", accept: true },
+      { kind: "dialog", accept: true, promptText: "Ada" },
+      { kind: "dialog", accept: false },
+    ]);
+    await toolError(tools.get("dialog")!.execute({}));
+    await toolError(tools.get("dialog")!.execute({ action: "dismiss", promptText: "x" }));
+    expect(session.requests).toHaveLength(3);
+  });
   test("viewport forwards a preset and rejects half a custom size", async () => {
     const { session, tools } = register();
     await tools.get("viewport")!.execute({ preset: "mobile" });

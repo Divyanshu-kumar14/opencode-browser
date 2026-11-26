@@ -4,12 +4,13 @@
 
 import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
-import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
+import { screenshotField, turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
     annotate: z.boolean().optional().default(true).describe("Draw SoM numbered badges on the screenshot"),
     fullPage: z.boolean().optional().default(false).describe("Capture the full scrollable page"),
+    screenshot: screenshotField,
   })
   .strict();
 
@@ -29,5 +30,6 @@ export async function execute(
     kind: "observe",
     annotate: input.annotate,
     fullPage: input.fullPage,
+    screenshot: input.screenshot,
   }, turnContext(context));
 }

@@ -20,10 +20,13 @@ import type { Page } from "playwright";
 import type { Telemetry } from "./telemetry.ts";
 import { viewportSizeOf } from "./viewport.ts";
 import { cleanFrame, indexPage } from "./page-agent.ts";
-import type { ElementLine } from "../utils/formatter.ts";
+import { ensurePrivateDir } from "./files.ts";
+import type { ElementLine, UnindexedFrame } from "../utils/formatter.ts";
 
 export interface Perception {
   readonly elements: readonly ElementLine[];
+  /** Cross-origin frames on screen, listed by origin only. */
+  readonly frames: readonly UnindexedFrame[];
   readonly screenshotPath: string | null;
   readonly width: number | null;
   readonly height: number | null;
@@ -42,6 +45,10 @@ export interface PerceiveOptions {
   /** Paint SoM badges on the screenshot (default true). */
   readonly annotate?: boolean;
   readonly fullPage?: boolean;
+  /** Take a screenshot (default true). `false` skips it and the HUD hide/show around it. */
+  readonly screenshot?: boolean;
+  /** Pages whose telemetry this perception reports (default: the perceived page). */
+  readonly telemetryPages?: readonly Page[];
 }
 
 const MAX_ATTEMPTS = 3;
@@ -55,7 +62,7 @@ export async function perceive(page: Page, opts: PerceiveOptions): Promise<Perce
     capture.catch(() => undefined);
     try {
       const result = await raceDeadline(capture, remaining, () => new PerceptionTimeoutError(opts.budgetMs));
-      return { ...result, telemetryEvents: drain(opts.telemetry), notice: null };
+      return { ...result, telemetryEvents: drain(opts.telemetry, opts.telemetryPages ?? [page]), notice: null };
     } catch (error) {
       if (!isNavigationRace(error)) throw error;
       lastRace = error;
@@ -68,10 +75,11 @@ export async function perceive(page: Page, opts: PerceiveOptions): Promise<Perce
   const reason = firstLine(lastRace) ?? `perception did not finish within ${opts.budgetMs}ms`;
   return {
     elements: [],
+    frames: [],
     screenshotPath: null,
     width: size?.width ?? null,
     height: size?.height ?? null,
-    telemetryEvents: drain(opts.telemetry),
+    telemetryEvents: drain(opts.telemetry, opts.telemetryPages ?? [page]),
     notice:
       `Perception incomplete: the page navigated during capture (${reason}). ` +
       "Call browse_snapshot to observe the new page.",
@@ -84,8 +92,12 @@ async function captureOnce(
   opts: PerceiveOptions,
   timeoutMs: number,
 ): Promise<Omit<Perception, "telemetryEvents" | "notice">> {
-  const elements = await indexPage(page);
-  // Always capture: annotate:false means a clean screenshot, not no screenshot.
+  const { elements, frames } = await indexPage(page);
+  if (opts.screenshot === false) {
+    const size = await viewportSizeOf(page);
+    return { elements, frames, screenshotPath: null, width: size?.width ?? null, height: size?.height ?? null };
+  }
+  // annotate:false means a clean screenshot, not no screenshot.
   const { buffer, size } = await cleanFrame(page, { annotate: opts.annotate !== false }, async () => ({
     buffer: await page.screenshot({
       fullPage: opts.fullPage ?? false,
@@ -94,12 +106,12 @@ async function captureOnce(
     size: await viewportSizeOf(page),
   }));
   const screenshotPath = await savePng(buffer, opts.screenshotDir);
-  return { elements, screenshotPath, width: size?.width ?? null, height: size?.height ?? null };
+  return { elements, frames, screenshotPath, width: size?.width ?? null, height: size?.height ?? null };
 }
 
 /** Delta drain: only telemetry generated since the last tool call. */
-function drain(telemetry: Telemetry): { readonly type: string; readonly text: string }[] {
-  return telemetry.drain().events.map((e) => ({ type: e.type, text: e.text }));
+function drain(telemetry: Telemetry, pages: readonly Page[]): { readonly type: string; readonly text: string }[] {
+  return telemetry.drain(pages).events.map((e) => ({ type: e.type, text: e.text }));
 }
 
 /** Raised when a capture attempt runs past its perception budget. */
@@ -121,7 +133,9 @@ function isNavigationRace(error: unknown): boolean {
   if (
     message.includes("Execution context was destroyed") ||
     message.includes("frame was detached") ||
-    message.includes("Cannot find context with specified id")
+    message.includes("Cannot find context with specified id") ||
+    // A reload swapped the page's render target out from under a screenshot.
+    message.includes("Not attached to an active page")
   ) {
     return true;
   }
@@ -143,23 +157,6 @@ function firstLine(error: unknown): string | null {
   if (error === null || error === undefined) return null;
   const message = error instanceof Error ? error.message : String(error);
   return message.split("\n")[0] ?? null;
-}
-
-/**
- * Create the screenshot directory owner-only (0700). An existing directory
- * must be a real directory, not a symlink; one owned by this uid is tightened
- * to 0700.
- */
-function ensurePrivateDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const st = fs.lstatSync(dir);
-  if (st.isSymbolicLink() || !st.isDirectory()) {
-    throw new Error(`screenshot directory ${dir} is not a directory (or is a symlink)`);
-  }
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  if (uid !== null && st.uid === uid && (st.mode & 0o777) !== 0o700) {
-    fs.chmodSync(dir, 0o700);
-  }
 }
 
 async function savePng(buffer: Buffer, screenshotDir: string): Promise<string> {

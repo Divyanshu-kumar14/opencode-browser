@@ -55,13 +55,14 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     if (labelledBy){
       // A space-separated id list; ids resolve in the element's own (shadow)
       // root first, then the document.
-      const root = el.getRootNode ? el.getRootNode() : document;
+      const owner = el.ownerDocument || document;
+      const root = el.getRootNode ? el.getRootNode() : owner;
       const parts = [];
       for (const id of labelledBy.split(/\\s+/)){
         if (!id) continue;
         let ref = null;
-        if (root && root !== document && typeof root.getElementById === "function") ref = root.getElementById(id);
-        if (!ref) ref = document.getElementById(id);
+        if (root && root !== owner && typeof root.getElementById === "function") ref = root.getElementById(id);
+        if (!ref) ref = owner.getElementById(id);
         if (!ref) continue;
         const t = (ref.textContent || "").trim();
         if (t) parts.push(t);
@@ -72,7 +73,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     // associated label for inputs / custom controls
     const idAttr = el.getAttribute("id");
     if (idAttr){
-      const label = document.querySelector('label[for="' + idAttr.replace(/"/g, '\\"') + '"]');
+      const label = (el.ownerDocument || document).querySelector('label[for="' + idAttr.replace(/"/g, '\\"') + '"]');
       if (label) return (label.textContent || "").trim();
     }
     // wrapping label
@@ -110,7 +111,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
   }
 
   function matchesInteractive(el){
-    if (!(el instanceof HTMLElement)) return false;
+    if (!el || el.nodeType !== 1 || !el.matches) return false;
     try {
       return el.matches(SELECTOR);
     } catch {
@@ -118,16 +119,64 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     }
   }
 
-  function visibleRect(el){
+  // Iframes: same-origin frame documents are walked from here, up to this
+  // depth. Cross-origin frames cannot be read and are reported by origin.
+  const MAX_FRAME_DEPTH = 3;
+  // The element's own window (a same-origin frame's, or this one).
+  function winOf(el){
+    return (el.ownerDocument && el.ownerDocument.defaultView) || window;
+  }
+  // Offset of a frame document's viewport within the top viewport.
+  function frameOffset(doc){
+    let x = 0, y = 0;
+    let w = doc.defaultView;
+    while (w && w !== window){
+      const fe = w.frameElement;
+      if (!fe) break;
+      const r = fe.getBoundingClientRect();
+      const cs = fe.ownerDocument.defaultView.getComputedStyle(fe);
+      x += r.x + fe.clientLeft + (parseFloat(cs.paddingLeft) || 0);
+      y += r.y + fe.clientTop + (parseFloat(cs.paddingTop) || 0);
+      w = fe.ownerDocument.defaultView;
+    }
+    return { x, y };
+  }
+  // The iframe element in the top document that contains this document.
+  function outermostFrame(doc){
+    let w = doc.defaultView, fe = null;
+    while (w && w !== window){
+      fe = w.frameElement;
+      if (!fe) break;
+      w = fe.ownerDocument.defaultView;
+    }
+    return fe;
+  }
+  // A rect in the top viewport, for an element in any same-origin document.
+  function absRect(el){
     const r = el.getBoundingClientRect();
-    if (r.width < 4 || r.height < 4) return null;
-    const style = window.getComputedStyle(el);
+    if (el.ownerDocument === document) return r;
+    const o = frameOffset(el.ownerDocument);
+    return { x: r.x + o.x, y: r.y + o.y, width: r.width, height: r.height };
+  }
+  function visibleRect(el){
+    const local = el.getBoundingClientRect();
+    if (local.width < 4 || local.height < 4) return null;
+    const style = winOf(el).getComputedStyle(el);
     if (style.display === "none") return null;
     if (style.visibility === "hidden") return null;
     if (style.opacity === "0") return null;
     if (style.pointerEvents === "none") return null;
+    const doc = el.ownerDocument;
+    if (doc !== document){
+      // Inside a frame: the centre must lie within the frame's own viewport.
+      const fw = doc.defaultView;
+      const cx = local.x + local.width / 2, cy = local.y + local.height / 2;
+      if (cx < 0 || cy < 0 || cx > fw.innerWidth || cy > fw.innerHeight) return null;
+    }
+    const r = absRect(el);
     return { x: r.x, y: r.y, width: r.width, height: r.height,
-             centerX: r.x + r.width / 2, centerY: r.y + r.height / 2 };
+             centerX: r.x + r.width / 2, centerY: r.y + r.height / 2,
+             localX: local.x + local.width / 2, localY: local.y + local.height / 2 };
   }
 
   function intersectsViewport(rect, buffer = 50){
@@ -139,8 +188,8 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
 
   // Hit-test through open shadow roots; document.elementFromPoint stops at
   // the shadow host.
-  function deepElementFromPoint(x, y){
-    let hit = document.elementFromPoint(x, y);
+  function deepElementFromPoint(x, y, doc){
+    let hit = (doc || document).elementFromPoint(x, y);
     while (hit && hit.shadowRoot){
       const inner = hit.shadowRoot.elementFromPoint(x, y);
       if (!inner || inner === hit) break;
@@ -174,15 +223,26 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
   }
 
   function isOccluded(el, rect){
-    const cx = Math.round(rect.centerX), cy = Math.round(rect.centerY);
-    const top = deepElementFromPoint(cx, cy);
+    const doc = el.ownerDocument;
+    if (doc !== document){
+      // The frame itself must be on top at this point in the top document...
+      const topHit = deepElementFromPoint(Math.round(rect.centerX), Math.round(rect.centerY), document);
+      const frame = outermostFrame(doc);
+      if (topHit && topHit !== frame && !isAgentChrome(topHit)) return true;
+      // ...and the element on top inside its own document.
+      return occludedIn(doc, el, Math.round(rect.localX), Math.round(rect.localY));
+    }
+    return occludedIn(document, el, Math.round(rect.centerX), Math.round(rect.centerY));
+  }
+  function occludedIn(doc, el, cx, cy){
+    const top = deepElementFromPoint(cx, cy, doc);
     if (!top) return false;
     if (top === el) return false;
     if (composedContains(el, top)) return false;
     if (isAgentChrome(top)) return false;
     // ancestor <label> covering the input is OK
     let anc = top;
-    while (anc && anc !== document.documentElement){
+    while (anc && anc !== doc.documentElement){
       if (anc === el) return false;
       if (anc.tagName === "LABEL") {
         // label covering its own control is fine
@@ -198,7 +258,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
 
   function isHiddenNativeInput(el){
     if (el.tagName !== "INPUT") return false;
-    const style = window.getComputedStyle(el);
+    const style = winOf(el).getComputedStyle(el);
     const r = el.getBoundingClientRect();
     if (style.opacity === "0" || (r.width < 4 && r.height < 4)) return true;
     return false;
@@ -210,7 +270,8 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     try {
       const nodes = root.querySelectorAll(SELECTOR);
       for (const el of nodes){
-        if (!(el instanceof HTMLElement)) continue;
+        // Not instanceof HTMLElement: elements in a frame come from another realm.
+        if (!el || el.nodeType !== 1 || !el.style) continue;
         if (visited.has(el)) continue;
         if (isHiddenNativeInput(el)) continue;
         visited.add(el);
@@ -223,7 +284,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
       for (const el of all){
         // The agent's own HUD (Stop button, pill) is never part of the page.
         if (el.tagName.toLowerCase() === HUD_TAG) continue;
-        if (el instanceof HTMLElement && el.shadowRoot && !visited.has(el)){
+        if (el.nodeType === 1 && el.shadowRoot && !visited.has(el)){
           collectFromRoot(el.shadowRoot, out, visited, roots);
         }
       }
@@ -259,6 +320,37 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
       }
     }
 
+    // Same-origin frames, breadth-first. A cross-origin frame cannot be read:
+    // it is reported by origin and position only.
+    const crossOrigin = [];
+    const frameQueue = [];
+    const queueFrames = (root, depth) => {
+      if (depth > MAX_FRAME_DEPTH) return;
+      let frames = [];
+      try { frames = Array.from(root.querySelectorAll("iframe, frame")); } catch {}
+      for (const fe of frames) frameQueue.push({ fe, depth });
+    };
+    for (const r of searchedRoots) queueFrames(r, 1);
+    while (frameQueue.length){
+      const { fe, depth } = frameQueue.shift();
+      if (fe.closest && fe.closest(HUD_TAG)) continue;
+      const box = visibleRect(fe);
+      if (!box || !intersectsViewport(box)) continue;
+      let fdoc = null;
+      try { fdoc = fe.contentDocument; } catch {}
+      if (!fdoc || !fdoc.documentElement){
+        let origin = "";
+        try { origin = new URL(fe.src || fe.getAttribute("src") || "", location.href).origin; } catch {}
+        if (origin && origin !== "null") {
+          crossOrigin.push({ origin, bbox: { x: Math.round(box.x), y: Math.round(box.y),
+            width: Math.round(box.width), height: Math.round(box.height) } });
+        }
+        continue;
+      }
+      const before = new Set(searchedRoots);
+      collectFromRoot(fdoc, candidates, visited, searchedRoots);
+      for (const r of searchedRoots) if (!before.has(r)) queueFrames(r, depth + 1);
+    }
     const rects = [];
     for (const el of candidates){
       if (isHiddenNativeInput(el)) continue;
@@ -298,6 +390,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
           : String(el.value),
         href: el.getAttribute("href") || "",
         disabled: el.disabled === true || el.getAttribute("aria-disabled") === "true",
+        inFrame: el.ownerDocument !== document,
         selectorFallback: cssSelector(el),
         bbox: { x: Math.round(rect.x), y: Math.round(rect.y),
                 width: Math.round(rect.width), height: Math.round(rect.height),
@@ -307,7 +400,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
       byId.set(id, el);
     }
     indexed = out;
-    return { elements: out, count: out.length, capped: rects.length > MAX_ELEMENTS };
+    return { elements: out, count: out.length, capped: rects.length > MAX_ELEMENTS, frames: crossOrigin };
   }
 
   function cssSelector(el){
@@ -339,7 +432,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     document.documentElement.appendChild(overlay);
     for (const entry of indexed){
       const el = byId.get(entry.id);
-      const rect = el ? el.getBoundingClientRect() : null;
+      const rect = el ? absRect(el) : null;
       if (!rect) continue;
       let left = rect.x, top = rect.y;
       // clamp badge inside viewport (12px badge size)

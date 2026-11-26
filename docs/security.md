@@ -22,6 +22,10 @@ There are two code bases in this repository:
 | Agent → page JS | `tools/evaluate.ts`, `index.ts` | `browser_eval` permission prompt, eval timeout |
 | Page → agent | `injected/dom-annotator.ts`, `core/telemetry.ts` | sensitive-input and URL redaction; page text is data, never instructions |
 | Local user → screenshots | `core/perception.ts` | owner-only directory and files |
+| Agent → disk (uploads) | `core/files.ts` | only regular files inside `OPENCODE_BROWSER_UPLOAD_DIR` or the download folder, resolved through symlinks first; 50 MB per file |
+| Page → disk (downloads) | `core/files.ts` | saved to an owner-only folder (0700) as 0600 files under a single safe name |
+| Agent → sites | `core/site-rules.ts`, `core/site-guard.ts` | optional allow / deny host lists on every page load in agent tabs, including clicks, redirects and popups |
+| Session → session | `core/tab-tracker.ts`, `core/telemetry.ts` | each session sees and acts on only its own tabs and their errors; the user's tabs are never claimed |
 | Page → agent session | `injected/agent-hud.ts`, `core/presence.ts` | the HUD's Stop calls a host binding that only a trusted click reaches; the HUD removes the binding global before page scripts run |
 
 ### Navigation

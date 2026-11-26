@@ -11,8 +11,12 @@
  *   - status pill (bottom centre): the agent's current step, or "Thinking…"
  *   - virtual cursor: SVG pointer that transitions smoothly to action targets
  *   - click ripple: expanding circle at the click point
- *   - Stop button (bottom right, red circle): the only part that takes
- *     pointer events. A trusted click calls the host binding, which interrupts
+ *   - hand-off panel (bottom centre, amber): "Your turn: <reason>" when the
+ *     agent hands the tab to the user to sign in or solve a CAPTCHA. It shows
+ *     even when the agent is not present, hides the Stop button, and a click
+ *     dismisses it.
+ *   - Stop button (bottom right, red circle): the only part besides the
+ *     hand-off panel that takes pointer events. A trusted click calls the host binding, which interrupts
  *     the agent and hands the tab back to the user. It steps to the bottom
  *     left when the agent needs to act on something beneath it.
  *
@@ -48,6 +52,7 @@ export const AGENT_HUD_SCRIPT = (() => {
   const host = document.createElement(${JSON.stringify(HUD_TAG)});
   host.style.visibility = "hidden";
   let present = false;
+  let handingOff = false;
   let stop = fresh;
   const mount = () => {
     const root = document.documentElement;
@@ -76,6 +81,10 @@ export const AGENT_HUD_SCRIPT = (() => {
     ".stop.left { right: auto; left: 20px; }",
     ".stop:hover { background: #b91c1c; transform: scale(1.06); }",
     ".stop .square { width: 14px; height: 14px; border-radius: 2px; background: #fff; }",
+    ".handoff { position: fixed; bottom: 24px; left: 50%; max-width: min(560px, calc(100% - 48px)); transform: translate3d(-50%, 0, 0); display: none; align-items: center; gap: 10px; padding: 10px 16px; border-radius: 12px; background: rgba(120, 53, 15, 0.92); color: #fff7ed; border: 1px solid #f59e0b; box-shadow: 0 6px 18px rgba(0,0,0,0.35); font: 500 13px/1.35 system-ui, sans-serif; pointer-events: auto; cursor: pointer; }",
+    ".handoff.visible { display: flex; }",
+    ".handoff b { color: #fbbf24; font-weight: 700; white-space: nowrap; }",
+    ":host(.handing-off) .stop, :host(.handing-off) .pill { display: none; }",
   ].join("\\n");
 
   const style = document.createElement("style");
@@ -123,6 +132,32 @@ export const AGENT_HUD_SCRIPT = (() => {
   square.className = "square";
   stopButton.appendChild(square);
   shadow.appendChild(stopButton);
+
+  const handoff = document.createElement("div");
+  handoff.className = "handoff";
+  handoff.setAttribute("role", "status");
+  const handoffTitle = document.createElement("b");
+  handoffTitle.textContent = "Your turn";
+  const handoffText = document.createElement("span");
+  handoff.appendChild(handoffTitle);
+  handoff.appendChild(handoffText);
+  handoff.title = "Click to dismiss";
+  shadow.appendChild(handoff);
+  // Dismissing only hides it here; the agent's next call clears it anyway.
+  handoff.addEventListener("click", () => setHandoff(null));
+
+  function applyVisibility(){
+    host.style.visibility = present || handingOff ? "visible" : "hidden";
+  }
+  function setHandoff(text){
+    mount();
+    handingOff = !!text;
+    // textContent only: the reason is agent text and must never be parsed as HTML.
+    handoffText.textContent = text ? String(text) + " Tell the agent when you are done." : "";
+    handoff.classList.toggle("visible", handingOff);
+    host.classList.toggle("handing-off", handingOff);
+    applyVisibility();
+  }
   // Only a real click counts: a page script cannot press Stop for the user.
   stopButton.addEventListener("click", (event) => {
     if (!event.isTrusted || !stop) return;
@@ -166,7 +201,7 @@ export const AGENT_HUD_SCRIPT = (() => {
     setPresent(on){
       mount();
       present = !!on;
-      host.style.visibility = present ? "visible" : "hidden";
+      applyVisibility();
       if (!present) {
         pill.classList.remove("visible");
         cursor.classList.remove("active");
@@ -178,7 +213,11 @@ export const AGENT_HUD_SCRIPT = (() => {
     },
     show(){
       mount();
-      host.style.visibility = present ? "visible" : "hidden";
+      applyVisibility();
+    },
+    /** Hand the tab to the user ("Your turn: …"), or clear it (null). */
+    setHandoff(text){
+      setHandoff(text);
     },
     /** Re-attach to the current document and adopt a fresh Stop binding. */
     remount(binding){

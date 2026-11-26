@@ -546,17 +546,21 @@ interface FakeTab {
   isClosed(): boolean;
   url(): string;
   bringToFront(): Promise<void>;
+  opener(): Promise<FakeTab | null>;
   close(): void;
   closed: boolean;
+  fronted: number;
 }
-function fakeTab(url: string): FakeTab {
+function fakeTab(url: string, opener: FakeTab | null = null): FakeTab {
   const em = fakePage();
   const tab: FakeTab = {
+    opener: async () => opener,
     on: em.on,
     emit: (e, a) => em.emit(e, a),
     isClosed: () => tab.closed,
     url: () => url,
-    bringToFront: async () => undefined,
+    bringToFront: async () => void (tab.fronted += 1),
+    fronted: 0,
     close: () => {
       tab.closed = true;
       em.emit("close", undefined);
@@ -592,21 +596,158 @@ describe("Group 5: session lifecycle (unit)", () => {
     expect(results.map((r) => r.status)).toEqual(["fulfilled", "rejected", "fulfilled"]);
     expect(m.isTurnActive()).toBe(false);
   });
+  test("runExclusive serializes one session's turns but lets different sessions run at once", async () => {
+    const m = new BrowserSessionManager({ headless: true });
+    const log: string[] = [];
+    const step = (session: string, name: string, ms: number) =>
+      m.runExclusive(async () => {
+        log.push(`start ${name}`);
+        await new Promise((r) => setTimeout(r, ms));
+        log.push(`end ${name}`);
+      }, session);
+    await Promise.all([step("ses_a", "a1", 40), step("ses_b", "b1", 10), step("ses_a", "a2", 1)]);
+    // b1 runs alongside a1; a2 waits for a1.
+    expect(log.indexOf("start b1")).toBeLessThan(log.indexOf("end a1"));
+    expect(log.indexOf("end b1")).toBeLessThan(log.indexOf("end a1"));
+    expect(log.indexOf("start a2")).toBeGreaterThan(log.indexOf("end a1"));
+    expect(m.isTurnActive()).toBe(false);
+  });
 
-  test("1.24 tab-switch notices name the reason: opened vs closed", () => {
+  test("1.24 tab-switch notices name the reason: opened vs closed", async () => {
     const tabs = new TabTracker<FakeTab>();
     const main = fakeTab("http://a.test/main");
     const ctx = fakeContext([main]);
     tabs.watch(ctx);
-    tabs.activate(main);
-    const popup = fakeTab("http://a.test/popup");
+    tabs.activate(main, "s1");
+    tabs.beginTurn("s1");
+    const popup = fakeTab("http://a.test/popup", main);
     ctx.open(popup);
-    expect(tabs.active()).toBe(popup);
-    expect(tabs.takeNotice()).toBe("Switched to new tab: http://a.test/popup");
-    expect(tabs.takeNotice()).toBeNull();
+    await tabs.attributed();
+    tabs.endTurn("s1");
+    expect(tabs.active("s1")).toBe(popup);
+    expect(tabs.takeNotice("s1")).toBe("Switched to new tab: http://a.test/popup");
+    expect(tabs.takeNotice("s1")).toBeNull();
     popup.close();
-    expect(tabs.active()).toBe(main);
-    expect(tabs.takeNotice()).toBe("Active tab closed; switched to tab: http://a.test/main");
+    expect(tabs.active("s1")).toBe(main);
+    expect(tabs.takeNotice("s1")).toBe("Active tab closed; switched to tab: http://a.test/main");
+  });
+  test("tabs: each session has its own active tab, and a popup belongs to the session whose turn opened it", async () => {
+    const tabs = new TabTracker<FakeTab>();
+    const ctx = fakeContext([]);
+    tabs.watch(ctx);
+    const a = fakeTab("http://a.test/");
+    const b = fakeTab("http://b.test/");
+    tabs.activate(a, "ses_a");
+    tabs.activate(b, "ses_b");
+    expect(tabs.active("ses_a")).toBe(a);
+    expect(tabs.active("ses_b")).toBe(b);
+    expect(tabs.ownerOf(a)).toBe("ses_a");
+    tabs.beginTurn("ses_a");
+    const popup = fakeTab("http://a.test/popup", a);
+    ctx.open(popup);
+    await tabs.attributed();
+    tabs.endTurn("ses_a");
+    expect(tabs.active("ses_a")).toBe(popup);
+    expect(tabs.active("ses_b")).toBe(b);
+    expect(tabs.ownerOf(popup)).toBe("ses_a");
+    expect(tabs.takeNotice("ses_b")).toBeNull();
+    expect(tabs.takeNotice("ses_a")).toContain("Switched to new tab");
+  });
+  test("tabs: with turns running in two sessions, a popup goes to the session that owns its opener", async () => {
+    const tabs = new TabTracker<FakeTab>();
+    const ctx = fakeContext([]);
+    tabs.watch(ctx);
+    const a = fakeTab("http://a.test/");
+    const b = fakeTab("http://b.test/");
+    tabs.activate(a, "ses_a");
+    tabs.activate(b, "ses_b");
+    tabs.beginTurn("ses_a");
+    tabs.beginTurn("ses_b");
+    const popup = fakeTab("http://b.test/popup", b);
+    ctx.open(popup);
+    await tabs.attributed();
+    tabs.endTurn("ses_a");
+    tabs.endTurn("ses_b");
+    expect(tabs.ownerOf(popup)).toBe("ses_b");
+    expect(tabs.active("ses_b")).toBe(popup);
+    expect(tabs.active("ses_a")).toBe(a);
+    expect(tabs.takeNotice("ses_a")).toBeNull();
+  });
+  test("tabs: a popup without an opener goes to the only running turn, or to nobody when several run", async () => {
+    const tabs = new TabTracker<FakeTab>();
+    const ctx = fakeContext([]);
+    tabs.watch(ctx);
+    tabs.activate(fakeTab("http://a.test/"), "ses_a");
+    tabs.activate(fakeTab("http://b.test/"), "ses_b");
+    tabs.beginTurn("ses_a");
+    const one = fakeTab("http://noopener.test/1");
+    ctx.open(one);
+    await tabs.attributed();
+    expect(tabs.ownerOf(one)).toBe("ses_a");
+    tabs.beginTurn("ses_b");
+    const two = fakeTab("http://noopener.test/2");
+    ctx.open(two);
+    await tabs.attributed();
+    expect(tabs.ownerOf(two)).toBeNull();
+  });
+  test("tabs: a tab the user opens from their own tab stays theirs, even during an agent turn", async () => {
+    const tabs = new TabTracker<FakeTab>();
+    const users = fakeTab("http://users.test/");
+    const ctx = fakeContext([users]);
+    tabs.watch(ctx);
+    tabs.activate(fakeTab("http://a.test/"), "ses_a");
+    tabs.beginTurn("ses_a");
+    const fromUser = fakeTab("http://users.test/link", users);
+    ctx.open(fromUser);
+    await tabs.attributed();
+    expect(tabs.ownerOf(fromUser)).toBeNull();
+    expect(tabs.takeNotice("ses_a")).toBeNull();
+  });
+  test("tabs: a page opened outside any turn is tracked but claimed by nobody", () => {
+    const tabs = new TabTracker<FakeTab>();
+    const ctx = fakeContext([]);
+    tabs.watch(ctx);
+    const mine = fakeTab("http://a.test/");
+    tabs.activate(mine, "ses_a");
+    const users = fakeTab("http://users-own-tab.test/");
+    ctx.open(users);
+    expect(tabs.active("ses_a")).toBe(mine);
+    expect(tabs.ownerOf(users)).toBeNull();
+    expect(tabs.takeNotice("ses_a")).toBeNull();
+    expect(tabs.list().map((t) => t.url)).toContain("http://users-own-tab.test/");
+    expect(tabs.list("ses_a").map((t) => t.url)).toEqual(["http://a.test/"]);
+  });
+  test("tabs: closing a session's active tab falls back to its own tabs only", () => {
+    const tabs = new TabTracker<FakeTab>();
+    const a1 = fakeTab("http://a1.test/");
+    const a2 = fakeTab("http://a2.test/");
+    const b1 = fakeTab("http://b1.test/");
+    tabs.activate(a1, "ses_a");
+    tabs.activate(b1, "ses_b");
+    tabs.activate(a2, "ses_a");
+    a2.close();
+    expect(tabs.active("ses_a")).toBe(a1);
+    b1.close();
+    expect(tabs.active("ses_b")).toBeNull();
+    // ses_a is never pointed at ses_b's tab, even though one existed.
+    a1.close();
+    expect(tabs.active("ses_a")).toBeNull();
+  });
+  test("tabs: a session cannot switch to another session's tab, and switching does not steal focus by default", async () => {
+    const tabs = new TabTracker<FakeTab>();
+    const a1 = fakeTab("http://a1.test/");
+    const a2 = fakeTab("http://a2.test/");
+    const b1 = fakeTab("http://b1.test/");
+    tabs.activate(a1, "ses_a");
+    tabs.add(a2);
+    tabs.own(a2, "ses_a");
+    tabs.activate(b1, "ses_b");
+    await expect(tabs.switchTo(tabs.idOf(b1), "ses_a")).rejects.toThrow("another session");
+    await tabs.switchTo(tabs.idOf(a2), "ses_a");
+    expect(tabs.active("ses_a")).toBe(a2);
+    expect(a2.fronted).toBe(0);
+    await tabs.switchTo(tabs.idOf(a1), "ses_a", { focus: true });
+    expect(a1.fronted).toBe(1);
   });
   test("tabs: each tracked page gets one stable id and runs the tracking hook once", () => {
     const tracked: FakeTab[] = [];
@@ -615,21 +756,26 @@ describe("Group 5: session lifecycle (unit)", () => {
     const b = fakeTab("http://b.test/");
     tabs.add(a);
     tabs.add(a);
-    tabs.activate(b);
+    tabs.activate(b, "unknown");
     expect(tracked).toEqual([a, b]);
     expect(tabs.idOf(a)).toBe(tabs.idOf(a));
     expect(tabs.idOf(a)).not.toBe(tabs.idOf(b));
     expect(tabs.list().map((t) => t.url)).toEqual(["http://a.test/", "http://b.test/"]);
     b.close();
     expect(tabs.list().map((t) => t.url)).toEqual(["http://a.test/"]);
-    expect(tabs.active()).toBe(a);
+    // a was never owned, so closing the active tab leaves the session with none.
+    expect(tabs.active("unknown")).toBeNull();
   });
-  test("tabs: switchTo rejects unknown or closed tabs", async () => {
+  test("tabs: switchTo rejects unknown, closed and unowned tabs", async () => {
     const tabs = new TabTracker<FakeTab>();
     const a = fakeTab("http://a.test/");
-    tabs.add(a);
+    const users = fakeTab("http://users.test/");
+    tabs.activate(a);
+    tabs.add(users);
     await tabs.switchTo(tabs.idOf(a));
     expect(tabs.active()).toBe(a);
+    await expect(tabs.switchTo(tabs.idOf(users))).rejects.toThrow("another session or to the user");
+    await expect(tabs.switchTo("page-nope")).rejects.toThrow("not found or closed");
     a.close();
     await expect(tabs.switchTo(tabs.idOf(a))).rejects.toThrow("not found or closed");
   });

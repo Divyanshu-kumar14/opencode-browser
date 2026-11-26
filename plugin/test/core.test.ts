@@ -153,6 +153,22 @@ describe("viewport module", () => {
     expect(log).toEqual([]);
   });
 
+  test("a scoped release leaves tabs outside the scope (another session's) alone", async () => {
+    const log: string[] = [];
+    const viewport = new Viewport("native");
+    const mine = viewportTab("mine", log);
+    const theirs = viewportTab("theirs", log);
+    await viewport.apply(mine as never, { width: 390, height: 844 });
+    await viewport.apply(theirs as never, { width: 768, height: 1024 });
+    log.length = 0;
+    await viewport.apply(mine as never, null, [mine as never]);
+    expect(log).toContain("mine Emulation.clearDeviceMetricsOverride");
+    expect(log.some((l) => l.startsWith("theirs"))).toBe(false);
+    // Theirs is still remembered and released by an unscoped release.
+    await viewport.apply(mine as never, null);
+    expect(log).toContain("theirs Emulation.clearDeviceMetricsOverride");
+  });
+
   test("a closed tab is forgotten and never released", async () => {
     const log: string[] = [];
     const viewport = new Viewport("native");
@@ -194,6 +210,33 @@ describe("telemetry", () => {
     expect(first.events[0]?.text).toContain("boom");
     expect(first.events[0]?.text).toContain("(x2)");
 
+    expect(telemetry.drain().events).toHaveLength(0);
+  });
+
+  test("drain(pages) returns only those pages' events, leaving other pages' for their own turn", () => {
+    const a = new FakePage();
+    const b = new FakePage();
+    const telemetry = new Telemetry(200);
+    telemetry.attach(asPage(a));
+    telemetry.attach(asPage(b));
+    a.emit("console", consoleMessage("error", "from a"));
+    b.emit("console", consoleMessage("error", "from b"));
+    expect(telemetry.drain([asPage(a)]).events.map((e) => e.text)).toEqual([expect.stringContaining("from a")]);
+    expect(telemetry.drain([asPage(a)]).events).toHaveLength(0);
+    expect(telemetry.drain([asPage(b)]).events.map((e) => e.text)).toEqual([expect.stringContaining("from b")]);
+  });
+
+  test("drain() with no pages still drains every page, in arrival order", () => {
+    const a = new FakePage();
+    const b = new FakePage();
+    const telemetry = new Telemetry(200);
+    telemetry.attach(asPage(a));
+    telemetry.attach(asPage(b));
+    a.emit("console", consoleMessage("error", "first"));
+    b.emit("console", consoleMessage("error", "second"));
+    a.emit("console", consoleMessage("error", "third"));
+    const texts = telemetry.drain().events.map((e) => e.text);
+    expect(texts.map((t) => t.match(/first|second|third/)?.[0])).toEqual(["first", "second", "third"]);
     expect(telemetry.drain().events).toHaveLength(0);
   });
 
@@ -407,6 +450,15 @@ describe("perception", () => {
     expect(page.events).toEqual(["hide", "screenshot", "show"]);
   });
 
+  test("screenshot:false still returns the element map and size, with no screenshot and no HUD blink", async () => {
+    const page = perceptionPage();
+    const result = await perceive(page as unknown as Page, { ...perceiveOpts(), screenshot: false });
+    expect(result.elements).toHaveLength(1);
+    expect(result.screenshotPath).toBeNull();
+    expect(result).toMatchObject({ width: 1280, height: 720, notice: null });
+    expect(page.events).toEqual([]);
+  });
+
   test("a failed screenshot still restores the HUD and removes the overlay", async () => {
     const page = perceptionPage({
       screenshot: async () => {
@@ -443,9 +495,29 @@ describe("perception", () => {
     const telemetry = new Telemetry(200);
     telemetry.attach(asPage(source));
     source.emit("console", consoleMessage("error", "boom"));
-    const result = await perceive(perceptionPage({ races: 2 }) as unknown as Page, perceiveOpts(telemetry));
+    const result = await perceive(perceptionPage({ races: 2 }) as unknown as Page, {
+      ...perceiveOpts(telemetry),
+      telemetryPages: [asPage(source)],
+    });
     expect(result.telemetryEvents).toHaveLength(1);
     expect(telemetry.drain().events).toHaveLength(0);
+  });
+
+  test("a screenshot lost to a reload ('Not attached to an active page') is retried as a navigation race", async () => {
+    let failures = 2;
+    const page = perceptionPage({
+      screenshot: async () => {
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error("screenshot: Protocol error (Page.captureScreenshot): Not attached to an active page");
+        }
+        return Buffer.from("png");
+      },
+    });
+    const result = await perceive(page as unknown as Page, perceiveOpts());
+    expect(result.notice).toBeNull();
+    expect(result.screenshotPath).not.toBeNull();
+    expect(page.events.filter((e) => e === "load")).toHaveLength(2);
   });
 
   test("errors other than a navigation race propagate", async () => {
@@ -465,6 +537,42 @@ describe("page agent", () => {
     expect(page.events).toEqual(["status:Navigating", "status:"]);
     const broken = { evaluate: async () => Promise.reject(new Error("Target closed")) };
     await expect(hud.status(broken as unknown as Page, "x")).resolves.toBeUndefined();
+  });
+});
+
+describe("turn formatting: read", () => {
+  const readOutcome = (extra: Partial<{ next: number | null }> = {}) =>
+    formatTurn({
+      kind: "read",
+      snapshot: snapshot(),
+      markdown: "# Title\n\nBody",
+      window: { total: 5000, offset: 0, nextOffset: extra.next ?? null, length: 14 },
+    });
+
+  test("a whole page reads as text with its position and no continuation hint", () => {
+    const result = readOutcome();
+    const out = (result.content[0] as { text: string }).text;
+    expect(out).toContain("## Page text");
+    expect(out).toContain("# Title\n\nBody");
+    expect(out).toContain("chars 0-14 of 5000");
+    expect(out).not.toContain("offset=");
+    expect(result.metadata).toMatchObject({ total: 5000, nextOffset: null });
+  });
+
+  test("a cut page says where to continue", () => {
+    const result = readOutcome({ next: 12000 });
+    expect((result.content[0] as { text: string }).text).toContain("call browse_read again with offset=12000");
+    expect(result.metadata["nextOffset"]).toBe(12000);
+  });
+
+  test("an empty page says so instead of printing nothing", () => {
+    const result = formatTurn({
+      kind: "read",
+      snapshot: snapshot(),
+      markdown: "",
+      window: { total: 0, offset: 0, nextOffset: null, length: 0 },
+    });
+    expect((result.content[0] as { text: string }).text).toContain("(no readable text)");
   });
 });
 

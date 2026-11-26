@@ -5,7 +5,7 @@
 
 import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
-import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
+import { screenshotField, turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
@@ -19,6 +19,7 @@ export const schema = z
       .enum(["load", "domcontentloaded", "networkidle"])
       .optional()
       .describe("Readiness to wait for (default load)."),
+    screenshot: screenshotField,
   })
   .strict()
   .refine((input) => input.action !== "goto" || !!input.url, {
@@ -44,5 +45,6 @@ export async function execute(
     action: input.action,
     url: input.url,
     waitUntil: input.waitUntil,
+    screenshot: input.screenshot,
   }, turnContext(context));
 }

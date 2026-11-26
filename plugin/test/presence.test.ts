@@ -258,4 +258,61 @@ describe("presence", () => {
     expect(clock.pending()).toBe(0);
     expect(a.calls).toEqual([]);
   });
+
+  test("a hand-off shows on the tab and outlives the session going idle", async () => {
+    const { presence } = make();
+    const a = tab("a");
+    await presence.begin("s1", [page(a)]);
+    await presence.handOff("s1", page(a), "Sign in");
+    expect(a.calls).toContain("setHandoff(Sign in)");
+    await presence.end("s1", []);
+    expect(a.calls).not.toContain("setHandoff()");
+  });
+
+  test("the same session's next browser call clears its hand-off; another session's does not", async () => {
+    const { presence } = make();
+    const a = tab("a");
+    const b = tab("b");
+    await presence.handOff("s1", page(a), "Sign in");
+    await presence.begin("s2", [page(b)]);
+    expect(a.calls).not.toContain("setHandoff()");
+    await presence.begin("s1", [page(a)]);
+    expect(a.calls).toContain("setHandoff()");
+    a.calls.length = 0;
+    await presence.begin("s1", [page(a)]);
+    expect(a.calls).not.toContain("setHandoff()");
+  });
+
+  test("a hand-off is shown again on each new document while the user signs in", async () => {
+    const { presence } = make();
+    const a = tab("a");
+    await presence.handOff("s1", page(a), "Sign in");
+    a.calls.length = 0;
+    a.fire("domcontentloaded");
+    await Promise.resolve();
+    expect(a.calls).toEqual(["setHandoff(Sign in)"]);
+    await presence.begin("s1", [page(a)]);
+    a.calls.length = 0;
+    a.fire("domcontentloaded");
+    await Promise.resolve();
+    expect(a.calls).not.toContain("setHandoff(Sign in)");
+  });
+
+  test("a hand-off works with presence disabled (headless) as a no-op on the page", async () => {
+    const presence = new Presence({ timeoutMs: 1000 });
+    const a = tab("a");
+    await presence.handOff("s1", page(a), "Sign in");
+    expect(a.calls).toEqual([]);
+  });
+
+  test("discard forgets hand-offs", async () => {
+    const { presence } = make();
+    const a = tab("a");
+    await presence.handOff("s1", page(a), "Sign in");
+    presence.discard();
+    a.calls.length = 0;
+    a.fire("domcontentloaded");
+    await Promise.resolve();
+    expect(a.calls).toEqual([]);
+  });
 });

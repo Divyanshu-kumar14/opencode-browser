@@ -8,15 +8,24 @@
  * tab-switch notice) lives behind this seam.
  */
 
-import type { ElementLine } from "../utils/formatter.ts";
+import type { ElementLine, UnindexedFrame } from "../utils/formatter.ts";
 import { buildPagePayload, formatTelemetryDelta } from "../utils/formatter.ts";
 import type { Action } from "./action-engine.ts";
+import type { WaitConditions } from "./wait.ts";
 
 export type NavigationAction = "goto" | "back" | "forward" | "reload";
 export type WaitUntil = "load" | "domcontentloaded" | "networkidle";
 export type ViewportPreset = "desktop" | "laptop" | "tablet" | "mobile";
 
-export type TurnRequest =
+export type TurnRequest = TurnVariants & {
+  /**
+   * Attach a screenshot to the result (default true). `false` returns the
+   * element map and text only, which costs fewer tokens and no image.
+   */
+  readonly screenshot?: boolean;
+};
+
+type TurnVariants =
   | {
     readonly kind: "navigate";
     readonly action: NavigationAction;
@@ -36,6 +45,46 @@ export type TurnRequest =
     readonly preset?: ViewportPreset;
     readonly width?: number;
     readonly height?: number;
+  }
+  | {
+    readonly kind: "network";
+    readonly show: "requests" | "console" | "both";
+    readonly filter?: string;
+    readonly onlyErrors: boolean;
+    readonly limit: number;
+  }
+  | {
+    readonly kind: "upload";
+    readonly elementId?: number;
+    readonly selector?: string;
+    readonly paths: readonly string[];
+  }
+  | {
+    readonly kind: "handoff";
+    readonly reason: string;
+  }
+  | {
+    readonly kind: "tabs";
+    readonly action: "list" | "open" | "switch" | "close";
+    readonly url?: string;
+    readonly tabId?: string;
+  }
+  | {
+    readonly kind: "read";
+    readonly selector?: string;
+    readonly links: boolean;
+    readonly maxChars: number;
+    readonly offset: number;
+  }
+  | {
+    readonly kind: "dialog";
+    readonly accept: boolean;
+    readonly promptText?: string;
+  }
+  | {
+    readonly kind: "wait";
+    readonly conditions: WaitConditions;
+    readonly timeoutMs: number;
   }
   | {
     readonly kind: "evaluate";
@@ -67,6 +116,8 @@ export interface TurnSnapshot {
   readonly title: string;
   readonly tabId: string | null;
   readonly elements: readonly ElementLine[];
+  /** Cross-origin frames on screen (default none). */
+  readonly frames?: readonly UnindexedFrame[];
   readonly screenshotPath: string | null;
   readonly width: number | null;
   readonly height: number | null;
@@ -85,6 +136,18 @@ export type TurnOutcome =
     readonly snapshot: TurnSnapshot;
     readonly lines: readonly string[];
     readonly found: boolean;
+    readonly metadata?: Record<string, unknown>;
+  }
+  | {
+    readonly kind: "read";
+    readonly snapshot: TurnSnapshot;
+    readonly markdown: string;
+    readonly window: {
+      readonly total: number;
+      readonly offset: number;
+      readonly nextOffset: number | null;
+      readonly length: number;
+    };
     readonly metadata?: Record<string, unknown>;
   }
   | {
@@ -108,6 +171,20 @@ export function formatTurn(outcome: TurnOutcome): ToolResult {
       "## Telemetry",
       formatTelemetryDelta(snapshot.telemetry),
     ].join("\n");
+  } else if (outcome.kind === "read") {
+    const { window } = outcome;
+    const from = window.offset;
+    const to = window.offset + window.length;
+    text = [
+      `URL: ${snapshot.url} — ${snapshot.title}`,
+      "",
+      `## Page text (chars ${from}-${to} of ${window.total})`,
+      outcome.markdown === "" ? "(no readable text)" : outcome.markdown,
+      ...(window.nextOffset === null ? [] : ["", `More below: call browse_read again with offset=${window.nextOffset}`]),
+      "",
+      "## Telemetry",
+      formatTelemetryDelta(snapshot.telemetry),
+    ].join("\n");
   } else if (outcome.kind === "evaluate") {
     text = [
       "## Eval result",
@@ -121,6 +198,7 @@ export function formatTurn(outcome: TurnOutcome): ToolResult {
       url: snapshot.url,
       title: snapshot.title,
       elements: snapshot.elements,
+      frames: snapshot.frames ?? [],
       tabSwitch: snapshot.tabSwitch,
       screenshotPath: snapshot.screenshotPath,
       width: snapshot.width,
@@ -151,6 +229,9 @@ export function formatTurn(outcome: TurnOutcome): ToolResult {
       width: snapshot.width,
       height: snapshot.height,
       elementCount: snapshot.elements.length,
+      ...(outcome.kind === "read"
+        ? { total: outcome.window.total, offset: outcome.window.offset, nextOffset: outcome.window.nextOffset }
+        : {}),
       ...(outcome.metadata ?? {}),
     },
   };

@@ -31,7 +31,7 @@ export class FakeBrowserSession implements BrowserSession {
 
   url = "about:blank";
 
-  activeUrl(): string {
+  activeUrl(_context?: TurnContext): string {
     return this.url;
   }
 

@@ -180,4 +180,66 @@ describe("HUD page object", () => {
     expect(await visibility(page)).toBe("visible");
     await page.close();
   });
+
+  test("a hand-off shows 'Your turn' on a tab even when the agent is not present, and hides Stop", async () => {
+    if (!ready()) return;
+    const page = await freshPage();
+    await hud.handoff(page, "Sign in to GitHub");
+    const state = await page.evaluate(() => {
+      const host = document.querySelector("opencode-agent-hud") as HTMLElement;
+      const root = host.shadowRoot!;
+      const panel = root.querySelector(".handoff") as HTMLElement;
+      const stop = root.querySelector(".stop") as HTMLElement;
+      return {
+        vis: host.style.visibility,
+        shown: panel.classList.contains("visible"),
+        text: panel.textContent,
+        stop: getComputedStyle(stop).display,
+      };
+    });
+    expect(state.vis).toBe("visible");
+    expect(state.shown).toBe(true);
+    expect(state.text).toContain("Your turn");
+    expect(state.text).toContain("Sign in to GitHub");
+    expect(state.stop).toBe("none");
+    await hud.handoff(page, null);
+    expect(await visibility(page)).toBe("hidden");
+    await page.close();
+  });
+
+  test("the hand-off text is shown as text, never as markup", async () => {
+    if (!ready()) return;
+    const page = await freshPage();
+    await hud.handoff(page, "<img src=x onerror=alert(1)><b>bold</b>");
+    const html = await page.evaluate(
+      () => (document.querySelector("opencode-agent-hud")!.shadowRoot!.querySelector(".handoff") as HTMLElement).innerHTML,
+    );
+    expect(html).not.toContain("<img");
+    expect(html).toContain("&lt;b&gt;bold&lt;/b&gt;");
+    await page.close();
+  });
+
+  test("a hand-off is hidden for the agent's screenshot and comes back after", async () => {
+    if (!ready()) return;
+    const page = await freshPage();
+    await hud.handoff(page, "Solve the CAPTCHA");
+    await page.evaluate((n) => (window as any)[n].hide(), PAGE_GLOBALS.hud);
+    expect(await visibility(page)).toBe("hidden");
+    await page.evaluate((n) => (window as any)[n].show(), PAGE_GLOBALS.hud);
+    expect(await visibility(page)).toBe("visible");
+    await page.close();
+  });
+
+  test("the user can dismiss the hand-off by clicking it", async () => {
+    if (!ready()) return;
+    const page = await freshPage();
+    await hud.handoff(page, "Approve the MFA prompt");
+    const at = await page.evaluate(() => {
+      const r = document.querySelector("opencode-agent-hud")!.shadowRoot!.querySelector(".handoff")!.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    await page.mouse.click(at.x, at.y);
+    expect(await visibility(page)).toBe("hidden");
+    await page.close();
+  });
 });

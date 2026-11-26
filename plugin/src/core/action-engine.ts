@@ -86,19 +86,33 @@ function short(text: string, max = 200): string {
   return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
 }
 
-/** Resolve an action's target to a Playwright Locator, or null. */
-export function resolveLocator(page: Page, action: Action): Locator | null {
-  if (action.elementId !== undefined) {
-    return page.locator(somSelector(action.elementId));
+/**
+ * Locator for an element id: in the page, or in the same-origin frame the
+ * annotator found it in. Returns the page locator when no frame has it, so a
+ * missing id still fails the usual way.
+ */
+async function locateId(page: Page, elementId: number): Promise<Locator> {
+  const selector = somSelector(elementId);
+  const main = page.locator(selector);
+  if ((await main.count()) > 0) return main;
+  for (const frame of page.frames()) {
+    if (frame === page.mainFrame()) continue;
+    const inFrame = frame.locator(selector);
+    if ((await inFrame.count().catch(() => 0)) > 0) return inFrame;
   }
+  return main;
+}
+
+/** Resolve an action's target to a Playwright Locator, or null. */
+export async function resolveLocator(page: Page, action: Action): Promise<Locator | null> {
+  if (action.elementId !== undefined) return locateId(page, action.elementId);
   if (action.selector) return page.locator(action.selector);
   return null;
 }
 
-/** Re-verify that an elementId target still exists in the live DOM. */
+/** Re-verify that an elementId target still exists in the live DOM (or a same-origin frame). */
 export async function elementExists(page: Page, elementId: number): Promise<boolean> {
-  const count = await page.locator(somSelector(elementId)).count();
-  return count > 0;
+  return (await (await locateId(page, elementId)).count()) > 0;
 }
 
 /** Get the center point of an action target, or null. */
@@ -109,7 +123,7 @@ export async function targetCenter(
   if (action.x !== undefined && action.y !== undefined) {
     return { x: action.x, y: action.y };
   }
-  const loc = resolveLocator(page, action);
+  const loc = await resolveLocator(page, action);
   if (!loc) return null;
   const box = await loc.boundingBox();
   if (!box) return null;
@@ -118,7 +132,7 @@ export async function targetCenter(
 
 export async function execAction(page: Page, action: Action): Promise<void> {
   const center = await targetCenter(page, action);
-  const loc = resolveLocator(page, action);
+  const loc = await resolveLocator(page, action);
   const label =
     action.elementId !== undefined
       ? `[${action.elementId}]`

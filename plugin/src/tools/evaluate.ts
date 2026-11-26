@@ -12,11 +12,12 @@ import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
 import { redactUrl } from "../core/url-policy.ts";
 import { markPassthrough } from "./passthrough.ts";
-import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
+import { screenshotField, turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
     expression: z.string().describe("Expression to evaluate in the page context"),
+    screenshot: screenshotField,
   })
   .strict();
 
@@ -42,7 +43,7 @@ export async function execute(
   }
   // Ask before anything runs, naming the page the expression will run on.
   // This stays outside the turn lock: a pending prompt never blocks others.
-  const url = redactUrl(deps.session.activeUrl());
+  const url = redactUrl(deps.session.activeUrl(turnContext(context)));
   try {
     await deps.permission.assert({
       sessionID: context.sessionID as never,
@@ -57,7 +58,7 @@ export async function execute(
     throw error;
   }
   return deps.session.turn(
-    { kind: "evaluate", expression: input.expression, approvedUrl: url },
+    { kind: "evaluate", expression: input.expression, approvedUrl: url, screenshot: input.screenshot },
     turnContext(context),
   );
 }

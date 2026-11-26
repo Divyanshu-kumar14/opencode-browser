@@ -5,7 +5,7 @@
 
 import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
-import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
+import { screenshotField, turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
@@ -15,6 +15,7 @@ export const schema = z
       .describe("Viewport preset"),
     width: z.number().int().positive().optional().describe("Custom viewport width (CSS px)"),
     height: z.number().int().positive().optional().describe("Custom viewport height (CSS px)"),
+    screenshot: screenshotField,
   })
   .strict()
   .refine((input) => (input.width === undefined) === (input.height === undefined), {
@@ -44,5 +45,6 @@ export async function execute(
     preset: input.preset,
     width: input.width,
     height: input.height,
+    screenshot: input.screenshot,
   }, turnContext(context));
 }

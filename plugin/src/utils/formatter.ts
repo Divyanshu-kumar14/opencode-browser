@@ -15,6 +15,14 @@ export interface ElementLine {
   readonly href?: string;
   readonly selectorFallback: string;
   readonly disabled?: boolean;
+  /** The element lives in a same-origin iframe. */
+  readonly inFrame?: boolean;
+}
+
+/** A visible cross-origin frame: listed by origin, contents not readable. */
+export interface UnindexedFrame {
+  readonly origin: string;
+  readonly bbox: { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
 }
 
 /**
@@ -53,7 +61,8 @@ export function formatElementMap(elements: readonly ElementLine[]): string {
     const attrs = el.tag === "a" ? href : value;
     const role = redundantRole(el.tag, el.role) ? "" : ` role="${escapeHtml(el.role)}"`;
     const disabled = el.disabled ? " disabled" : "";
-    return `[${el.id}] <${el.tag}${attrs}${role}${disabled}>${label}`;
+    const frame = el.inFrame ? " (in frame)" : "";
+    return `[${el.id}] <${el.tag}${attrs}${role}${disabled}>${label}${frame}`;
   });
   return lines.join("\n");
 }
@@ -73,6 +82,8 @@ export interface PagePayloadOptions {
   readonly url: string;
   readonly title?: string;
   readonly elements: readonly ElementLine[];
+  /** Cross-origin frames on screen, whose contents are not in the map. */
+  readonly frames?: readonly UnindexedFrame[];
   readonly tabSwitch?: string | null;
   readonly screenshotPath?: string | null;
   readonly width?: number | null;
@@ -97,6 +108,17 @@ export function buildPagePayload(options: PagePayloadOptions): string {
   parts.push("## Interactive elements");
   parts.push(formatElementMap(options.elements));
   parts.push("");
+  if (options.frames && options.frames.length > 0) {
+    parts.push("## Frames not indexed");
+    for (const f of options.frames) {
+      const b = f.bbox;
+      parts.push(
+        `- ${sanitizePageText(f.origin)} at x=${b.x}, y=${b.y}, ${b.width}x${b.height} ` +
+          "(cross-origin: contents are not readable; act on it by coordinates)",
+      );
+    }
+    parts.push("");
+  }
 
   if (options.screenshotPath) {
     const hint = options.width && options.height

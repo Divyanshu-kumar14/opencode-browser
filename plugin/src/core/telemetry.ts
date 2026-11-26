@@ -8,9 +8,11 @@
  *   - response : HTTP responses with status >= 400
  *   - requestfailed: aborted / CORS-failed requests
  *
- * Delta-cursor architecture: `drain()` returns only events added since the
- * last drain and advances the cursor, so each tool execution reports only the
- * *new* errors since the previous tool call.
+ * Delta architecture: `drain(pages)` returns only events not yet drained and
+ * marks them drained, so each tool execution reports only the *new* errors
+ * since the previous tool call. Sessions run in parallel in their own tabs, so a
+ * drain can be limited to that session's pages; events from other pages wait
+ * for their own session's turn. `drain()` with no pages drains everything.
  *
  * URLs are redacted at the source (query, fragment, and userinfo removed), so
  * tokens in request URLs never reach the tool output.
@@ -29,22 +31,30 @@ export interface TelemetryEvent {
   repeat?: string;
 }
 
+type Page = import("playwright").Page;
+
+interface Stored {
+  readonly event: TelemetryEvent;
+  readonly page: Page;
+  drained: boolean;
+}
+
 export class Telemetry {
   private readonly max: number;
-  private readonly events: TelemetryEvent[] = [];
-  /** Number of events already drained (delta cursor). */
+  private readonly events: Stored[] = [];
+  /** Total events drained so far (for peekCursor). */
   private cursor = 0;
   /** Last console text, for dedup of identical consecutive messages. */
   private lastConsoleText: string | null = null;
   private repeatCount = 0;
-  private readonly attached = new WeakSet<import("playwright").Page>();
+  private readonly attached = new WeakSet<Page>();
 
   constructor(max = 200) {
     this.max = max;
   }
 
   /** Attach persistent listeners to a Playwright Page. Idempotent per page. */
-  attach(page: import("playwright").Page): void {
+  attach(page: Page): void {
     if (this.attached.has(page)) return;
     this.attached.add(page);
     page.on("console", (msg) => {
@@ -53,7 +63,7 @@ export class Telemetry {
       const loc = msg.location();
       const source = loc.url ? redactUrl(loc.url) : "(inline)";
       const text = `[${type.toUpperCase()}] ${msg.text()} (${source})`;
-      this.addConsole(text);
+      this.addConsole(page, text);
     });
 
     page.on("pageerror", (err) => {
@@ -63,7 +73,7 @@ export class Telemetry {
         .filter(Boolean)
         .map((frame) => redactUrlsInText(frame))
         .join(" | ");
-      this.add({
+      this.add(page, {
         type: "pageerror",
         text: `[PAGE ERROR] ${err.message}${stack ? ` | ${stack}` : ""}`,
         source: "(page)",
@@ -74,7 +84,7 @@ export class Telemetry {
     page.on("response", (resp) => {
       if (resp.status() < 400) return;
       const url = redactUrl(resp.url());
-      this.add({
+      this.add(page, {
         type: "response",
         text: `[HTTP ${resp.status()}] ${resp.request().method()} ${url}`,
         source: url,
@@ -86,7 +96,7 @@ export class Telemetry {
       const failure = req.failure();
       const reason = failure?.errorText ?? "failed";
       const url = redactUrl(req.url());
-      this.add({
+      this.add(page, {
         type: "requestfailed",
         text: `[NET FAIL] ${req.method()} ${url} - net::${reason}`,
         source: url,
@@ -102,37 +112,47 @@ export class Telemetry {
    * one starts a fresh event: the next tool call must still see that the error
    * happened again, instead of reporting "Errors: none".
    */
-  private addConsole(text: string): void {
+  private addConsole(page: Page, text: string): void {
     const last = this.events[this.events.length - 1];
-    const undrained = this.events.length > this.cursor;
-    if (undrained && text === this.lastConsoleText && last?.type === "console") {
+    if (
+      last !== undefined &&
+      !last.drained &&
+      last.page === page &&
+      last.event.type === "console" &&
+      text === this.lastConsoleText
+    ) {
       this.repeatCount += 1;
-      last.text = `${text} (x${this.repeatCount})`;
-      last.repeat = ` (x${this.repeatCount})`;
-      last.timestamp = Date.now();
+      last.event.text = `${text} (x${this.repeatCount})`;
+      last.event.repeat = ` (x${this.repeatCount})`;
+      last.event.timestamp = Date.now();
       return;
     }
     this.lastConsoleText = text;
     this.repeatCount = 1;
-    this.add({ type: "console", text, source: "(console)", timestamp: Date.now() });
+    this.add(page, { type: "console", text, source: "(console)", timestamp: Date.now() });
   }
 
-  private add(event: TelemetryEvent): void {
-    this.events.push(event);
-    if (this.events.length > this.max) {
-      this.events.shift();
-      // The cursor counts drained events still in the ring. Evicting the
-      // oldest moves it back by one, or new events would be skipped forever.
-      if (this.cursor > 0) this.cursor -= 1;
+  private add(page: Page, event: TelemetryEvent): void {
+    this.events.push({ event, page, drained: false });
+    if (this.events.length > this.max) this.events.shift();
+  }
+
+  /**
+   * Drain the events not drained yet, in arrival order: all of them, or only
+   * those from `pages`. Drained events are never returned again.
+   */
+  drain(pages?: readonly Page[]): { readonly events: TelemetryEvent[]; readonly cursor: number } {
+    const only = pages === undefined ? null : new Set(pages);
+    const out: TelemetryEvent[] = [];
+    for (const stored of this.events) {
+      if (stored.drained || (only !== null && !only.has(stored.page))) continue;
+      stored.drained = true;
+      out.push(stored.event);
     }
-  }
-
-  /** Drain events added since the last drain, advancing the cursor. */
-  drain(): { readonly events: TelemetryEvent[]; readonly cursor: number } {
-    const start = Math.min(this.cursor, this.events.length);
-    const newEvents = this.events.slice(start);
-    this.cursor = this.events.length;
-    return { events: newEvents, cursor: this.cursor };
+    this.cursor += out.length;
+    // Drained events at the front are no longer needed.
+    while (this.events.length > 0 && this.events[0]!.drained) this.events.shift();
+    return { events: out, cursor: this.cursor };
   }
 
   /** Snapshot the current cursor without consuming (for peek / testing). */

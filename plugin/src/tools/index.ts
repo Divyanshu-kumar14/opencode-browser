@@ -16,8 +16,15 @@ import type { ToolResult } from "../core/turn.ts";
 import * as navigateTool from "./navigate.ts";
 import * as interactTool from "./interact.ts";
 import * as snapshotTool from "./snapshot.ts";
+import * as readTool from "./read.ts";
 import * as inspectTool from "./inspect.ts";
 import * as viewportTool from "./viewport.ts";
+import * as waitTool from "./wait.ts";
+import * as dialogTool from "./dialog.ts";
+import * as tabsTool from "./tabs.ts";
+import * as handoffTool from "./handoff.ts";
+import * as uploadTool from "./upload.ts";
+import * as networkTool from "./network.ts";
 import * as evaluateTool from "./evaluate.ts";
 import type { ToolCallContext, ToolDeps } from "./types.ts";
 import { isPassthrough } from "./passthrough.ts";
@@ -73,6 +80,12 @@ const tools: readonly AnyTool[] = [
     execute: snapshotTool.execute,
   }),
   defineTool({
+    name: "read",
+    description: readTool.description,
+    schema: readTool.schema,
+    execute: readTool.execute,
+  }),
+  defineTool({
     name: "inspect",
     description: inspectTool.description,
     schema: inspectTool.schema,
@@ -83,6 +96,42 @@ const tools: readonly AnyTool[] = [
     description: viewportTool.description,
     schema: viewportTool.schema,
     execute: viewportTool.execute,
+  }),
+  defineTool({
+    name: "wait",
+    description: waitTool.description,
+    schema: waitTool.schema,
+    execute: waitTool.execute,
+  }),
+  defineTool({
+    name: "tabs",
+    description: tabsTool.description,
+    schema: tabsTool.schema,
+    execute: tabsTool.execute,
+  }),
+  defineTool({
+    name: "network",
+    description: networkTool.description,
+    schema: networkTool.schema,
+    execute: networkTool.execute,
+  }),
+  defineTool({
+    name: "upload",
+    description: uploadTool.description,
+    schema: uploadTool.schema,
+    execute: uploadTool.execute,
+  }),
+  defineTool({
+    name: "handoff",
+    description: handoffTool.description,
+    schema: handoffTool.schema,
+    execute: handoffTool.execute,
+  }),
+  defineTool({
+    name: "dialog",
+    description: dialogTool.description,
+    schema: dialogTool.schema,
+    execute: dialogTool.execute,
   }),
   defineTool({
     name: "eval",

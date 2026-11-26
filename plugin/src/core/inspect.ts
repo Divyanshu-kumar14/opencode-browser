@@ -56,7 +56,6 @@ export async function inspectElement(page: Page, input: InspectInput): Promise<I
     (args) => {
       const g = globalThis as unknown as Record<string, any>;
       const doc = g["document"];
-      const getStyle = g["getComputedStyle"];
       let el;
       try {
         el = (
@@ -67,9 +66,44 @@ export async function inspectElement(page: Page, input: InspectInput): Promise<I
       } catch (error) {
         return { invalidSelector: error instanceof Error ? error.message : String(error) };
       }
+      // An element id can live in a same-origin frame (the annotator indexes
+      // them); search those documents too, up to three levels deep.
+      if (!el && args.mode === "id") {
+        const selector = `[${args.attribute}="${args.target}"]`;
+        const queue: { d: any; depth: number }[] = [{ d: doc, depth: 0 }];
+        while (!el && queue.length > 0) {
+          const { d, depth } = queue.shift()!;
+          if (depth >= 3) continue;
+          for (const fe of Array.from(d.querySelectorAll("iframe, frame")) as any[]) {
+            let inner: any = null;
+            try {
+              inner = fe.contentDocument;
+            } catch {
+              inner = null;
+            }
+            if (!inner) continue;
+            el = inner.querySelector(selector);
+            if (el) break;
+            queue.push({ d: inner, depth: depth + 1 });
+          }
+        }
+      }
       if (!el) return null;
-      const r = el.getBoundingClientRect();
-      const style = getStyle(el);
+      // Positions are reported in the top viewport, also for frame elements.
+      let offsetX = 0;
+      let offsetY = 0;
+      const ownerWin = (el.ownerDocument && el.ownerDocument.defaultView) || g;
+      for (let w = ownerWin; w && w !== g; ) {
+        const fe = w.frameElement;
+        if (!fe) break;
+        const fr = fe.getBoundingClientRect();
+        offsetX += fr.x + fe.clientLeft;
+        offsetY += fr.y + fe.clientTop;
+        w = fe.ownerDocument.defaultView;
+      }
+      const local = el.getBoundingClientRect();
+      const r = { x: local.x + offsetX, y: local.y + offsetY, width: local.width, height: local.height };
+      const style = ownerWin.getComputedStyle(el);
       const attributes: Record<string, string> = {};
       for (const attr of el.getAttributeNames()) {
         attributes[attr] = el.getAttribute(attr) ?? "";

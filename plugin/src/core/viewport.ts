@@ -10,8 +10,9 @@
  *   - emulated (headless): Playwright's fixed emulation; release returns to
  *     1280x720.
  *
- * An override is remembered per tab, so a release clears every tab that
- * carries one, including a tab the active pointer has since left.
+ * An override is remembered per tab, so a release clears every tab in its
+ * scope that carries one (a session's own tabs), including a tab the active
+ * pointer has since left.
  */
 
 import type { CDPSession, Page } from "playwright";
@@ -81,10 +82,13 @@ export class Viewport {
     return mode === "native" ? { viewport: null, args: ["--start-maximized"] } : { args: [] };
   }
 
-  /** Give `page` an explicit size, or release every override (`null`). */
-  async apply(page: ViewportPage, size: ResolvedViewport | null): Promise<void> {
+  /**
+   * Give `page` an explicit size, or release overrides (`null`): on the tabs in
+   * `scope` when given, otherwise on every tab.
+   */
+  async apply(page: ViewportPage, size: ResolvedViewport | null, scope?: readonly ViewportPage[]): Promise<void> {
     if (size === null) {
-      await this.releaseAll();
+      await this.release(scope);
       return;
     }
     if (this.mode === "emulated") {
@@ -110,9 +114,10 @@ export class Viewport {
     this.overrides.set(page, session);
   }
 
-  private async releaseAll(): Promise<void> {
-    const entries = [...this.overrides];
-    this.overrides.clear();
+  private async release(scope: readonly ViewportPage[] | undefined): Promise<void> {
+    const only = scope === undefined ? null : new Set(scope);
+    const entries = [...this.overrides].filter(([page]) => only === null || only.has(page));
+    for (const [page] of entries) this.overrides.delete(page);
     await Promise.all(
       entries.map(([page, session]) =>
         session === null

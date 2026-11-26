@@ -9,7 +9,7 @@
 import { z } from "zod";
 import type { Action } from "../core/action-engine.ts";
 import type { ToolResult } from "../core/turn.ts";
-import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
+import { screenshotField, turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 const ActionShape = z.object({
   type: z.enum([
@@ -74,6 +74,7 @@ export const schema = z
     scrollAmount: ActionShape.shape.scrollAmount.optional(),
     toX: ActionShape.shape.toX.optional(),
     toY: ActionShape.shape.toY.optional(),
+    screenshot: screenshotField,
   })
   .strict()
   .refine((input) => input.actions !== undefined || input.type !== undefined, {
@@ -124,5 +125,5 @@ export async function execute(
   context?: ToolCallContext,
 ): Promise<ToolResult> {
   const actions: Action[] = input.actions ?? [toAction(input)];
-  return deps.session.turn({ kind: "act", actions }, turnContext(context));
+  return deps.session.turn({ kind: "act", actions, screenshot: input.screenshot }, turnContext(context));
 }

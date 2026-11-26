@@ -11,8 +11,9 @@
  * page the context opens is tracked and becomes active, with a one-shot
  * notice for the next tool response.
  *
- * Concurrency: one launch at a time (single-flight), and `runExclusive`
- * serializes tool turns so two turns never interleave on the shared page.
+ * Concurrency: one launch at a time (single-flight). `runExclusive` serializes
+ * one session's turns, so they never interleave on its tabs; different
+ * sessions work in their own tabs and run at the same time.
  *
  * One manager per process lives in core/process-browser.ts, which also owns
  * signal teardown.
@@ -23,10 +24,15 @@ import type { ResolvedConfig } from "../config.ts";
 import { loadConfig } from "../config.ts";
 import { Telemetry } from "./telemetry.ts";
 import { pageScripts } from "./page-agent.ts";
+import { Dialogs } from "./dialogs.ts";
+import { Downloads } from "./files.ts";
+import { NetworkLog } from "./network-log.ts";
+import { SiteGuard } from "./site-guard.ts";
+import { parseSiteRules } from "./site-rules.ts";
 import { Presence } from "./presence.ts";
 import { PAGE_GLOBALS } from "./som.ts";
 import { Viewport } from "./viewport.ts";
-import { TabTracker } from "./tab-tracker.ts";
+import { DEFAULT_SESSION, TabTracker } from "./tab-tracker.ts";
 
 /**
  * Conventional local DevTools endpoint. Chrome/Brave 136+ refuse remote
@@ -80,6 +86,26 @@ export class BrowserSessionManager {
   readonly tabs: TabTracker<Page>;
   private closed = false;
   private deathWatchArmed = false;
+  /** Site-rule installs in progress; a turn waits for them before acting. */
+  private readonly pendingGuards = new Set<Promise<void>>();
+
+  /** Resolves once every owned tab has its site rules in place. */
+  async sitesReady(): Promise<void> {
+    const pending = [...this.pendingGuards];
+    this.pendingGuards.clear();
+    await Promise.all(pending);
+  }
+
+  /** True when attached to a browser the user runs (CDP), not one this plugin launched. */
+  private attached = false;
+  /** Answers and reports alert / confirm / prompt dialogs on every tracked tab. */
+  readonly dialogs = new Dialogs();
+  /** Keeps agent tabs to the allowed sites (when rules are set). */
+  readonly sites: SiteGuard;
+  /** Recent requests and console lines per tab (browse_network). */
+  readonly network = new NetworkLog();
+  /** Saves downloads from every tracked tab and reports them. */
+  readonly downloads: Downloads;
   /** The agent's visible presence (HUD) on the tabs it uses. */
   readonly presence: Presence;
   /** Viewport for the current launch; its mode is chosen in launchAndSetup. */
@@ -87,8 +113,8 @@ export class BrowserSessionManager {
 
   /** In-flight launch, shared by concurrent callers (single-flight). */
   private launching: Promise<void> | null = null;
-  /** Tail of the turn queue; each turn waits for the previous one. */
-  private turnQueue: Promise<void> = Promise.resolve();
+  /** Tail of each session's turn queue; a turn waits for that session's previous one. */
+  private readonly turnQueues = new Map<string, Promise<void>>();
   private turnsActive = 0;
 
   constructor(config?: Partial<ResolvedConfig>) {
@@ -96,9 +122,17 @@ export class BrowserSessionManager {
     this.telemetry = new Telemetry(this.config.maxTelemetry);
     this.pageScripts = pageScripts(this.config.maxElements);
     this.presence = new Presence({ timeoutMs: this.config.hudTimeoutMs });
+    this.downloads = new Downloads(this.config.downloadDir);
+    this.sites = new SiteGuard(parseSiteRules(this.config.allowOrigins, this.config.denyOrigins));
     this.tabs = new TabTracker<Page>((page) => {
       this.telemetry.attach(page);
+      this.dialogs.attach(page);
+      this.downloads.attach(page);
+      this.network.attach(page);
       this.installPageScripts(page);
+    }, (page) => {
+      // Only a session's own tabs are filtered; the user's are left alone.
+      this.pendingGuards.add(this.sites.guard(page));
     });
   }
 
@@ -113,15 +147,17 @@ export class BrowserSessionManager {
   }
 
   /**
-   * Run `fn` with exclusive use of the browser: turns run one at a time, in
-   * call order. The lock is released whether `fn` resolves or rejects.
+   * Run `fn` with exclusive use of `sessionId`'s tabs: that session's turns run
+   * one at a time, in call order, while other sessions run alongside. The lock
+   * is released whether `fn` resolves or rejects.
    */
-  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const previous = this.turnQueue;
+  async runExclusive<T>(fn: () => Promise<T>, sessionId: string = DEFAULT_SESSION): Promise<T> {
+    const previous = this.turnQueues.get(sessionId) ?? Promise.resolve();
     let release!: () => void;
-    this.turnQueue = new Promise<void>((resolve) => {
+    const mine = new Promise<void>((resolve) => {
       release = resolve;
     });
+    this.turnQueues.set(sessionId, mine);
     await previous;
     this.turnsActive += 1;
     try {
@@ -129,28 +165,50 @@ export class BrowserSessionManager {
     } finally {
       this.turnsActive -= 1;
       release();
+      // Forget an idle session's queue.
+      if (this.turnQueues.get(sessionId) === mine) this.turnQueues.delete(sessionId);
     }
   }
 
-  /** True while a turn holds the lock. */
+  /** True while any session's turn is running. */
   isTurnActive(): boolean {
     return this.turnsActive > 0;
   }
 
-  /** Ensure a browser + context exist and return the active page (creating one if needed). */
-  async ensureActivePage(): Promise<Page> {
+  /**
+   * Ensure a browser + context exist and return `sessionId`'s active tab,
+   * giving the session a tab of its own when it has none.
+   */
+  async ensureActivePage(sessionId: string = DEFAULT_SESSION): Promise<Page> {
     // A manager that was closed (or whose plugin instance was disposed) can be
     // reused: clear the terminal flag so relaunch and teardown work again. The browser is process-global, not per plugin instance.
     if (this.closed) {
       this.closed = false;
       this.deathWatchArmed = false;
     }
-    const active = this.tabs.active();
+    const active = this.tabs.active(sessionId);
     if (active && !active.isClosed()) return active;
     await this.ensureBrowser();
+    return this.openTabFor(sessionId);
+  }
+
+  /**
+   * A tab for `sessionId`. A browser this plugin launched starts with one
+   * blank tab nobody owns, which the first session takes. In an attached
+   * browser every tab already there is the user's, so a session always gets a
+   * new one.
+   */
+  async openTabFor(sessionId: string): Promise<Page> {
     const ctx = this.context!;
-    const page = ctx.pages().find((p) => !p.isClosed()) ?? (await ctx.newPage());
-    this.tabs.activate(page);
+    if (!this.attached) {
+      const blank = ctx.pages().find((p) => !p.isClosed() && this.tabs.ownerOf(p) === null && p.url() === "about:blank");
+      if (blank) {
+        this.tabs.activate(blank, sessionId);
+        return blank;
+      }
+    }
+    const page = await ctx.newPage();
+    this.tabs.activate(page, sessionId);
     return page;
   }
 
@@ -277,6 +335,7 @@ export class BrowserSessionManager {
     this.context = context;
     this.browser = browser;
     this.viewport = new Viewport(mode);
+    this.attached = cdpUrl !== undefined;
     this.presence.enabled = mode === "native" && this.config.indicators;
 
     // Dead-browser recovery: if Chromium dies (or is killed externally), drop

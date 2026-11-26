@@ -5,7 +5,7 @@
 
 import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
-import type { ToolDeps } from "./types.ts";
+import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
@@ -27,11 +27,15 @@ export const description =
   "requested cssProperties). Use for debugging spacing, alignment, z-index, or " +
   "responsive styling bugs. A clean screenshot is captured with the result.";
 
-export async function execute(input: Input, deps: ToolDeps): Promise<ToolResult> {
+export async function execute(
+  input: Input,
+  deps: ToolDeps,
+  context?: ToolCallContext,
+): Promise<ToolResult> {
   return deps.session.turn({
     kind: "inspect",
     elementId: input.elementId,
     selector: input.selector,
     cssProperties: input.cssProperties,
-  });
+  }, turnContext(context));
 }

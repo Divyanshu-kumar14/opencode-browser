@@ -24,8 +24,40 @@ import { PlaywrightBrowserSession } from "./core/browser-session.ts";
 import { processBrowser } from "./core/process-browser.ts";
 import { registerBrowserTools } from "./tools/index.ts";
 import { registerEvalPrompt } from "./tools/evaluate.ts";
+import type { Presence } from "./core/presence.ts";
+import type { SessionDomain } from "@opencode/plugin/promise/session";
 
 const NAMESPACE = "browse";
+
+type PresenceSession = Pick<SessionDomain, "hook" | "interrupt">;
+
+/**
+ * Connect presence to the host: the idle hook ends a session's presence, and
+ * Take over interrupts sessions through the host. A host without a session
+ * domain (older builds, unit tests) just leaves the HUD to its safety timer.
+ */
+async function registerPresence(
+  session: PresenceSession | undefined,
+  presence: Presence,
+): Promise<{ dispose(): Promise<void> }> {
+  if (session === undefined || typeof session.hook !== "function") {
+    return { dispose: async () => undefined };
+  }
+  const interrupt = async (sessionID: string): Promise<void> => {
+    await session.interrupt({ sessionID: sessionID as never });
+  };
+  presence.setInterrupter(interrupt);
+  const idle = await session.hook("experimental.idle", (event) =>
+    presence.end(event.sessionID, event.background),
+  );
+  return {
+    dispose: async () => {
+      // A newer plugin instance may have taken over the interrupter already.
+      if (presence.getInterrupter() === interrupt) presence.setInterrupter(undefined);
+      await idle.dispose();
+    },
+  };
+}
 
 export default Plugin.define({
   id: "browser",
@@ -45,6 +77,10 @@ export default Plugin.define({
     // browse_eval runs arbitrary page JS: prompt even when no rule exists.
     const evalPrompt = await registerEvalPrompt(ctx.permission, config.evalPrompt);
 
+    // The agent's presence in the browser: it lasts until every session that
+    // used the browser is idle, and the HUD's Stop button interrupts them.
+    const presenceHooks = await registerPresence(ctx.session, sessionManager.presence);
+
     const registration = await ctx.tool.transform((editor) => {
       editor.namespace({
         name: NAMESPACE,
@@ -62,7 +98,7 @@ export default Plugin.define({
     );
 
     return async () => {
-      await Promise.all([registration.dispose(), evalPrompt?.dispose()]);
+      await Promise.all([registration.dispose(), evalPrompt?.dispose(), presenceHooks.dispose()]);
       // Intentionally do NOT close the browser: the next plugin instance (or
       // the next turn) reuses the same process-global session. Closing here is
       // what caused a fresh Chromium launch on every agent step.

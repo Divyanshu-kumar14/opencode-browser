@@ -26,7 +26,7 @@ export function pageScripts(maxElements: number): readonly string[] {
   return [makeDomAnnotatorScript(maxElements), AGENT_HUD_SCRIPT];
 }
 
-type HudMethod = "updateStatus" | "moveCursor" | "showClickRipple";
+type HudMethod = "updateStatus" | "moveCursor" | "showClickRipple" | "setPresent";
 
 function callHud(page: Evaluator, method: HudMethod, args: readonly unknown[]): Promise<void> {
   return page
@@ -50,6 +50,8 @@ export const hud = {
   clear: (page: Evaluator): Promise<void> => callHud(page, "updateStatus", [""]),
   /** Move the virtual cursor to viewport (x, y). */
   cursor: (page: Evaluator, x: number, y: number): Promise<void> => callHud(page, "moveCursor", [x, y]),
+  /** Show or hide the whole HUD on this tab (only agent tabs are presented). */
+  present: (page: Evaluator, on: boolean): Promise<void> => callHud(page, "setPresent", [on]),
   /** Play the click ripple at viewport (x, y). */
   ripple: (page: Evaluator, x: number, y: number): Promise<void> => callHud(page, "showClickRipple", [x, y]),
 };

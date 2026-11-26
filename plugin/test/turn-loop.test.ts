@@ -7,6 +7,7 @@ import type { Page } from "playwright";
 import { loadConfig } from "../src/config.ts";
 import { PlaywrightBrowserSession, type SessionHost } from "../src/core/browser-session.ts";
 import type { Perception, PerceiveOptions } from "../src/core/perception.ts";
+import { Presence, THINKING } from "../src/core/presence.ts";
 import { TabTracker } from "../src/core/tab-tracker.ts";
 import { Telemetry } from "../src/core/telemetry.ts";
 import { Viewport } from "../src/core/viewport.ts";
@@ -50,7 +51,7 @@ function tab(name: string, onExpression: (expr: string) => unknown = () => 1): T
   return t;
 }
 
-function host(main: Tab) {
+function host(main: Tab, presence = new Presence({ timeoutMs: 30000 })) {
   const tabs = new TabTracker<Tab>();
   let onPage: (p: Tab) => void = () => undefined;
   tabs.watch({ on: (_e, fn) => void (onPage = fn), pages: () => [main] });
@@ -61,6 +62,7 @@ function host(main: Tab) {
     getConfig: () => ({ ...loadConfig(), evalTimeoutMs: 1000 }),
     getTelemetry: () => new Telemetry(),
     getViewport: () => new Viewport("emulated"),
+    presence,
     tabs,
   };
   return { host: fake as unknown as SessionHost, open: (p: Tab) => onPage(p) };
@@ -118,5 +120,44 @@ describe("turn loop", () => {
     expect(seen).toEqual(["main annotate=false"]);
     expect(textOf(result)).toContain("Perception incomplete: test");
     expect(result.metadata["tabId"]).toBe(env.host.tabs.idOf(main as unknown as Page));
+  });
+
+  test("with presence on, the session id reaches presence and the pill says Thinking… after the turn", async () => {
+    const main = tab("main");
+    const presence = new Presence({ timeoutMs: 30000 });
+    presence.enabled = true;
+    const env = host(main, presence);
+    const session = new PlaywrightBrowserSession(env.host, perceptionStandIn([]));
+    await session.turn({ kind: "observe" }, { sessionId: "ses_42" });
+    expect(presence.sessionIds()).toEqual(["ses_42"]);
+    expect(main.hud).toEqual(["setPresent(true)", `updateStatus(${THINKING})`]);
+  });
+
+  test("a failing intent leaves the agent Thinking…, not showing a stale step", async () => {
+    const main = tab("main");
+    const presence = new Presence({ timeoutMs: 30000 });
+    presence.enabled = true;
+    const env = host(main, presence);
+    const session = new PlaywrightBrowserSession(env.host, perceptionStandIn([]));
+    await expect(
+      session.turn({ kind: "evaluate", expression: "1", approvedUrl: "https://elsewhere.test/" }, { sessionId: "s" }),
+    ).rejects.toThrow("page changed");
+    expect(main.hud.at(-1)).toBe(`updateStatus(${THINKING})`);
+  });
+
+  test("a popup the turn opens is presented too", async () => {
+    const popup = tab("popup");
+    let env!: ReturnType<typeof host>;
+    const main = tab("main", () => {
+      env.open(popup);
+      return "opened";
+    });
+    const presence = new Presence({ timeoutMs: 30000 });
+    presence.enabled = true;
+    env = host(main, presence);
+    const session = new PlaywrightBrowserSession(env.host, perceptionStandIn([]));
+    await session.turn({ kind: "evaluate", expression: "window.open()" }, { sessionId: "s" });
+    expect(popup.hud).toContain("setPresent(true)");
+    expect(popup.hud.at(-1)).toBe(`updateStatus(${THINKING})`);
   });
 });

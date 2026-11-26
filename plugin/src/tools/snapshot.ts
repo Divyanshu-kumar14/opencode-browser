@@ -4,7 +4,7 @@
 
 import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
-import type { ToolDeps } from "./types.ts";
+import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
@@ -20,10 +20,14 @@ export const description =
   "into a fresh [1..N] map, captures an annotated screenshot (unless annotate=false), and " +
   "drains any new console/network errors. Use after the page changed on its own.";
 
-export async function execute(input: Input, deps: ToolDeps): Promise<ToolResult> {
+export async function execute(
+  input: Input,
+  deps: ToolDeps,
+  context?: ToolCallContext,
+): Promise<ToolResult> {
   return deps.session.turn({
     kind: "observe",
     annotate: input.annotate,
     fullPage: input.fullPage,
-  });
+  }, turnContext(context));
 }

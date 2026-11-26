@@ -20,3 +20,8 @@ export interface ToolCallContext {
   readonly messageID: string;
   readonly id: string;
 }
+
+/** The per-turn context a tool hands to the browser session. */
+export function turnContext(context: ToolCallContext | undefined): { readonly sessionId?: string } {
+  return context === undefined ? {} : { sessionId: context.sessionID };
+}

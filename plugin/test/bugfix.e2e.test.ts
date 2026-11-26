@@ -299,17 +299,80 @@ describe("Group 2: annotator and HUD", () => {
     expect(await page().title()).toBe("Widgets");
   }, 30000);
 
-  test("3.6 the HUD is visible again after every turn", async () => {
+  test("the HUD is attached in a tab the agent opens with window.open", async () => {
     if (!ready()) return;
-    await goto("/second");
+    const b = await extraBrowser({});
+    await b.session.turn({ kind: "navigate", action: "goto", url: base + "popup" });
+    await b.session.turn({ kind: "act", actions: [{ type: "click", selector: "#pop" }] });
+    const active = b.manager.tabs.active()!;
+    expect(active.url()).toContain("/second");
+    const attached = await active.evaluate(
+      () => document.querySelector("opencode-agent-hud")?.isConnected === true,
+    );
+    expect(attached).toBe(true);
+  }, 60000);
+  test("3.6 the HUD is visible again after every turn, saying Thinking… between calls", async () => {
+    if (!ready()) return;
+    const b = await extraBrowser({});
+    b.manager.presence.enabled = true;
+    await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, { sessionId: "ses_1" });
     for (const req of [{ kind: "observe" as const }, { kind: "observe" as const, annotate: false }]) {
-      await env!.session.turn(req);
-      const vis = await page().evaluate(
-        () => (document.querySelector("opencode-agent-hud") as HTMLElement | null)?.style.visibility,
-      );
-      expect(vis).toBe("visible");
+      await b.session.turn(req, { sessionId: "ses_1" });
+      const hud = await b.manager.tabs.active()!.evaluate(() => {
+        const host = document.querySelector("opencode-agent-hud") as HTMLElement | null;
+        const pill = host?.shadowRoot?.querySelector(".pill") as HTMLElement | null;
+        return { vis: host?.style.visibility, pill: pill?.className, text: pill?.textContent };
+      });
+      expect(hud).toEqual({ vis: "visible", pill: "pill visible", text: "Thinking…" });
     }
-  }, 30000);
+  }, 60000);
+  test("the HUD's Stop button is never in the agent's element map", async () => {
+    if (!ready()) return;
+    const b = await extraBrowser({});
+    b.manager.presence.enabled = true;
+    await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, { sessionId: "ses_1" });
+    const out = text(await b.session.turn({ kind: "observe" }, { sessionId: "ses_1" }));
+    expect(out).not.toMatch(/Stop the agent|<button[^>]*> ""/);
+    const indexed = await b.manager.tabs.active()!.evaluate(
+      () => (window as any).__opencodeSom.getElements().map((e: { label: string }) => e.label),
+    );
+    expect(indexed.join("|")).not.toContain("Stop the agent");
+  }, 60000);
+  test("a tab the agent never used shows no HUD, and the HUD leaves when the session is idle", async () => {
+    if (!ready()) return;
+    const b = await extraBrowser({});
+    b.manager.presence.enabled = true;
+    await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, { sessionId: "ses_1" });
+    const other = await b.manager.tabs.list()[0]!.page.context().newPage();
+    await other.goto(base + "second");
+    const state = (p: Page) =>
+      p.evaluate(() => (document.querySelector("opencode-agent-hud") as HTMLElement | null)?.style.visibility);
+    expect(await state(other)).toBe("hidden");
+    await b.manager.presence.end("ses_1", []);
+    expect(await state(b.manager.tabs.list()[0]!.page)).toBe("hidden");
+  }, 60000);
+  test("Stop in the page takes over: sessions are interrupted and the HUD leaves", async () => {
+    if (!ready()) return;
+    const b = await extraBrowser({});
+    b.manager.presence.enabled = true;
+    const interrupted: string[] = [];
+    b.manager.presence.setInterrupter((id) => void interrupted.push(id));
+    await b.session.turn({ kind: "navigate", action: "goto", url: base + "second" }, { sessionId: "ses_1" });
+    const tab = b.manager.tabs.active()!;
+    const at = await tab.evaluate(() => {
+      const r = document.querySelector("opencode-agent-hud")!.shadowRoot!.querySelector(".stop")!.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    await tab.mouse.click(at.x, at.y);
+    const deadline = Date.now() + 3000;
+    while (interrupted.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    expect(interrupted).toEqual(["ses_1"]);
+    expect(b.manager.presence.isActive()).toBe(false);
+    const vis = await tab.evaluate(
+      () => (document.querySelector("opencode-agent-hud") as HTMLElement).style.visibility,
+    );
+    expect(vis).toBe("hidden");
+  }, 60000);
 });
 
 // ---------------------------------------------------------------------------

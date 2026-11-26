@@ -12,7 +12,7 @@ import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
 import { redactUrl } from "../core/url-policy.ts";
 import { markPassthrough } from "./passthrough.ts";
-import type { ToolCallContext, ToolDeps } from "./types.ts";
+import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
@@ -56,7 +56,10 @@ export async function execute(
     markPassthrough(error);
     throw error;
   }
-  return deps.session.turn({ kind: "evaluate", expression: input.expression, approvedUrl: url });
+  return deps.session.turn(
+    { kind: "evaluate", expression: input.expression, approvedUrl: url },
+    turnContext(context),
+  );
 }
 
 type EvaluateHookDomain = Pick<PermissionDomain, "hook">;

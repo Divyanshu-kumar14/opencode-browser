@@ -10,7 +10,7 @@
  * efficiency, and tags DOM nodes with SOM_ATTRIBUTE (`data-opencode-id`) for fast lookup.
  */
 
-import { IMPLICIT_ROLE_BY_TAG, PAGE_GLOBALS, SOM_ATTRIBUTE } from "../core/som.ts";
+import { HUD_TAG, IMPLICIT_ROLE_BY_TAG, PAGE_GLOBALS, SOM_ATTRIBUTE } from "../core/som.ts";
 
 export function makeDomAnnotatorScript(maxElements = 100): string {
   const script = `
@@ -24,6 +24,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
   }
   const MAX_ELEMENTS = ${maxElements};
   const ATTR = ${JSON.stringify(SOM_ATTRIBUTE)};
+  const HUD_TAG = ${JSON.stringify(HUD_TAG)};
   const LABEL_MAX = 60;
   const SELECTOR =
     'a[href],button,input:not([type="hidden"]),textarea,select,summary,details,' +
@@ -164,7 +165,7 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
   function isAgentChrome(node){
     let n = node;
     while (n){
-      if (n.tagName === "OPENCODE-AGENT-HUD" || n.id === "opencode-som-overlay") return true;
+      if ((n.tagName && n.tagName.toLowerCase() === HUD_TAG) || n.id === "opencode-som-overlay") return true;
       if (n.parentNode) n = n.parentNode;
       else if (n.host) n = n.host;
       else return false;
@@ -220,6 +221,8 @@ export function makeDomAnnotatorScript(maxElements = 100): string {
     try {
       const all = root.querySelectorAll("*");
       for (const el of all){
+        // The agent's own HUD (Stop button, pill) is never part of the page.
+        if (el.tagName.toLowerCase() === HUD_TAG) continue;
         if (el instanceof HTMLElement && el.shadowRoot && !visited.has(el)){
           collectFromRoot(el.shadowRoot, out, visited, roots);
         }

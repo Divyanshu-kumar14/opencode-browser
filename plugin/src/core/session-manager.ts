@@ -23,6 +23,8 @@ import type { ResolvedConfig } from "../config.ts";
 import { loadConfig } from "../config.ts";
 import { Telemetry } from "./telemetry.ts";
 import { pageScripts } from "./page-agent.ts";
+import { Presence } from "./presence.ts";
+import { PAGE_GLOBALS } from "./som.ts";
 import { Viewport } from "./viewport.ts";
 import { TabTracker } from "./tab-tracker.ts";
 
@@ -78,6 +80,8 @@ export class BrowserSessionManager {
   readonly tabs: TabTracker<Page>;
   private closed = false;
   private deathWatchArmed = false;
+  /** The agent's visible presence (HUD) on the tabs it uses. */
+  readonly presence: Presence;
   /** Viewport for the current launch; its mode is chosen in launchAndSetup. */
   private viewport = new Viewport("emulated");
 
@@ -91,6 +95,7 @@ export class BrowserSessionManager {
     this.config = { ...loadConfig(), ...(config ?? {}) };
     this.telemetry = new Telemetry(this.config.maxTelemetry);
     this.pageScripts = pageScripts(this.config.maxElements);
+    this.presence = new Presence({ timeoutMs: this.config.hudTimeoutMs });
     this.tabs = new TabTracker<Page>((page) => {
       this.telemetry.attach(page);
       this.installPageScripts(page);
@@ -194,6 +199,7 @@ export class BrowserSessionManager {
     this.context = null;
     this.deathWatchArmed = false;
     this.tabs.reset();
+    this.presence.discard();
   }
 
   private browserReady(): boolean {
@@ -245,6 +251,15 @@ export class BrowserSessionManager {
       // Init scripts run on EVERY document (including after navigations), so
       // the SoM indexer and HUD survive page loads. Tracking a page also
       // evaluates them once for pages that already exist.
+      // The HUD's Stop button calls this binding: a Take over. It is exposed
+      // first so each document's HUD script can capture it and remove the
+      // global before page scripts run. A headless browser never presents the
+      // HUD, so the binding is idle there.
+      if (this.config.indicators) {
+        await context.exposeBinding(PAGE_GLOBALS.stop, () => {
+          void this.presence.takeOver();
+        });
+      }
       for (const script of this.pageScripts) await context.addInitScript(script);
       this.tabs.watch(context);
     } catch (error) {
@@ -262,6 +277,7 @@ export class BrowserSessionManager {
     this.context = context;
     this.browser = browser;
     this.viewport = new Viewport(mode);
+    this.presence.enabled = mode === "native" && this.config.indicators;
 
     // Dead-browser recovery: if Chromium dies (or is killed externally), drop
     // the stale handles so the next tool call relaunches cleanly instead of

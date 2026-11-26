@@ -5,7 +5,7 @@
 
 import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
-import type { ToolDeps } from "./types.ts";
+import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
@@ -34,11 +34,15 @@ export const description =
   "map, an annotated screenshot, and any new console/network errors. Prefer elementId from " +
   "the element map over guessing CSS selectors in subsequent calls.";
 
-export async function execute(input: Input, deps: ToolDeps): Promise<ToolResult> {
+export async function execute(
+  input: Input,
+  deps: ToolDeps,
+  context?: ToolCallContext,
+): Promise<ToolResult> {
   return deps.session.turn({
     kind: "navigate",
     action: input.action,
     url: input.url,
     waitUntil: input.waitUntil,
-  });
+  }, turnContext(context));
 }

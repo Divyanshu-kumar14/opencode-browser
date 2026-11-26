@@ -9,7 +9,7 @@
 import { z } from "zod";
 import type { Action } from "../core/action-engine.ts";
 import type { ToolResult } from "../core/turn.ts";
-import type { ToolDeps } from "./types.ts";
+import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 const ActionShape = z.object({
   type: z.enum([
@@ -118,7 +118,11 @@ function toAction(input: Input): Action {
   };
 }
 
-export async function execute(input: Input, deps: ToolDeps): Promise<ToolResult> {
+export async function execute(
+  input: Input,
+  deps: ToolDeps,
+  context?: ToolCallContext,
+): Promise<ToolResult> {
   const actions: Action[] = input.actions ?? [toAction(input)];
-  return deps.session.turn({ kind: "act", actions });
+  return deps.session.turn({ kind: "act", actions }, turnContext(context));
 }

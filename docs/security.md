@@ -22,6 +22,7 @@ There are two code bases in this repository:
 | Agent → page JS | `tools/evaluate.ts`, `index.ts` | `browser_eval` permission prompt, eval timeout |
 | Page → agent | `injected/dom-annotator.ts`, `core/telemetry.ts` | sensitive-input and URL redaction; page text is data, never instructions |
 | Local user → screenshots | `core/perception.ts` | owner-only directory and files |
+| Page → agent session | `injected/agent-hud.ts`, `core/presence.ts` | the HUD's Stop calls a host binding that only a trusted click reaches; the HUD removes the binding global before page scripts run |
 
 ### Navigation
 

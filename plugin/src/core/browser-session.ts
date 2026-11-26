@@ -28,9 +28,14 @@ import {
 import { resolveViewport, viewportSizeOf } from "./viewport.ts";
 import { checkNavigationUrl, redactUrl } from "./url-policy.ts";
 
+/** Who is asking: the OpenCode session whose tool call this turn serves. */
+export interface TurnContext {
+  readonly sessionId?: string;
+}
+
 export interface BrowserSession {
   /** Run one tool turn and return the formatted result. */
-  turn(request: TurnRequest): Promise<ToolResult>;
+  turn(request: TurnRequest, context?: TurnContext): Promise<ToolResult>;
   /** URL of the active tab, without launching a browser ("about:blank" if none). */
   activeUrl(): string;
 }
@@ -38,7 +43,7 @@ export interface BrowserSession {
 /** What the turn loop needs from the process browser; the manager satisfies it. */
 export type SessionHost = Pick<
   BrowserSessionManager,
-  "ensureActivePage" | "runExclusive" | "getConfig" | "getTelemetry" | "getViewport" | "tabs"
+  "ensureActivePage" | "runExclusive" | "getConfig" | "getTelemetry" | "getViewport" | "tabs" | "presence"
 >;
 
 /** What one request kind's intent hands back to the shared turn sequence. */
@@ -52,6 +57,9 @@ interface Intent {
   /** The outcome built from the snapshot; default is a page outcome. */
   readonly outcome?: (snapshot: TurnSnapshot, metadata: Record<string, unknown>) => TurnOutcome;
 }
+
+/** Turns made without a session (direct callers, tests) share this id. */
+const UNKNOWN_SESSION = "unknown";
 
 export class PlaywrightBrowserSession implements BrowserSession {
   /**
@@ -73,8 +81,8 @@ export class PlaywrightBrowserSession implements BrowserSession {
    * One turn at a time: the manager's lock serializes turns so two calls
    * never interleave their intent and perception on the shared page.
    */
-  turn(request: TurnRequest): Promise<ToolResult> {
-    return this.manager.runExclusive(() => this.runTurn(request));
+  turn(request: TurnRequest, context: TurnContext = {}): Promise<ToolResult> {
+    return this.manager.runExclusive(() => this.runTurn(request, context.sessionId ?? UNKNOWN_SESSION));
   }
 
   /**
@@ -82,11 +90,13 @@ export class PlaywrightBrowserSession implements BrowserSession {
    * tab to perceive -> perceive -> snapshot -> format, and clear the HUD on
    * every tab the turn touched, success or failure.
    */
-  private async runTurn(request: TurnRequest): Promise<ToolResult> {
+  private async runTurn(request: TurnRequest, sessionId: string): Promise<ToolResult> {
     const page = await this.manager.ensureActivePage();
     const config = this.manager.getConfig();
     let target: Page = page;
     try {
+      // The agent is using the browser: show its presence on this tab.
+      await this.manager.presence.begin(sessionId, [page]);
       const intent = await this.intent(page, request);
 
       // Perceive the tab that is active now, not the one the turn started on:
@@ -125,10 +135,10 @@ export class PlaywrightBrowserSession implements BrowserSession {
       const metadata = intent.metadata ?? {};
       return formatTurn(intent.outcome ? intent.outcome(snapshot, metadata) : { kind: "page", snapshot, metadata });
     } finally {
-      // Never leave the status pill showing a stale activity. Perception
-      // restores the hidden HUD before this runs.
-      await hud.clear(page);
-      if (target !== page) await hud.clear(target);
+      // Never leave the pill showing a stale step: "Thinking…" while the agent
+      // is still working, cleared when it is not (headless, or released).
+      // Perception restores the hidden HUD before this runs.
+      await this.manager.presence.settle(target === page ? [page] : [page, target]);
     }
   }
 

@@ -5,7 +5,7 @@
  * Playwright adapter implements; no browser, no page, no Playwright.
  */
 
-import type { BrowserSession } from "../src/core/browser-session.ts";
+import type { BrowserSession, TurnContext } from "../src/core/browser-session.ts";
 import type { ToolResult, TurnRequest } from "../src/core/turn.ts";
 
 const DEFAULT_RESULT: ToolResult = {
@@ -15,6 +15,7 @@ const DEFAULT_RESULT: ToolResult = {
 
 export class FakeBrowserSession implements BrowserSession {
   readonly requests: TurnRequest[] = [];
+  readonly contexts: (TurnContext | undefined)[] = [];
   private result: ToolResult = DEFAULT_RESULT;
   private failure: Error | null = null;
 
@@ -34,8 +35,9 @@ export class FakeBrowserSession implements BrowserSession {
     return this.url;
   }
 
-  async turn(request: TurnRequest): Promise<ToolResult> {
+  async turn(request: TurnRequest, context?: TurnContext): Promise<ToolResult> {
     this.requests.push(request);
+    this.contexts.push(context);
     if (this.failure) throw this.failure;
     return this.result;
   }

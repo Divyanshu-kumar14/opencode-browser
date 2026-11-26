@@ -1,5 +1,13 @@
 /** Page globals the injected scripts install (HUD and SoM indexer). */
-export const PAGE_GLOBALS = { hud: "__opencodeHud", som: "__opencodeSom" } as const;
+export const PAGE_GLOBALS = {
+  hud: "__opencodeHud",
+  som: "__opencodeSom",
+  /** Binding the host exposes for the HUD's Stop button; the HUD captures and removes it. */
+  stop: "__opencodeStop",
+} as const;
+
+/** Tag of the HUD host element; the annotator never indexes anything inside it. */
+export const HUD_TAG = "opencode-agent-hud";
 
 /** Attribute the injected SoM annotator tags indexed nodes with. */
 export const SOM_ATTRIBUTE = "data-opencode-id";

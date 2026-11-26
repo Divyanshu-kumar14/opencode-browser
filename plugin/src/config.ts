@@ -20,6 +20,16 @@ export interface ResolvedConfig {
    * (OPENCODE_BROWSER_CDP_AUTODETECT, default true).
    */
   readonly cdpAutoDetect: boolean;
+  /**
+   * Show the agent's presence (HUD with a Stop button) on tabs it uses when
+   * the browser is headful or attached (OPENCODE_BROWSER_INDICATORS, default true).
+   */
+  readonly indicators: boolean;
+  /**
+   * Hide the HUD this long after the last browser call when the host sends no
+   * idle signal, e.g. after an interrupt or failure (OPENCODE_BROWSER_HUD_TIMEOUT_MS).
+   */
+  readonly hudTimeoutMs: number;
   /** Chromium executable override (OPENCODE_BROWSER_EXECUTABLE_PATH, auto-detected). */
   readonly executablePath: string | undefined;
   /** Persistent user-data-dir for profile launch. */
@@ -105,6 +115,8 @@ export function loadConfig(): ResolvedConfig {
     headless: envBool("OPENCODE_BROWSER_HEADLESS", false),
     cdpUrl: process.env["OPENCODE_BROWSER_CDP_URL"] ?? undefined,
     cdpAutoDetect: envBool("OPENCODE_BROWSER_CDP_AUTODETECT", true),
+    indicators: envBool("OPENCODE_BROWSER_INDICATORS", true),
+    hudTimeoutMs: envNum("OPENCODE_BROWSER_HUD_TIMEOUT_MS", 30000),
     executablePath: process.env["OPENCODE_BROWSER_EXECUTABLE_PATH"] ?? detectChromium(),
     profileDir: path.resolve(profileDir),
     maxElements: envNum("OPENCODE_BROWSER_MAX_ELEMENTS", 100),

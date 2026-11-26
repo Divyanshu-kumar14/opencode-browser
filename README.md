@@ -54,6 +54,21 @@ plugins many times per server process, so `BrowserSessionManager` lives on `glob
 closed only on `SIGINT`/`SIGTERM`/`beforeExit`. Consecutive `browse_*` calls share one tab, one
 profile, and one login state.
 
+### The agent's presence
+
+While the agent uses a headful or attached browser, the tabs it works in show a HUD, in the style of
+Antigravity: a pill with the current step (or "Thinking…" between tool calls), a virtual cursor, click
+ripples, and a red **Stop** button at the bottom right. Nothing blocks you: you can click, scroll and
+type in an agent tab at any time.
+
+- **Stop** interrupts every OpenCode session that used the browser and hands the tab back to you.
+- The HUD goes away when every session that used the browser reports idle, or after
+  `OPENCODE_BROWSER_HUD_TIMEOUT_MS` without a browser call (OpenCode sends no idle signal after an
+  interrupt or failure).
+- Only tabs the agent used show it; your other tabs are untouched, including in an attached browser.
+- It is hidden in the agent's own screenshots and never appears in its element map.
+- `OPENCODE_BROWSER_INDICATORS=0` turns it off. Headless runs never show it.
+
 ### Module map
 
 | Path | Responsibility |
@@ -66,6 +81,7 @@ profile, and one login state.
 | `plugin/src/core/viewport.ts` | Native vs emulated viewport, preset overrides and release, size reads |
 | `plugin/src/core/perception.ts` | Element map + clean screenshot + telemetry drain, with retry and deadline |
 | `plugin/src/core/page-agent.ts` | Host side of the in-page HUD and SoM objects |
+| `plugin/src/core/presence.ts` | Which sessions use the browser, which tabs show the HUD, safety timer, Take over |
 | `plugin/src/core/turn.ts` | `TurnRequest`, `TurnOutcome`, and the single result formatter |
 | `plugin/src/core/action-engine.ts` | Action batches and stale-id recovery |
 | `plugin/src/core/settle.ts` | Deterministic post-action settling |
@@ -139,6 +155,8 @@ All options are optional; defaults shown.
 | `OPENCODE_BROWSER_HEADLESS` | unset (headful) | `1`/`true` for headless (CI, servers) |
 | `OPENCODE_BROWSER_CDP_URL` | unset (persistent launch) | e.g. `http://127.0.0.1:9222` — attach to a running Chrome instead of launching |
 | `OPENCODE_BROWSER_CDP_AUTODETECT` | `1` (on) | with no CDP URL, attach to a browser already listening on `http://127.0.0.1:9222`; `0` always launches its own Chromium |
+| `OPENCODE_BROWSER_INDICATORS` | `1` (on) | show the agent's HUD (current step, "Thinking…", Stop button) on the tabs it uses; `0` hides it. Never shown when headless |
+| `OPENCODE_BROWSER_HUD_TIMEOUT_MS` | `30000` | hide the HUD this long after the last browser call if OpenCode sends no idle signal (interrupt, failure) |
 | `OPENCODE_BROWSER_PROFILE_DIR` | `.opencode/browser-profile` | persistent profile; cookies/localStorage survive runs |
 | `OPENCODE_BROWSER_EXECUTABLE_PATH` | auto-detected (`/usr/bin/chromium`, `google-chrome`, …) or `CHROME_PATH` | override when Playwright has no bundled browser |
 | `OPENCODE_BROWSER_SCREENSHOT_DIR` | `$TMPDIR/opencode/browser-screenshots` | annotated PNG output |

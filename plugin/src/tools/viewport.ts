@@ -5,7 +5,7 @@
 
 import { z } from "zod";
 import type { ToolResult } from "../core/turn.ts";
-import type { ToolDeps } from "./types.ts";
+import { turnContext, type ToolCallContext, type ToolDeps } from "./types.ts";
 
 export const schema = z
   .object({
@@ -34,11 +34,15 @@ export const description =
   "override so the page fills the live browser window again. Settles and returns the refreshed element map " +
   "and screenshot.";
 
-export async function execute(input: Input, deps: ToolDeps): Promise<ToolResult> {
+export async function execute(
+  input: Input,
+  deps: ToolDeps,
+  context?: ToolCallContext,
+): Promise<ToolResult> {
   return deps.session.turn({
     kind: "viewport",
     preset: input.preset,
     width: input.width,
     height: input.height,
-  });
+  }, turnContext(context));
 }

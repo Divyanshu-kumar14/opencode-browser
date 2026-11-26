@@ -336,6 +336,88 @@ describe("Group 1: eval permission gate (1.21)", () => {
   });
 });
 
+describe("plugin setup: the agent's presence", () => {
+  /** A host `ctx` with a session domain that records hooks and interrupts. */
+  function hostWithSession() {
+    const hooks = new Map<string, (event: unknown) => unknown>();
+    const disposed: string[] = [];
+    const interrupted: string[] = [];
+    const ctx = {
+      tool: {
+        transform: async (cb: (editor: unknown) => void) => {
+          cb({ namespace: () => undefined, add: () => undefined });
+          return { dispose: async () => undefined };
+        },
+        list: async () => [],
+      },
+      permission: { assert: async () => undefined, hook: async () => ({ dispose: async () => undefined }) },
+      session: {
+        hook: async (name: string, cb: (event: unknown) => unknown) => {
+          hooks.set(name, cb);
+          return { dispose: async () => void disposed.push(name) };
+        },
+        interrupt: async (input: { sessionID: string }) => void interrupted.push(input.sessionID),
+      },
+    };
+    return { ctx, hooks, disposed, interrupted };
+  }
+  /** A tab that accepts HUD calls. */
+  const hudTab = () => ({
+    evaluate: async () => undefined,
+    on: () => undefined,
+    isClosed: () => false,
+  });
+  test("the idle hook ends presence, and Stop interrupts the sessions that used the browser", async () => {
+    const manager = new BrowserSessionManager({ headless: true });
+    manager.presence.enabled = true;
+    const saved = processBrowser.replace(manager);
+    const host = hostWithSession();
+    try {
+      const cleanup = (await plugin.setup(host.ctx as never)) as () => Promise<void>;
+      expect([...host.hooks.keys()]).toEqual(["experimental.idle"]);
+      await manager.presence.begin("ses_a", [hudTab() as never]);
+      await manager.presence.begin("ses_b", [hudTab() as never]);
+      await host.hooks.get("experimental.idle")!({ sessionID: "ses_a", background: [] });
+      expect(manager.presence.sessionIds()).toEqual(["ses_b"]);
+      await manager.presence.takeOver();
+      expect(host.interrupted).toEqual(["ses_b"]);
+      await cleanup();
+      expect(host.disposed).toEqual(["experimental.idle"]);
+      expect(manager.presence.getInterrupter()).toBeUndefined();
+    } finally {
+      processBrowser.replace(saved);
+    }
+  });
+  test("a stale plugin instance's disposal does not remove the newer instance's interrupter", async () => {
+    const manager = new BrowserSessionManager({ headless: true });
+    const saved = processBrowser.replace(manager);
+    try {
+      const first = hostWithSession();
+      const cleanupFirst = (await plugin.setup(first.ctx as never)) as () => Promise<void>;
+      const second = hostWithSession();
+      await plugin.setup(second.ctx as never);
+      await cleanupFirst();
+      expect(manager.presence.getInterrupter()).toBeDefined();
+      manager.presence.enabled = true;
+      await manager.presence.begin("ses_x", [hudTab() as never]);
+      await manager.presence.takeOver();
+      expect(second.interrupted).toEqual(["ses_x"]);
+      expect(first.interrupted).toEqual([]);
+    } finally {
+      processBrowser.replace(saved);
+    }
+  });
+  test("a host without a session domain still sets up", async () => {
+    const manager = new BrowserSessionManager({ headless: true });
+    const saved = processBrowser.replace(manager);
+    try {
+      const { session: _unused, ...ctx } = hostWithSession().ctx;
+      await expect(plugin.setup(ctx as never)).resolves.toBeDefined();
+    } finally {
+      processBrowser.replace(saved);
+    }
+  });
+});
 // ---------------------------------------------------------------------------
 // Group 2: formatter (1.23)
 // ---------------------------------------------------------------------------
